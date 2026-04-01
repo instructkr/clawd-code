@@ -1,6 +1,6 @@
 # 🦞 Claw Code — Rust Implementation
 
-A high-performance Rust rewrite of the Claude Code CLI agent harness. Built for speed, safety, and native tool execution.
+A high-performance Rust rewrite of the Claw Code CLI agent harness. Built for speed, safety, and native tool execution.
 
 ## Quick Start
 

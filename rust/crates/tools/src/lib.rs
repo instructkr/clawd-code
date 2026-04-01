@@ -323,7 +323,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "Config",
-            description: "Get or set Claude Code settings.",
+            description: "Get or set Claw Code settings.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1537,7 +1537,7 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
             "SendUserMessage",
             "PowerShell",
         ],
-        "claude-code-guide" => vec![
+        "claw-code-guide" => vec![
             "read_file",
             "glob_search",
             "grep_search",
@@ -2087,7 +2087,7 @@ fn normalize_subagent_type(subagent_type: Option<&str>) -> String {
         "verification" | "verificationagent" | "verify" | "verifier" => {
             String::from("Verification")
         }
-        "claudecodeguide" | "claudecodeguideagent" | "guide" => String::from("claude-code-guide"),
+        "claudecodeguide" | "claudecodeguideagent" | "guide" => String::from("claw-code-guide"),
         "statusline" | "statuslinesetup" => String::from("statusline-setup"),
         _ => trimmed.to_string(),
     }
