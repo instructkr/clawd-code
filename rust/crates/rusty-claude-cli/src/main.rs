@@ -19,11 +19,12 @@ use api::{
 };
 
 use commands::{
-    render_slash_command_help, resume_supported_slash_commands, slash_command_specs, SlashCommand,
+    handle_plugins_slash_command, render_slash_command_help, resume_supported_slash_commands,
+    slash_command_specs, SlashCommand,
 };
 use compat_harness::{extract_manifest, UpstreamPaths};
 use init::initialize_repo;
-use plugins::{PluginKind, PluginManager, PluginManagerConfig, PluginRegistry, PluginSummary};
+use plugins::{PluginManager, PluginManagerConfig, PluginRegistry};
 use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::{
     clear_oauth_credentials, generate_pkce_pair, generate_state, load_system_prompt,
@@ -31,7 +32,7 @@ use runtime::{
     AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource, ContentBlock,
     ConversationMessage, ConversationRuntime, MessageRole, OAuthAuthorizationRequest, OAuthConfig,
     OAuthTokenExchangeRequest, PermissionMode, PermissionPolicy, ProjectContext, RuntimeError,
-    RuntimeHookConfig, Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
+    Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
 };
 use serde_json::json;
 use tools::{execute_tool, mvp_tool_specs, ToolSpec};
@@ -1494,89 +1495,10 @@ impl LiveCli {
         let loader = ConfigLoader::default_for(&cwd);
         let runtime_config = loader.load()?;
         let mut manager = build_plugin_manager(&cwd, &loader, &runtime_config);
-
-        match action {
-            None | Some("list") => {
-                let plugins = manager.list_plugins()?;
-                println!("{}", render_plugins_report(&plugins));
-            }
-            Some("install") => {
-                let Some(target) = target else {
-                    println!("Usage: /plugins install <path-or-git-url>");
-                    return Ok(false);
-                };
-                let result = manager.install(target)?;
-                println!(
-                    "Plugins
-  Result           installed {}
-  Version          {}
-  Path             {}",
-                    result.plugin_id,
-                    result.version,
-                    result.install_path.display(),
-                );
-                self.reload_runtime_features()?;
-            }
-            Some("enable") => {
-                let Some(target) = target else {
-                    println!("Usage: /plugins enable <plugin-id>");
-                    return Ok(false);
-                };
-                manager.enable(target)?;
-                println!(
-                    "Plugins
-  Result           enabled {target}"
-                );
-                self.reload_runtime_features()?;
-            }
-            Some("disable") => {
-                let Some(target) = target else {
-                    println!("Usage: /plugins disable <plugin-id>");
-                    return Ok(false);
-                };
-                manager.disable(target)?;
-                println!(
-                    "Plugins
-  Result           disabled {target}"
-                );
-                self.reload_runtime_features()?;
-            }
-            Some("uninstall") => {
-                let Some(target) = target else {
-                    println!("Usage: /plugins uninstall <plugin-id>");
-                    return Ok(false);
-                };
-                manager.uninstall(target)?;
-                println!(
-                    "Plugins
-  Result           uninstalled {target}"
-                );
-                self.reload_runtime_features()?;
-            }
-            Some("update") => {
-                let Some(target) = target else {
-                    println!("Usage: /plugins update <plugin-id>");
-                    return Ok(false);
-                };
-                let result = manager.update(target)?;
-                println!(
-                    "Plugins
-  Result           updated {}
-  Old version      {}
-  New version      {}
-  Path             {}",
-                    result.plugin_id,
-                    result.old_version,
-                    result.new_version,
-                    result.install_path.display(),
-                );
-                self.reload_runtime_features()?;
-            }
-            Some(other) => {
-                println!(
-                    "Unknown /plugins action '{other}'. Use list, install, enable, disable, uninstall, or update."
-                );
-            }
+        let result = handle_plugins_slash_command(action, target, &mut manager)?;
+        println!("{}", result.message);
+        if result.reload_runtime {
+            self.reload_runtime_features()?;
         }
         Ok(false)
     }
@@ -1885,37 +1807,6 @@ fn render_repl_help() -> String {
         "
 ",
     )
-}
-
-fn render_plugins_report(plugins: &[PluginSummary]) -> String {
-    let mut lines = vec!["Plugins".to_string()];
-    if plugins.is_empty() {
-        lines.push("  No plugins discovered.".to_string());
-        return lines.join("\n");
-    }
-    for plugin in plugins {
-        let kind = match plugin.metadata.kind {
-            PluginKind::Builtin => "builtin",
-            PluginKind::Bundled => "bundled",
-            PluginKind::External => "external",
-        };
-        let location = plugin.metadata.root.as_ref().map_or_else(
-            || plugin.metadata.source.clone(),
-            |root| root.display().to_string(),
-        );
-        let enabled = if plugin.enabled {
-            "enabled"
-        } else {
-            "disabled"
-        };
-        lines.push(format!(
-            "  {id:<24} {kind:<8} {enabled:<8} v{version:<8} {location}",
-            id = plugin.metadata.id,
-            kind = kind,
-            version = plugin.metadata.version,
-        ));
-    }
-    lines.join("\n")
 }
 
 fn status_context(
@@ -2463,15 +2354,7 @@ fn build_runtime_plugin_state(
     let runtime_config = loader.load()?;
     let plugin_manager = build_plugin_manager(&cwd, &loader, &runtime_config);
     let plugin_registry = plugin_manager.plugin_registry()?;
-    let plugin_hooks = plugin_registry.aggregated_hooks()?;
-    let feature_config = runtime_config
-        .feature_config()
-        .clone()
-        .with_hooks(runtime_config.hooks().merged(&RuntimeHookConfig::new(
-            plugin_hooks.pre_tool_use,
-            plugin_hooks.post_tool_use,
-        )));
-    Ok((feature_config, plugin_registry))
+    Ok((runtime_config.feature_config().clone(), plugin_registry))
 }
 
 fn build_plugin_manager(

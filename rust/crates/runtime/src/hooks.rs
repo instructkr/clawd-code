@@ -1,6 +1,8 @@
 use std::ffi::OsStr;
+use std::path::Path;
 use std::process::Command;
 
+use plugins::{PluginError, PluginRegistry};
 use serde_json::json;
 
 use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
@@ -60,6 +62,19 @@ impl HookRunner {
     #[must_use]
     pub fn from_feature_config(feature_config: &RuntimeFeatureConfig) -> Self {
         Self::new(feature_config.hooks().clone())
+    }
+
+    pub fn from_feature_config_and_plugins(
+        feature_config: &RuntimeFeatureConfig,
+        plugin_registry: &PluginRegistry,
+    ) -> Result<Self, PluginError> {
+        let mut config = feature_config.hooks().clone();
+        let plugin_hooks = plugin_registry.aggregated_hooks()?;
+        config.extend(&RuntimeHookConfig::new(
+            plugin_hooks.pre_tool_use,
+            plugin_hooks.post_tool_use,
+        ));
+        Ok(Self::new(config))
     }
 
     #[must_use]
@@ -238,7 +253,11 @@ fn shell_command(command: &str) -> CommandWithStdin {
     };
 
     #[cfg(not(windows))]
-    let command_builder = {
+    let command_builder = if Path::new(command).exists() {
+        let mut command_builder = Command::new("sh");
+        command_builder.arg(command);
+        CommandWithStdin::new(command_builder)
+    } else {
         let mut command_builder = Command::new("sh");
         command_builder.arg("-lc").arg(command);
         CommandWithStdin::new(command_builder)
@@ -294,6 +313,50 @@ impl CommandWithStdin {
 mod tests {
     use super::{HookRunResult, HookRunner};
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
+    use plugins::{PluginManager, PluginManagerConfig};
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("hook-runner-{label}-{nanos}"))
+    }
+
+    fn write_hook_plugin(root: &Path, name: &str) {
+        fs::create_dir_all(root.join(".claude-plugin")).expect("manifest dir");
+        fs::create_dir_all(root.join("hooks")).expect("hooks dir");
+        fs::write(
+            root.join("hooks").join("pre.sh"),
+            "#!/bin/sh\nprintf 'plugin pre'\n",
+        )
+        .expect("write pre hook");
+        fs::write(
+            root.join("hooks").join("post.sh"),
+            "#!/bin/sh\nprintf 'plugin post'\n",
+        )
+        .expect("write post hook");
+        #[cfg(unix)]
+        {
+            let exec_mode = fs::Permissions::from_mode(0o755);
+            fs::set_permissions(root.join("hooks").join("pre.sh"), exec_mode.clone())
+                .expect("chmod pre hook");
+            fs::set_permissions(root.join("hooks").join("post.sh"), exec_mode)
+                .expect("chmod post hook");
+        }
+        fs::write(
+            root.join(".claude-plugin").join("plugin.json"),
+            format!(
+                "{{\n  \"name\": \"{name}\",\n  \"version\": \"1.0.0\",\n  \"description\": \"hook plugin\",\n  \"hooks\": {{\n    \"PreToolUse\": [\"./hooks/pre.sh\"],\n    \"PostToolUse\": [\"./hooks/post.sh\"]\n  }}\n}}"
+            ),
+        )
+        .expect("write plugin manifest");
+    }
 
     #[test]
     fn allows_exit_code_zero_and_captures_stdout() {
@@ -336,6 +399,40 @@ mod tests {
             .messages()
             .iter()
             .any(|message| message.contains("allowing tool execution to continue")));
+    }
+
+    #[test]
+    fn collects_hooks_from_enabled_plugins() {
+        let config_home = temp_dir("config");
+        let source_root = temp_dir("source");
+        write_hook_plugin(&source_root, "hooked");
+
+        let mut manager = PluginManager::new(PluginManagerConfig::new(&config_home));
+        manager
+            .install(source_root.to_str().expect("utf8 path"))
+            .expect("install should succeed");
+        let registry = manager.plugin_registry().expect("registry should build");
+
+        let runner = HookRunner::from_feature_config_and_plugins(
+            &RuntimeFeatureConfig::default(),
+            &registry,
+        )
+        .expect("plugin hooks should load");
+
+        let pre_result = runner.run_pre_tool_use("Read", r#"{"path":"README.md"}"#);
+        let post_result = runner.run_post_tool_use("Read", r#"{"path":"README.md"}"#, "ok", false);
+
+        assert_eq!(
+            pre_result,
+            HookRunResult::allow(vec!["plugin pre".to_string()])
+        );
+        assert_eq!(
+            post_result,
+            HookRunResult::allow(vec!["plugin post".to_string()])
+        );
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(source_root);
     }
 
     #[cfg(windows)]

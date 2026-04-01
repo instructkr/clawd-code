@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -13,7 +13,9 @@ const BUILTIN_MARKETPLACE: &str = "builtin";
 const BUNDLED_MARKETPLACE: &str = "bundled";
 const SETTINGS_FILE_NAME: &str = "settings.json";
 const REGISTRY_FILE_NAME: &str = "installed.json";
+const MANIFEST_FILE_NAME: &str = "plugin.json";
 const MANIFEST_RELATIVE_PATH: &str = ".claude-plugin/plugin.json";
+const PACKAGE_MANIFEST_RELATIVE_PATH: &str = MANIFEST_RELATIVE_PATH;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -87,17 +89,150 @@ impl PluginLifecycle {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PluginManifest {
     pub name: String,
     pub version: String,
     pub description: String,
+    #[serde(default)]
+    pub permissions: Vec<String>,
     #[serde(rename = "defaultEnabled", default)]
     pub default_enabled: bool,
     #[serde(default)]
     pub hooks: PluginHooks,
     #[serde(default)]
     pub lifecycle: PluginLifecycle,
+    #[serde(default)]
+    pub tools: Vec<PluginToolManifest>,
+    #[serde(default)]
+    pub commands: Vec<PluginCommandManifest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PluginToolManifest {
+    pub name: String,
+    pub description: String,
+    #[serde(rename = "inputSchema")]
+    pub input_schema: Value,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(rename = "requiredPermission", default = "default_tool_permission")]
+    pub required_permission: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PluginToolDefinition {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(rename = "inputSchema")]
+    pub input_schema: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginCommandManifest {
+    pub name: String,
+    pub description: String,
+    pub command: String,
+}
+
+type PluginPackageManifest = PluginManifest;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PluginTool {
+    plugin_id: String,
+    plugin_name: String,
+    definition: PluginToolDefinition,
+    command: String,
+    args: Vec<String>,
+    required_permission: String,
+    root: Option<PathBuf>,
+}
+
+impl PluginTool {
+    #[must_use]
+    pub fn new(
+        plugin_id: impl Into<String>,
+        plugin_name: impl Into<String>,
+        definition: PluginToolDefinition,
+        command: impl Into<String>,
+        args: Vec<String>,
+        required_permission: impl Into<String>,
+        root: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            plugin_id: plugin_id.into(),
+            plugin_name: plugin_name.into(),
+            definition,
+            command: command.into(),
+            args,
+            required_permission: required_permission.into(),
+            root,
+        }
+    }
+
+    #[must_use]
+    pub fn plugin_id(&self) -> &str {
+        &self.plugin_id
+    }
+
+    #[must_use]
+    pub fn definition(&self) -> &PluginToolDefinition {
+        &self.definition
+    }
+
+    #[must_use]
+    pub fn required_permission(&self) -> &str {
+        &self.required_permission
+    }
+
+    pub fn execute(&self, input: &Value) -> Result<String, PluginError> {
+        let input_json = input.to_string();
+        let mut process = Command::new(&self.command);
+        process
+            .args(&self.args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .env("CLAWD_PLUGIN_ID", &self.plugin_id)
+            .env("CLAWD_PLUGIN_NAME", &self.plugin_name)
+            .env("CLAWD_TOOL_NAME", &self.definition.name)
+            .env("CLAWD_TOOL_INPUT", &input_json);
+        if let Some(root) = &self.root {
+            process
+                .current_dir(root)
+                .env("CLAWD_PLUGIN_ROOT", root.display().to_string());
+        }
+
+        let mut child = process.spawn()?;
+        if let Some(stdin) = child.stdin.as_mut() {
+            use std::io::Write as _;
+            stdin.write_all(input_json.as_bytes())?;
+        }
+
+        let output = child.wait_with_output()?;
+        if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            Err(PluginError::CommandFailed(format!(
+                "plugin tool `{}` from `{}` failed for `{}`: {}",
+                self.definition.name,
+                self.plugin_id,
+                self.command,
+                if stderr.is_empty() {
+                    format!("exit status {}", output.status)
+                } else {
+                    stderr
+                }
+            )))
+        }
+    }
+}
+
+fn default_tool_permission() -> String {
+    "danger-full-access".to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,37 +260,41 @@ pub struct InstalledPluginRegistry {
     pub plugins: BTreeMap<String, InstalledPluginRecord>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BuiltinPlugin {
     metadata: PluginMetadata,
     hooks: PluginHooks,
     lifecycle: PluginLifecycle,
+    tools: Vec<PluginTool>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BundledPlugin {
     metadata: PluginMetadata,
     hooks: PluginHooks,
     lifecycle: PluginLifecycle,
+    tools: Vec<PluginTool>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ExternalPlugin {
     metadata: PluginMetadata,
     hooks: PluginHooks,
     lifecycle: PluginLifecycle,
+    tools: Vec<PluginTool>,
 }
 
 pub trait Plugin {
     fn metadata(&self) -> &PluginMetadata;
     fn hooks(&self) -> &PluginHooks;
     fn lifecycle(&self) -> &PluginLifecycle;
+    fn tools(&self) -> &[PluginTool];
     fn validate(&self) -> Result<(), PluginError>;
     fn initialize(&self) -> Result<(), PluginError>;
     fn shutdown(&self) -> Result<(), PluginError>;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum PluginDefinition {
     Builtin(BuiltinPlugin),
     Bundled(BundledPlugin),
@@ -173,6 +312,10 @@ impl Plugin for BuiltinPlugin {
 
     fn lifecycle(&self) -> &PluginLifecycle {
         &self.lifecycle
+    }
+
+    fn tools(&self) -> &[PluginTool] {
+        &self.tools
     }
 
     fn validate(&self) -> Result<(), PluginError> {
@@ -201,13 +344,23 @@ impl Plugin for BundledPlugin {
         &self.lifecycle
     }
 
+    fn tools(&self) -> &[PluginTool] {
+        &self.tools
+    }
+
     fn validate(&self) -> Result<(), PluginError> {
         validate_hook_paths(self.metadata.root.as_deref(), &self.hooks)?;
-        validate_lifecycle_paths(self.metadata.root.as_deref(), &self.lifecycle)
+        validate_lifecycle_paths(self.metadata.root.as_deref(), &self.lifecycle)?;
+        validate_tool_paths(self.metadata.root.as_deref(), &self.tools)
     }
 
     fn initialize(&self) -> Result<(), PluginError> {
-        run_lifecycle_commands(self.metadata(), self.lifecycle(), "init", &self.lifecycle.init)
+        run_lifecycle_commands(
+            self.metadata(),
+            self.lifecycle(),
+            "init",
+            &self.lifecycle.init,
+        )
     }
 
     fn shutdown(&self) -> Result<(), PluginError> {
@@ -233,13 +386,23 @@ impl Plugin for ExternalPlugin {
         &self.lifecycle
     }
 
+    fn tools(&self) -> &[PluginTool] {
+        &self.tools
+    }
+
     fn validate(&self) -> Result<(), PluginError> {
         validate_hook_paths(self.metadata.root.as_deref(), &self.hooks)?;
-        validate_lifecycle_paths(self.metadata.root.as_deref(), &self.lifecycle)
+        validate_lifecycle_paths(self.metadata.root.as_deref(), &self.lifecycle)?;
+        validate_tool_paths(self.metadata.root.as_deref(), &self.tools)
     }
 
     fn initialize(&self) -> Result<(), PluginError> {
-        run_lifecycle_commands(self.metadata(), self.lifecycle(), "init", &self.lifecycle.init)
+        run_lifecycle_commands(
+            self.metadata(),
+            self.lifecycle(),
+            "init",
+            &self.lifecycle.init,
+        )
     }
 
     fn shutdown(&self) -> Result<(), PluginError> {
@@ -277,6 +440,14 @@ impl Plugin for PluginDefinition {
         }
     }
 
+    fn tools(&self) -> &[PluginTool] {
+        match self {
+            Self::Builtin(plugin) => plugin.tools(),
+            Self::Bundled(plugin) => plugin.tools(),
+            Self::External(plugin) => plugin.tools(),
+        }
+    }
+
     fn validate(&self) -> Result<(), PluginError> {
         match self {
             Self::Builtin(plugin) => plugin.validate(),
@@ -302,7 +473,7 @@ impl Plugin for PluginDefinition {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RegisteredPlugin {
     definition: PluginDefinition,
     enabled: bool,
@@ -325,6 +496,11 @@ impl RegisteredPlugin {
     #[must_use]
     pub fn hooks(&self) -> &PluginHooks {
         self.definition.hooks()
+    }
+
+    #[must_use]
+    pub fn tools(&self) -> &[PluginTool] {
+        self.definition.tools()
     }
 
     #[must_use]
@@ -359,7 +535,7 @@ pub struct PluginSummary {
     pub enabled: bool,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct PluginRegistry {
     plugins: Vec<RegisteredPlugin>,
 }
@@ -403,6 +579,27 @@ impl PluginRegistry {
             })
     }
 
+    pub fn aggregated_tools(&self) -> Result<Vec<PluginTool>, PluginError> {
+        let mut tools = Vec::new();
+        let mut seen_names = BTreeMap::new();
+        for plugin in self.plugins.iter().filter(|plugin| plugin.is_enabled()) {
+            plugin.validate()?;
+            for tool in plugin.tools() {
+                if let Some(existing_plugin) =
+                    seen_names.insert(tool.definition().name.clone(), tool.plugin_id().to_string())
+                {
+                    return Err(PluginError::InvalidManifest(format!(
+                        "plugin tool `{}` is defined by both `{existing_plugin}` and `{}`",
+                        tool.definition().name,
+                        tool.plugin_id()
+                    )));
+                }
+                tools.push(tool.clone());
+            }
+        }
+        Ok(tools)
+    }
+
     pub fn initialize(&self) -> Result<(), PluginError> {
         for plugin in self.plugins.iter().filter(|plugin| plugin.is_enabled()) {
             plugin.validate()?;
@@ -412,7 +609,12 @@ impl PluginRegistry {
     }
 
     pub fn shutdown(&self) -> Result<(), PluginError> {
-        for plugin in self.plugins.iter().rev().filter(|plugin| plugin.is_enabled()) {
+        for plugin in self
+            .plugins
+            .iter()
+            .rev()
+            .filter(|plugin| plugin.is_enabled())
+        {
             plugin.shutdown()?;
         }
         Ok(())
@@ -561,7 +763,7 @@ impl PluginManager {
 
     pub fn validate_plugin_source(&self, source: &str) -> Result<PluginManifest, PluginError> {
         let path = resolve_local_source(source)?;
-        load_validated_manifest_from_root(&path)
+        load_plugin_from_directory(&path)
     }
 
     pub fn install(&mut self, source: &str) -> Result<InstallOutcome, PluginError> {
@@ -569,7 +771,7 @@ impl PluginManager {
         let temp_root = self.install_root().join(".tmp");
         let staged_source = materialize_source(&install_source, &temp_root)?;
         let cleanup_source = matches!(install_source, PluginInstallSource::GitUrl { .. });
-        let manifest = load_validated_manifest_from_root(&staged_source)?;
+        let manifest = load_validated_package_manifest_from_root(&staged_source)?;
 
         let plugin_id = plugin_id(&manifest.name, EXTERNAL_MARKETPLACE);
         let install_path = self.install_root().join(sanitize_plugin_id(&plugin_id));
@@ -647,7 +849,7 @@ impl PluginManager {
         let temp_root = self.install_root().join(".tmp");
         let staged_source = materialize_source(&record.source, &temp_root)?;
         let cleanup_source = matches!(record.source, PluginInstallSource::GitUrl { .. });
-        let manifest = load_validated_manifest_from_root(&staged_source)?;
+        let manifest = load_validated_package_manifest_from_root(&staged_source)?;
 
         if record.install_path.exists() {
             fs::remove_dir_all(&record.install_path)?;
@@ -806,6 +1008,7 @@ pub fn builtin_plugins() -> Vec<PluginDefinition> {
         },
         hooks: PluginHooks::default(),
         lifecycle: PluginLifecycle::default(),
+        tools: Vec::new(),
     })]
 }
 
@@ -815,7 +1018,7 @@ fn load_plugin_definition(
     source: String,
     marketplace: &str,
 ) -> Result<PluginDefinition, PluginError> {
-    let manifest = load_validated_manifest_from_root(root)?;
+    let manifest = load_validated_package_manifest_from_root(root)?;
     let metadata = PluginMetadata {
         id: plugin_id(&manifest.name, marketplace),
         name: manifest.name,
@@ -828,34 +1031,46 @@ fn load_plugin_definition(
     };
     let hooks = resolve_hooks(root, &manifest.hooks);
     let lifecycle = resolve_lifecycle(root, &manifest.lifecycle);
+    let tools = resolve_tools(root, &metadata.id, &metadata.name, &manifest.tools);
     Ok(match kind {
         PluginKind::Builtin => PluginDefinition::Builtin(BuiltinPlugin {
             metadata,
             hooks,
             lifecycle,
+            tools,
         }),
         PluginKind::Bundled => PluginDefinition::Bundled(BundledPlugin {
             metadata,
             hooks,
             lifecycle,
+            tools,
         }),
         PluginKind::External => PluginDefinition::External(ExternalPlugin {
             metadata,
             hooks,
             lifecycle,
+            tools,
         }),
     })
 }
 
-fn load_validated_manifest_from_root(root: &Path) -> Result<PluginManifest, PluginError> {
-    let manifest = load_manifest_from_root(root)?;
-    validate_manifest(&manifest)?;
+pub fn load_plugin_from_directory(root: &Path) -> Result<PluginManifest, PluginError> {
+    let manifest = load_manifest_from_directory(root)?;
+    validate_plugin_manifest(root, &manifest)?;
+    Ok(manifest)
+}
+
+fn load_validated_package_manifest_from_root(
+    root: &Path,
+) -> Result<PluginPackageManifest, PluginError> {
+    let manifest = load_package_manifest_from_root(root)?;
+    validate_package_manifest(root, &manifest)?;
     validate_hook_paths(Some(root), &manifest.hooks)?;
     validate_lifecycle_paths(Some(root), &manifest.lifecycle)?;
     Ok(manifest)
 }
 
-fn validate_manifest(manifest: &PluginManifest) -> Result<(), PluginError> {
+fn validate_plugin_manifest(root: &Path, manifest: &PluginManifest) -> Result<(), PluginError> {
     if manifest.name.trim().is_empty() {
         return Err(PluginError::InvalidManifest(
             "plugin manifest name cannot be empty".to_string(),
@@ -871,10 +1086,45 @@ fn validate_manifest(manifest: &PluginManifest) -> Result<(), PluginError> {
             "plugin manifest description cannot be empty".to_string(),
         ));
     }
+    validate_named_strings(&manifest.permissions, "permission")?;
+    validate_hook_paths(Some(root), &manifest.hooks)?;
+    validate_named_commands(root, &manifest.tools, "tool")?;
+    validate_named_commands(root, &manifest.commands, "command")?;
     Ok(())
 }
 
-fn load_manifest_from_root(root: &Path) -> Result<PluginManifest, PluginError> {
+fn validate_package_manifest(root: &Path, manifest: &PluginPackageManifest) -> Result<(), PluginError> {
+    if manifest.name.trim().is_empty() {
+        return Err(PluginError::InvalidManifest(
+            "plugin manifest name cannot be empty".to_string(),
+        ));
+    }
+    if manifest.version.trim().is_empty() {
+        return Err(PluginError::InvalidManifest(
+            "plugin manifest version cannot be empty".to_string(),
+        ));
+    }
+    if manifest.description.trim().is_empty() {
+        return Err(PluginError::InvalidManifest(
+            "plugin manifest description cannot be empty".to_string(),
+        ));
+    }
+    validate_named_commands(root, &manifest.tools, "tool")?;
+    Ok(())
+}
+
+fn load_manifest_from_directory(root: &Path) -> Result<PluginManifest, PluginError> {
+    let manifest_path = plugin_manifest_path(root)?;
+    let contents = fs::read_to_string(&manifest_path).map_err(|error| {
+        PluginError::NotFound(format!(
+            "plugin manifest not found at {}: {error}",
+            manifest_path.display()
+        ))
+    })?;
+    Ok(serde_json::from_str(&contents)?)
+}
+
+fn load_package_manifest_from_root(root: &Path) -> Result<PluginPackageManifest, PluginError> {
     let manifest_path = root.join(MANIFEST_RELATIVE_PATH);
     let contents = fs::read_to_string(&manifest_path).map_err(|error| {
         PluginError::NotFound(format!(
@@ -883,6 +1133,109 @@ fn load_manifest_from_root(root: &Path) -> Result<PluginManifest, PluginError> {
         ))
     })?;
     Ok(serde_json::from_str(&contents)?)
+}
+
+fn plugin_manifest_path(root: &Path) -> Result<PathBuf, PluginError> {
+    let direct_path = root.join(MANIFEST_FILE_NAME);
+    if direct_path.exists() {
+        return Ok(direct_path);
+    }
+
+    let packaged_path = root.join(MANIFEST_RELATIVE_PATH);
+    if packaged_path.exists() {
+        return Ok(packaged_path);
+    }
+
+    Err(PluginError::NotFound(format!(
+        "plugin manifest not found at {} or {}",
+        direct_path.display(),
+        packaged_path.display()
+    )))
+}
+
+fn validate_named_strings(entries: &[String], kind: &str) -> Result<(), PluginError> {
+    let mut seen = BTreeMap::<&str, ()>::new();
+    for entry in entries {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() {
+            return Err(PluginError::InvalidManifest(format!(
+                "plugin manifest {kind} cannot be empty"
+            )));
+        }
+        if seen.insert(trimmed, ()).is_some() {
+            return Err(PluginError::InvalidManifest(format!(
+                "plugin manifest {kind} `{trimmed}` is duplicated"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_named_commands(
+    root: &Path,
+    entries: &[impl NamedCommand],
+    kind: &str,
+) -> Result<(), PluginError> {
+    let mut seen = BTreeMap::<&str, ()>::new();
+    for entry in entries {
+        let name = entry.name().trim();
+        if name.is_empty() {
+            return Err(PluginError::InvalidManifest(format!(
+                "plugin {kind} name cannot be empty"
+            )));
+        }
+        if seen.insert(name, ()).is_some() {
+            return Err(PluginError::InvalidManifest(format!(
+                "plugin {kind} `{name}` is duplicated"
+            )));
+        }
+        if entry.description().trim().is_empty() {
+            return Err(PluginError::InvalidManifest(format!(
+                "plugin {kind} `{name}` description cannot be empty"
+            )));
+        }
+        if entry.command().trim().is_empty() {
+            return Err(PluginError::InvalidManifest(format!(
+                "plugin {kind} `{name}` command cannot be empty"
+            )));
+        }
+        validate_command_path(root, entry.command(), kind)?;
+    }
+    Ok(())
+}
+
+trait NamedCommand {
+    fn name(&self) -> &str;
+    fn description(&self) -> &str;
+    fn command(&self) -> &str;
+}
+
+impl NamedCommand for PluginToolManifest {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn description(&self) -> &str {
+        &self.description
+    }
+
+    fn command(&self) -> &str {
+        &self.command
+    }
+}
+
+impl NamedCommand for PluginCommandManifest {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn description(&self) -> &str {
+        &self.description
+    }
+
+    fn command(&self) -> &str {
+        &self.command
+    }
 }
 
 fn resolve_hooks(root: &Path, hooks: &PluginHooks) -> PluginHooks {
@@ -915,6 +1268,32 @@ fn resolve_lifecycle(root: &Path, lifecycle: &PluginLifecycle) -> PluginLifecycl
     }
 }
 
+fn resolve_tools(
+    root: &Path,
+    plugin_id: &str,
+    plugin_name: &str,
+    tools: &[PluginToolManifest],
+) -> Vec<PluginTool> {
+    tools
+        .iter()
+        .map(|tool| {
+            PluginTool::new(
+                plugin_id,
+                plugin_name,
+                PluginToolDefinition {
+                    name: tool.name.clone(),
+                    description: Some(tool.description.clone()),
+                    input_schema: tool.input_schema.clone(),
+                },
+                resolve_hook_entry(root, &tool.command),
+                tool.args.clone(),
+                tool.required_permission.clone(),
+                Some(root.to_path_buf()),
+            )
+        })
+        .collect()
+}
+
 fn validate_hook_paths(root: Option<&Path>, hooks: &PluginHooks) -> Result<(), PluginError> {
     let Some(root) = root else {
         return Ok(());
@@ -934,6 +1313,16 @@ fn validate_lifecycle_paths(
     };
     for entry in lifecycle.init.iter().chain(lifecycle.shutdown.iter()) {
         validate_command_path(root, entry, "lifecycle command")?;
+    }
+    Ok(())
+}
+
+fn validate_tool_paths(root: Option<&Path>, tools: &[PluginTool]) -> Result<(), PluginError> {
+    let Some(root) = root else {
+        return Ok(());
+    };
+    for tool in tools {
+        validate_command_path(root, &tool.command, "tool")?;
     }
     Ok(())
 }
@@ -965,7 +1354,7 @@ fn resolve_hook_entry(root: &Path, entry: &str) -> String {
 }
 
 fn is_literal_command(entry: &str) -> bool {
-    !entry.starts_with("./") && !entry.starts_with("../")
+    !entry.starts_with("./") && !entry.starts_with("../") && !Path::new(entry).is_absolute()
 }
 
 fn run_lifecycle_commands(
@@ -979,17 +1368,29 @@ fn run_lifecycle_commands(
     }
 
     for command in commands {
-        let output = if Path::new(command).exists() {
+        let mut process = if Path::new(command).exists() {
             if cfg!(windows) {
-                Command::new("cmd").arg("/C").arg(command).output()?
+                let mut process = Command::new("cmd");
+                process.arg("/C").arg(command);
+                process
             } else {
-                Command::new("sh").arg(command).output()?
+                let mut process = Command::new("sh");
+                process.arg(command);
+                process
             }
         } else if cfg!(windows) {
-            Command::new("cmd").arg("/C").arg(command).output()?
+            let mut process = Command::new("cmd");
+            process.arg("/C").arg(command);
+            process
         } else {
-            Command::new("sh").arg("-lc").arg(command).output()?
+            let mut process = Command::new("sh");
+            process.arg("-lc").arg(command);
+            process
         };
+        if let Some(root) = &metadata.root {
+            process.current_dir(root);
+        }
+        let output = process.output()?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -1206,12 +1607,12 @@ mod tests {
         let log_path = root.join("lifecycle.log");
         fs::write(
             root.join("lifecycle").join("init.sh"),
-            "#!/bin/sh\nprintf 'init\\n' >> \"$(dirname \"$0\")/../lifecycle.log\"\n",
+            "#!/bin/sh\nprintf 'init\\n' >> lifecycle.log\n",
         )
         .expect("write init hook");
         fs::write(
             root.join("lifecycle").join("shutdown.sh"),
-            "#!/bin/sh\nprintf 'shutdown\\n' >> \"$(dirname \"$0\")/../lifecycle.log\"\n",
+            "#!/bin/sh\nprintf 'shutdown\\n' >> lifecycle.log\n",
         )
         .expect("write shutdown hook");
         fs::write(
@@ -1232,6 +1633,7 @@ mod tests {
             description: "desc".to_string(),
             default_enabled: false,
             hooks: PluginHooks::default(),
+            lifecycle: PluginLifecycle::default(),
         })
         .expect_err("empty name should fail");
         assert!(error.to_string().contains("name cannot be empty"));
@@ -1364,12 +1766,13 @@ mod tests {
     fn plugin_registry_runs_initialize_and_shutdown_for_enabled_plugins() {
         let config_home = temp_dir("lifecycle-home");
         let source_root = temp_dir("lifecycle-source");
-        let log_path = write_lifecycle_plugin(&source_root, "lifecycle-demo", "1.0.0");
+        let _ = write_lifecycle_plugin(&source_root, "lifecycle-demo", "1.0.0");
 
         let mut manager = PluginManager::new(PluginManagerConfig::new(&config_home));
-        manager
+        let install = manager
             .install(source_root.to_str().expect("utf8 path"))
             .expect("install should succeed");
+        let log_path = install.install_path.join("lifecycle.log");
 
         let registry = manager.plugin_registry().expect("registry should build");
         registry.initialize().expect("init should succeed");

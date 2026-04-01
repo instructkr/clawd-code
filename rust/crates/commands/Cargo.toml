@@ -9,4 +9,5 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+plugins = { path = "../plugins" }
 runtime = { path = "../runtime" }

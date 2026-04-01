@@ -111,6 +111,7 @@ dependencies = [
 name = "commands"
 version = "0.1.0"
 dependencies = [
+ "plugins",
  "runtime",
 ]
 
@@ -1100,6 +1101,7 @@ name = "runtime"
 version = "0.1.0"
 dependencies = [
  "glob",
+ "plugins",
  "regex",
  "serde",
  "serde_json",

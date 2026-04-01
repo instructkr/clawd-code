@@ -113,6 +113,21 @@ pub struct ConversationRuntime<C, T> {
     plugins_shutdown: bool,
 }
 
+impl<C, T> ConversationRuntime<C, T> {
+    fn shutdown_registered_plugins(&mut self) -> Result<(), RuntimeError> {
+        if self.plugins_shutdown {
+            return Ok(());
+        }
+        if let Some(registry) = &self.plugin_registry {
+            registry
+                .shutdown()
+                .map_err(|error| RuntimeError::new(format!("plugin shutdown failed: {error}")))?;
+        }
+        self.plugins_shutdown = true;
+        Ok(())
+    }
+}
+
 impl<C, T> ConversationRuntime<C, T>
 where
     C: ApiClient,
@@ -144,7 +159,7 @@ where
         tool_executor: T,
         permission_policy: PermissionPolicy,
         system_prompt: Vec<String>,
-            feature_config: RuntimeFeatureConfig,
+        feature_config: RuntimeFeatureConfig,
     ) -> Self {
         let usage_tracker = UsageTracker::from_session(&session);
         Self {
@@ -172,6 +187,11 @@ where
         feature_config: RuntimeFeatureConfig,
         plugin_registry: PluginRegistry,
     ) -> Result<Self, RuntimeError> {
+        let hook_runner =
+            HookRunner::from_feature_config_and_plugins(&feature_config, &plugin_registry)
+                .map_err(|error| {
+                    RuntimeError::new(format!("plugin hook registration failed: {error}"))
+                })?;
         plugin_registry
             .initialize()
             .map_err(|error| RuntimeError::new(format!("plugin initialization failed: {error}")))?;
@@ -183,6 +203,7 @@ where
             system_prompt,
             feature_config,
         );
+        runtime.hook_runner = hook_runner;
         runtime.plugin_registry = Some(plugin_registry);
         Ok(runtime)
     }
@@ -336,21 +357,12 @@ where
 
     #[must_use]
     pub fn into_session(mut self) -> Session {
-        let _ = self.shutdown_plugins();
+        let _ = self.shutdown_registered_plugins();
         std::mem::take(&mut self.session)
     }
 
     pub fn shutdown_plugins(&mut self) -> Result<(), RuntimeError> {
-        if self.plugins_shutdown {
-            return Ok(());
-        }
-        if let Some(registry) = &self.plugin_registry {
-            registry
-                .shutdown()
-                .map_err(|error| RuntimeError::new(format!("plugin shutdown failed: {error}")))?;
-        }
-        self.plugins_shutdown = true;
-        Ok(())
+        self.shutdown_registered_plugins()
     }
 
     fn maybe_auto_compact(&mut self) -> Option<AutoCompactionEvent> {
@@ -381,7 +393,7 @@ where
 
 impl<C, T> Drop for ConversationRuntime<C, T> {
     fn drop(&mut self) {
-        let _ = self.shutdown_plugins();
+        let _ = self.shutdown_registered_plugins();
     }
 }
 
@@ -525,6 +537,8 @@ mod tests {
     use crate::usage::TokenUsage;
     use plugins::{PluginManager, PluginManagerConfig};
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -603,12 +617,12 @@ mod tests {
         let log_path = root.join("lifecycle.log");
         fs::write(
             root.join("lifecycle").join("init.sh"),
-            "#!/bin/sh\nprintf 'init\\n' >> \"$(dirname \"$0\")/../lifecycle.log\"\n",
+            "#!/bin/sh\nprintf 'init\\n' >> lifecycle.log\n",
         )
         .expect("write init script");
         fs::write(
             root.join("lifecycle").join("shutdown.sh"),
-            "#!/bin/sh\nprintf 'shutdown\\n' >> \"$(dirname \"$0\")/../lifecycle.log\"\n",
+            "#!/bin/sh\nprintf 'shutdown\\n' >> lifecycle.log\n",
         )
         .expect("write shutdown script");
         fs::write(
@@ -619,6 +633,36 @@ mod tests {
         )
         .expect("write plugin manifest");
         log_path
+    }
+
+    fn write_hook_plugin(root: &Path, name: &str, pre_message: &str, post_message: &str) {
+        fs::create_dir_all(root.join(".claude-plugin")).expect("manifest dir");
+        fs::create_dir_all(root.join("hooks")).expect("hooks dir");
+        fs::write(
+            root.join("hooks").join("pre.sh"),
+            format!("#!/bin/sh\nprintf '%s\\n' '{pre_message}'\n"),
+        )
+        .expect("write pre hook");
+        fs::write(
+            root.join("hooks").join("post.sh"),
+            format!("#!/bin/sh\nprintf '%s\\n' '{post_message}'\n"),
+        )
+        .expect("write post hook");
+        #[cfg(unix)]
+        {
+            let exec_mode = fs::Permissions::from_mode(0o755);
+            fs::set_permissions(root.join("hooks").join("pre.sh"), exec_mode.clone())
+                .expect("chmod pre hook");
+            fs::set_permissions(root.join("hooks").join("post.sh"), exec_mode)
+                .expect("chmod post hook");
+        }
+        fs::write(
+            root.join(".claude-plugin").join("plugin.json"),
+            format!(
+                "{{\n  \"name\": \"{name}\",\n  \"version\": \"1.0.0\",\n  \"description\": \"runtime hook plugin\",\n  \"hooks\": {{\n    \"PreToolUse\": [\"./hooks/pre.sh\"],\n    \"PostToolUse\": [\"./hooks/post.sh\"]\n  }}\n}}"
+            ),
+        )
+        .expect("write plugin manifest");
     }
 
     #[test]
@@ -866,12 +910,13 @@ mod tests {
     fn initializes_and_shuts_down_plugins_with_runtime_lifecycle() {
         let config_home = temp_dir("config");
         let source_root = temp_dir("source");
-        let log_path = write_lifecycle_plugin(&source_root, "runtime-lifecycle");
+        let _ = write_lifecycle_plugin(&source_root, "runtime-lifecycle");
 
         let mut manager = PluginManager::new(PluginManagerConfig::new(&config_home));
-        manager
+        let install = manager
             .install(source_root.to_str().expect("utf8 path"))
             .expect("install should succeed");
+        let log_path = install.install_path.join("lifecycle.log");
         let registry = manager.plugin_registry().expect("registry should load");
 
         {
@@ -896,6 +941,116 @@ mod tests {
 
         let _ = fs::remove_dir_all(config_home);
         let _ = fs::remove_dir_all(source_root);
+    }
+
+    #[test]
+    fn executes_hooks_from_installed_plugins_during_tool_use() {
+        struct TwoCallApiClient {
+            calls: usize,
+        }
+
+        impl ApiClient for TwoCallApiClient {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                match self.calls {
+                    1 => Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "tool-1".to_string(),
+                            name: "add".to_string(),
+                            input: r#"{"lhs":2,"rhs":2}"#.to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]),
+                    2 => {
+                        assert!(request
+                            .messages
+                            .iter()
+                            .any(|message| message.role == MessageRole::Tool));
+                        Ok(vec![
+                            AssistantEvent::TextDelta("done".to_string()),
+                            AssistantEvent::MessageStop,
+                        ])
+                    }
+                    _ => Err(RuntimeError::new("unexpected extra API call")),
+                }
+            }
+        }
+
+        let config_home = temp_dir("hook-config");
+        let first_source_root = temp_dir("hook-source-a");
+        let second_source_root = temp_dir("hook-source-b");
+        write_hook_plugin(
+            &first_source_root,
+            "first",
+            "plugin pre one",
+            "plugin post one",
+        );
+        write_hook_plugin(
+            &second_source_root,
+            "second",
+            "plugin pre two",
+            "plugin post two",
+        );
+
+        let mut manager = PluginManager::new(PluginManagerConfig::new(&config_home));
+        manager
+            .install(first_source_root.to_str().expect("utf8 path"))
+            .expect("first plugin install should succeed");
+        manager
+            .install(second_source_root.to_str().expect("utf8 path"))
+            .expect("second plugin install should succeed");
+        let registry = manager.plugin_registry().expect("registry should load");
+
+        let mut runtime = ConversationRuntime::new_with_plugins(
+            Session::new(),
+            TwoCallApiClient { calls: 0 },
+            StaticToolExecutor::new().register("add", |_input| Ok("4".to_string())),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+            RuntimeFeatureConfig::default(),
+            registry,
+        )
+        .expect("runtime should load plugin hooks");
+
+        let summary = runtime
+            .run_turn("use add", None)
+            .expect("tool loop succeeds");
+
+        assert_eq!(summary.tool_results.len(), 1);
+        let ContentBlock::ToolResult {
+            is_error, output, ..
+        } = &summary.tool_results[0].blocks[0]
+        else {
+            panic!("expected tool result block");
+        };
+        assert!(
+            !*is_error,
+            "plugin hooks should not force an error: {output:?}"
+        );
+        assert!(
+            output.contains('4'),
+            "tool output missing value: {output:?}"
+        );
+        assert!(
+            output.contains("plugin pre one"),
+            "tool output missing first pre hook feedback: {output:?}"
+        );
+        assert!(
+            output.contains("plugin pre two"),
+            "tool output missing second pre hook feedback: {output:?}"
+        );
+        assert!(
+            output.contains("plugin post one"),
+            "tool output missing first post hook feedback: {output:?}"
+        );
+        assert!(
+            output.contains("plugin post two"),
+            "tool output missing second post hook feedback: {output:?}"
+        );
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(first_source_root);
+        let _ = fs::remove_dir_all(second_source_root);
     }
 
     #[test]
