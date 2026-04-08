@@ -153,6 +153,23 @@ cd rust
 ./target/debug/claw --model "openai/gpt-4.1-mini" prompt "summarize this repository in one sentence"
 ```
 
+### Alibaba DashScope (Qwen)
+
+For Qwen models via Alibaba's native DashScope API (higher rate limits than OpenRouter):
+
+```bash
+export DASHSCOPE_API_KEY="sk-..."
+
+cd rust
+./target/debug/claw --model "qwen/qwen-max" prompt "hello"
+# or bare:
+./target/debug/claw --model "qwen-plus" prompt "hello"
+```
+
+Model names starting with `qwen/` or `qwen-` are automatically routed to the DashScope compatible-mode endpoint (`https://dashscope.aliyuncs.com/compatible-mode/v1`). You do **not** need to set `OPENAI_BASE_URL` or unset `ANTHROPIC_API_KEY` — the model prefix wins over the ambient credential sniffer.
+
+Reasoning variants (`qwen-qwq-*`, `qwq-*`, `*-thinking`) automatically strip `temperature`/`top_p`/`frequency_penalty`/`presence_penalty` before the request hits the wire (these params are rejected by reasoning models).
+
 ## Supported Providers & Models
 
 `claw` has three built-in provider backends. The provider is selected automatically based on the model name, falling back to whichever credential is present in the environment.
@@ -164,8 +181,11 @@ cd rust
 | **Anthropic** (direct) | Anthropic Messages API | `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` or OAuth (`claw login`) | `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` |
 | **xAI** | OpenAI-compatible | `XAI_API_KEY` | `XAI_BASE_URL` | `https://api.x.ai/v1` |
 | **OpenAI-compatible** | OpenAI Chat Completions | `OPENAI_API_KEY` | `OPENAI_BASE_URL` | `https://api.openai.com/v1` |
+| **DashScope** (Alibaba) | OpenAI-compatible | `DASHSCOPE_API_KEY` | `DASHSCOPE_BASE_URL` | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
 
 The OpenAI-compatible backend also serves as the gateway for **OpenRouter**, **Ollama**, and any other service that speaks the OpenAI `/v1/chat/completions` wire format — just point `OPENAI_BASE_URL` at the service.
+
+**Model-name prefix routing:** If a model name starts with `openai/`, `gpt-`, `qwen/`, or `qwen-`, the provider is selected by the prefix regardless of which env vars are set. This prevents accidental misrouting to Anthropic when multiple credentials exist in the environment.
 
 ### Tested models and aliases
 
