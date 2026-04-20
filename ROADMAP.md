@@ -4966,3 +4966,45 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
    **Blocker.** None. Reuses existing `stale_base` module; no new logic needed, just a missing call site.
 
    **Source.** Jobdori dogfood 2026-04-20 against `/tmp/jobdori-129-mcp-cred-order` + `/tmp/stale-branch` in response to 10-min cron cycle. Confirmed: `claw doctor` on branch 5 commits behind main says "Status: ok" but `prompt` dispatch would warn "worktree HEAD does not match expected base commit." Gap is a missing invocation of the already-correct `run_stale_base_preflight()` in the `doctor` action handler. Joins **Boot preflight / doctor contract (#80–#83, #114)** family — doctor is the single machine-readable preflight surface; missing checks degrade operator trust. Also relates to **Silent-state inventory** cluster (#102/#127/#129/#245) because stale-base is a runtime truth ("my branch is behind main") that the preflight surface (doctor) does not expose.
+
+## Pinpoint #131. `claw export` positional argument silently treated as output PATH, not session reference, causing wrong-session export with no warning
+
+**The clawability gap.** `claw export <session-id> --output /path/to/out.md` does NOT export the session named `<session-id>`. The positional arg `<session-id>` is parsed as the output PATH, and the session reference defaults to `latest`. Result: operator thinks they're exporting session A, gets session B (latest) silently. No error, no warning.
+
+   **Trace path.**
+   - `rust/crates/rusty-claude-cli/src/main.rs:6018-6038` — `parse_export_args()`: when no `--session` flag is provided, `session_reference = LATEST_SESSION_REFERENCE`. The first positional arg gets assigned to `output_path` (the loop's `other if output_path.is_none()` arm).
+   - The user's intent ("export this session") is silently rewritten to "export latest session, naming the output file what you typed."
+   - There is no validation that the positional arg looks like a path (e.g., has a file extension) versus a session ID.
+
+   **Reproduce.**
+   ```
+   $ claw export this-session-does-not-exist --output /tmp/out.md
+   Export
+     Result           wrote markdown transcript
+     File             /tmp/out.md
+     Session          session-1775777421902-1   <-- LATEST, not requested!
+     Messages         0
+   ```
+   
+   With explicit `--session` flag, behavior is correct:
+   ```
+   $ claw export --session this-session-does-not-exist --output /tmp/out.md
+   error: session not found: this-session-does-not-exist
+   ```
+
+   **Why this matters.**
+   1. **Data confusion.** Operator believes they're exporting session A, gets session B silently. If session B contains sensitive data the user didn't intend to share, this is leakage.
+   2. **No file extension validation.** The positional arg becomes a filename even if it has no extension or looks like a session ID.
+   3. **Asymmetric flag/positional behavior.** `--session FOO` errors on missing session; positional FOO silently substitutes latest. This violates least-surprise.
+   4. **Joins silent-state inventory family** (#102, #127, #129, #130) — same pattern: silent fallback to default behavior instead of erroring on unrecognized input.
+
+   **Fix shape.**
+   1. **Heuristic detection in `parse_export_args()`** — if the positional arg has no path separator AND no file extension AND matches the pattern of a known session ID (e.g., `session-\d+-\d+`), treat it as a session reference, not an output path. Emit a warning if ambiguous.
+   2. **Or stricter:** require explicit `--session` and `--output` flags; deprecate positional fallback. Reject ambiguous positional with: `error: ambiguous argument 'X'; use --session X for session reference or --output X for output path`.
+   3. **Regression tests:** (a) positional looks like session ID → treated as session, (b) positional looks like path → treated as output_path, (c) ambiguous → error with hint.
+
+   **Acceptance.** `claw export <session-id-pattern>` either errors (if session doesn't exist) or exports the requested session. Cannot silently substitute `latest` when user names a specific reference.
+
+   **Blocker.** None. Pure parser-level fix; ~30 lines in `parse_export_args()`.
+
+   **Source.** Jobdori dogfood 2026-04-20 against `/tmp/jobdori-130-export-error/rust` discovered while auditing #130 export error path. Joins **Silent-state inventory** (#102, #127, #129, #130) family as 5th — silent fallback to default instead of erroring. Joins **Parser-level trust gap quintet** (#108, #117, #119, #122, #127) as 6th — same `_other` fall-through pattern at the per-verb arg parser level. Joins **Truth-audit / diagnostic-integrity** — wrong session is exported without any signal to the operator. Natural bundle: **#130 + #131** — export-surface integrity pair: error envelope (#130) + correct session targeting (#131). Both required for `export` verb to be clawable. Session tally: ROADMAP #131.
