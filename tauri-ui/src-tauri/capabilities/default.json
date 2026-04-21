@@ -5,6 +5,9 @@
   "windows": ["main"],
   "permissions": [
     "core:default",
-    "opener:default"
+    "opener:default",
+    "shell:allow-execute",
+    "shell:allow-spawn",
+    "shell:allow-kill"
   ]
 }

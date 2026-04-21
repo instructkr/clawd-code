@@ -22,6 +22,10 @@
     }
   },
   "bundle": {
+    "externalBin": [
+      "binaries/claw",
+      "binaries/hardware_daemon"
+    ],
     "active": true,
     "targets": "all",
     "icon": [
