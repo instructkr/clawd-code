@@ -1556,6 +1556,8 @@ fn render_doctor_report() -> Result<DoctorReport, Box<dyn std::error::Error>> {
         project_root,
         git_branch,
         git_summary,
+        active_session: false,
+        session_id: None,
         sandbox_status: resolve_sandbox_status(sandbox_config.sandbox(), &cwd),
     };
     Ok(DoctorReport {
@@ -2376,6 +2378,8 @@ struct ResumeCommandOutcome {
 struct StatusContext {
     cwd: PathBuf,
     session_path: Option<PathBuf>,
+    active_session: bool,
+    session_id: Option<String>,
     loaded_config_files: usize,
     discovered_config_files: usize,
     memory_file_count: usize,
@@ -2383,6 +2387,16 @@ struct StatusContext {
     git_branch: Option<String>,
     git_summary: GitWorkspaceSummary,
     sandbox_status: runtime::SandboxStatus,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct WorkerStateSnapshot {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    prompt_in_flight: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4993,6 +5007,8 @@ fn status_json_value(
         "kind": "status",
         "model": model,
         "permission_mode": permission_mode,
+        "active_session": context.active_session,
+        "session_id": context.session_id,
         "usage": {
             "messages": usage.message_count,
             "turns": usage.turns,
@@ -5051,9 +5067,12 @@ fn status_context(
         parse_git_status_metadata(project_context.git_status.as_deref());
     let git_summary = parse_git_workspace_summary(project_context.git_status.as_deref());
     let sandbox_status = resolve_sandbox_status(runtime_config.sandbox(), &cwd);
+    let worker_state = read_worker_state_snapshot(&cwd);
     Ok(StatusContext {
         cwd,
         session_path: session_path.map(Path::to_path_buf),
+        active_session: worker_state.as_ref().is_some_and(worker_state_is_active),
+        session_id: worker_state.and_then(|snapshot| snapshot.session_id),
         loaded_config_files: runtime_config.loaded_entries().len(),
         discovered_config_files,
         memory_file_count: project_context.instruction_files.len(),
@@ -5062,6 +5081,20 @@ fn status_context(
         git_summary,
         sandbox_status,
     })
+}
+
+fn read_worker_state_snapshot(cwd: &Path) -> Option<WorkerStateSnapshot> {
+    let state_path = cwd.join(".claw").join("worker-state.json");
+    let raw = fs::read_to_string(state_path).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn worker_state_is_active(snapshot: &WorkerStateSnapshot) -> bool {
+    snapshot.prompt_in_flight
+        || matches!(
+            snapshot.status.as_deref(),
+            Some("spawning" | "trust_required" | "ready_for_prompt" | "running")
+        )
 }
 
 fn format_status_report(
@@ -5116,10 +5149,7 @@ fn format_status_report(
             context.git_summary.staged_files,
             context.git_summary.unstaged_files,
             context.git_summary.untracked_files,
-            context.session_path.as_ref().map_or_else(
-                || "live-repl".to_string(),
-                |path| path.display().to_string()
-            ),
+            format_active_session(context),
             context.loaded_config_files,
             context.discovered_config_files,
             context.memory_file_count,
@@ -5131,6 +5161,17 @@ fn format_status_report(
 
 ",
     )
+}
+
+fn format_active_session(context: &StatusContext) -> String {
+    if context.active_session {
+        match context.session_id.as_deref() {
+            Some(session_id) => format!("active ({session_id})"),
+            None => "active".to_string(),
+        }
+    } else {
+        "idle".to_string()
+    }
 }
 
 fn format_sandbox_report(status: &runtime::SandboxStatus) -> String {
@@ -10346,6 +10387,8 @@ mod tests {
             &super::StatusContext {
                 cwd: PathBuf::from("/tmp/project"),
                 session_path: Some(PathBuf::from("session.jsonl")),
+                active_session: true,
+                session_id: Some("boot-status-test".to_string()),
                 loaded_config_files: 2,
                 discovered_config_files: 3,
                 memory_file_count: 4,
@@ -10374,10 +10417,10 @@ mod tests {
             status.contains("Git state        dirty · 3 files · 1 staged, 1 unstaged, 1 untracked")
         );
         assert!(status.contains("Changed files    3"));
+        assert!(status.contains("Session          active (boot-status-test)"));
         assert!(status.contains("Staged           1"));
         assert!(status.contains("Unstaged         1"));
         assert!(status.contains("Untracked        1"));
-        assert!(status.contains("Session          session.jsonl"));
         assert!(status.contains("Config files     loaded 2/3"));
         assert!(status.contains("Memory files     4"));
         assert!(status.contains("Suggested flow   /status → /diff → /commit"));

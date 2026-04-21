@@ -39,6 +39,8 @@ fn status_and_sandbox_emit_json_when_requested() {
 
     let status = assert_json_command(&root, &["--output-format", "json", "status"]);
     assert_eq!(status["kind"], "status");
+    assert_eq!(status["active_session"], false);
+    assert!(status["session_id"].is_null());
     assert!(status["workspace"]["cwd"].as_str().is_some());
 
     let sandbox = assert_json_command(&root, &["--output-format", "json", "sandbox"]);
@@ -384,6 +386,47 @@ fn resumed_version_and_init_emit_structured_json_when_requested() {
     assert!(root.join("CLAUDE.md").exists());
 }
 
+#[test]
+fn status_json_surfaces_active_session_and_boot_session_id_from_worker_state() {
+    let root = unique_temp_dir("status-worker-state-json");
+    fs::create_dir_all(&root).expect("temp dir should exist");
+    write_worker_state_fixture(&root, "running", "boot-fixture-123");
+
+    let status = assert_json_command(&root, &["--output-format", "json", "status"]);
+    assert_eq!(status["kind"], "status");
+    assert_eq!(status["active_session"], true);
+    assert_eq!(status["session_id"], "boot-fixture-123");
+}
+
+#[test]
+fn status_text_surfaces_active_session_and_boot_session_id_from_worker_state() {
+    let root = unique_temp_dir("status-worker-state-text");
+    fs::create_dir_all(&root).expect("temp dir should exist");
+    write_worker_state_fixture(&root, "running", "boot-fixture-456");
+
+    let output = run_claw(&root, &["status"], &[]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Session          active (boot-fixture-456)"));
+}
+
+#[test]
+fn worker_state_fixture_round_trips_session_id_across_status_surface() {
+    let root = unique_temp_dir("status-worker-state-roundtrip");
+    fs::create_dir_all(&root).expect("temp dir should exist");
+    let session_id = "boot-roundtrip-789";
+    write_worker_state_fixture(&root, "running", session_id);
+
+    let status = assert_json_command(&root, &["--output-format", "json", "status"]);
+    assert_eq!(status["active_session"], true);
+    assert_eq!(status["session_id"], session_id);
+
+    let raw = fs::read_to_string(root.join(".claw").join("worker-state.json"))
+        .expect("worker state should exist");
+    let state: Value = serde_json::from_str(&raw).expect("worker state should be valid json");
+    assert_eq!(state["session_id"], session_id);
+}
+
 fn assert_json_command(current_dir: &Path, args: &[&str]) -> Value {
     assert_json_command_with_env(current_dir, args, &[])
 }
@@ -429,6 +472,26 @@ fn write_upstream_fixture(root: &Path) -> PathBuf {
     )
     .expect("cli fixture should write");
     upstream
+}
+
+fn write_worker_state_fixture(root: &Path, status: &str, session_id: &str) {
+    let claw_dir = root.join(".claw");
+    fs::create_dir_all(&claw_dir).expect("worker state dir should exist");
+    fs::write(
+        claw_dir.join("worker-state.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "worker_id": "worker-test",
+            "session_id": session_id,
+            "status": status,
+            "is_ready": status == "ready_for_prompt",
+            "trust_gate_cleared": false,
+            "prompt_in_flight": status == "running",
+            "updated_at": 1,
+            "seconds_since_update": 0
+        }))
+        .expect("worker state json should serialize"),
+    )
+    .expect("worker state fixture should write");
 }
 
 fn write_session_fixture(root: &Path, session_id: &str, user_text: Option<&str>) -> PathBuf {
