@@ -7122,3 +7122,79 @@ File as a **consistency/discoverability gap**, not a blocker. Can ship as part o
 - `claw config --help` → emits help for config command
 - `claw status --help` → emits help for status command
 - Bonus: `claw export --help`, `claw submit --help` continue to work (regression test)
+
+---
+
+## Pinpoint #130d. `claw config --help` silently ignores help flag and runs config display
+
+**Concrete observation (cycle #52 dogfood, 2026-04-23 01:53 Seoul):**
+
+```bash
+$ claw config --help
+Config
+  Working directory /private/tmp/dogfood-probe-47
+  Loaded files      0
+  Merged keys       0
+  ...
+  (displays full config, ignores --help)
+```
+
+Expected: help for the config command. Actual: runs the config command, silent acceptance of `--help`.
+
+**Comparison (help inconsistency family):**
+- `claw diff --help` → error (rejects as extra arg) [#130c — FIXED]
+- `claw config --help` → silent ignore, runs command ⚠️
+- `claw status --help` → shows help ✅
+- `claw mcp --help` → shows help ✅
+
+**What's broken:**
+- User expecting `claw config --help` to show help gets the config dump instead
+- Silent behavior: no error, no help, just unexpected output
+- Violates help-parity contract (other local commands honor `--help`)
+
+**Root cause (traced at main.rs:1131):**
+
+The `"config"` parser arm accepts all trailing args:
+```rust
+"config" => {
+    let cwd = rest.get(1).and_then(|arg| {
+        if arg == "--cwd" {
+            rest.get(2).map(|p| p.as_str())
+        } else {
+            None
+        }
+    });
+    // ... rest of parsing, `--help` falls through silently
+    Ok(CliAction::Config { ... })
+}
+```
+
+Unlike the `diff` arm (which explicitly checks `rest.len() > 1`), the `config` arm parses arguments positionally (`--cwd VALUE`) and silently ignores unrecognized args like `--help`.
+
+**Fix strategy:**
+
+Similar to #130c but with different validation:
+1. Add `Config` variant to `LocalHelpTopic` enum
+2. Extend `parse_local_help_action()` to map `"config" => LocalHelpTopic::Config`
+3. Add help-flag check early in the `"config"` arm:
+   ```rust
+   "config" => {
+       if rest.len() >= 2 && is_help_flag(&rest[1]) {
+           return Ok(CliAction::HelpTopic(LocalHelpTopic::Config));
+       }
+       // ... existing parsing
+   }
+   ```
+4. Add help topic renderer for config
+
+**Scope:**
+Low-risk, high-clarity UX fix. Same pattern as #130c. Completes the help-parity sweep for local introspection commands.
+
+**Acceptance criterion:**
+- `claw config --help` → emits help for config command (not config dump)
+- `claw config -h` → same
+- `claw config` (no args) → still displays config dump
+- `claw config --cwd /some/path` (valid flag) → still works
+
+**Next-cycle plan:**
+Implement #130d to close the help-parity family. Stack on top of #130c branch for coherence.
