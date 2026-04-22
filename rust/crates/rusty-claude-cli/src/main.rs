@@ -1015,7 +1015,18 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
 
     match rest[0].as_str() {
         "dump-manifests" => parse_dump_manifests_args(&rest[1..], output_format),
-        "bootstrap-plan" => Ok(CliAction::BootstrapPlan { output_format }),
+        "bootstrap-plan" => {
+            // #152: bootstrap-plan is a no-arg verb. Reject unexpected suffixes
+            // like `claw bootstrap-plan garbage` that silently accept trailing
+            // args instead of rejecting at parse time.
+            if rest.len() > 1 {
+                return Err(format!(
+                    "unrecognized argument `{}` for subcommand `bootstrap-plan`",
+                    rest[1]
+                ));
+            }
+            Ok(CliAction::BootstrapPlan { output_format })
+        }
         "agents" => Ok(CliAction::Agents {
             args: join_optional_args(&rest[1..]),
             output_format,
