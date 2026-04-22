@@ -186,7 +186,10 @@ The Python harness is continuously dogfood-tested:
 
 ## Related docs
 
+- **`ERROR_HANDLING.md`** — Unified error-handling pattern for claws (one handler for all 14 clawable commands)
 - **`SCHEMAS.md`** — JSON protocol specification (read before implementing)
+- **`OPT_OUT_AUDIT.md`** — Governance for the 12 non-clawable surfaces
+- **`OPT_OUT_DEMAND_LOG.md`** — Active survey recording real demand signals (evidence base for decisions)
 - **`ROADMAP.md`** — macro roadmap and macro pain points
 - **`PHILOSOPHY.md`** — system design intent
 - **`PARITY.md`** — status of Python ↔ Rust protocol equivalence
