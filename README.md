@@ -5,6 +5,8 @@
   ·
   <a href="./USAGE.md">Usage</a>
   ·
+  <a href="./ERROR_HANDLING.md">Error Handling</a>
+  ·
   <a href="./rust/README.md">Rust workspace</a>
   ·
   <a href="./PARITY.md">Parity</a>
@@ -40,9 +42,11 @@ The canonical implementation lives in [`rust/`](./rust), and the current source 
 
 - **`rust/`** — canonical Rust workspace and the `claw` CLI binary
 - **`USAGE.md`** — task-oriented usage guide for the current product surface
+- **`ERROR_HANDLING.md`** — unified error-handling pattern for orchestration code
 - **`PARITY.md`** — Rust-port parity status and migration notes
 - **`ROADMAP.md`** — active roadmap and cleanup backlog
 - **`PHILOSOPHY.md`** — project intent and system-design framing
+- **`SCHEMAS.md`** — JSON protocol contract (Python harness reference)
 - **`src/` + `tests/`** — companion Python/reference workspace and audit helpers; not the primary runtime surface
 
 ## Quick start
