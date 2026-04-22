@@ -6163,3 +6163,34 @@ load_session('nonexistent')  # raises FileNotFoundError with no structured error
 **Blocker.** None.
 
 **Source.** Jobdori dogfood sweep 2026-04-22 08:56 KST — grepped `src/runtime.py` and `src/query_engine.py` for any timeout/deadline/wall-clock mechanism; found none.
+
+## Pinpoint #162. `submit_message` appends the budget-exceeded turn to the transcript before returning `stop_reason='max_budget_reached'` — session state is corrupted on overflow
+
+**Gap.** In `QueryEnginePort.submit_message` (`src/query_engine.py:63`), the token-budget check is performed *after* the prompt is already appended to `mutable_messages` and `transcript_store`. When projected usage exceeds `max_budget_tokens`, the method sets `stop_reason='max_budget_reached'` — but by that point the prompt has already been committed to `self.mutable_messages` (line 97) and `self.transcript_store` (line 98), and `compact_messages_if_needed()` has been called (line 99). The `TurnResult` returned to the caller correctly signals overflow, but the underlying session state silently includes the overflow turn. If the caller persists the session (e.g., via `persist_session()`), the budget-exceeded prompt is saved, effectively poisoning the session store with a turn that the caller was told never completed cleanly.
+
+**Repro.**
+```python
+import sys; sys.path.insert(0, 'src')
+from query_engine import QueryEnginePort, QueryEngineConfig
+from port_manifest import build_port_manifest
+
+engine = QueryEnginePort(manifest=build_port_manifest())
+engine.config = QueryEngineConfig(max_budget_tokens=10)  # tiny budget
+
+# First turn fills the budget
+r1 = engine.submit_message('hello world')
+print(r1.stop_reason)            # 'max_budget_reached'
+print(len(engine.mutable_messages))  # 1 — overflow turn was still appended
+path = engine.persist_session()
+print(path)                      # session saved with the overflow turn inside
+```
+
+**Root cause.** `src/query_engine.py:88-103` — budget is checked at line 89 but `mutable_messages.append` happens at line 97 unconditionally. There is no early-return before the append on budget overflow. The check sets `stop_reason` but does not prevent mutation.
+
+**Fix shape (~5 lines).** Restructure `submit_message` to check the projected budget *before* mutating state. On overflow, return a `TurnResult` with `stop_reason='max_budget_reached'` without appending to `mutable_messages`, `transcript_store`, or calling `compact_messages_if_needed`. The session state must remain identical to what it was before the overflowing call.
+
+**Acceptance.** After a `stop_reason='max_budget_reached'` result, `len(engine.mutable_messages)` is unchanged from before the call. A session persisted after budget overflow does not contain the overflow prompt. Subsequent calls with a fresh prompt on the same engine instance still route correctly.
+
+**Blocker.** None.
+
+**Source.** Jobdori dogfood sweep 2026-04-22 09:36 KST — traced `submit_message` mutation order in `src/query_engine.py:88-103`; confirmed append precedes budget-guard return.
