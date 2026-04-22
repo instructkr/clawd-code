@@ -2,6 +2,9 @@
 
 This guide covers the current Rust workspace under `rust/` and the `claw` CLI binary. If you are brand new, make the doctor health check your first run: start `claw`, then run `/doctor`.
 
+> [!TIP]
+> **Building orchestration code that calls `claw` as a subprocess?** See [`ERROR_HANDLING.md`](./ERROR_HANDLING.md) for the unified error-handling pattern (one handler for all 14 clawable commands, exit codes, JSON envelope contract, and recovery strategies).
+
 ## Quick-start health check
 
 Run this before prompts, sessions, or automation:
@@ -95,10 +98,16 @@ cd rust
 
 ### JSON output for scripting
 
+All clawable commands support `--output-format json` for machine-readable output. Every invocation returns a consistent JSON envelope with `exit_code`, `command`, `timestamp`, and either `{success fields}` or `{error: {kind, message, ...}}`.
+
 ```bash
 cd rust
 ./target/debug/claw --output-format json prompt "status"
+./target/debug/claw --output-format json load-session my-session-id
+./target/debug/claw --output-format json turn-loop "analyze logs" --max-turns 1
 ```
+
+**Building a dispatcher or orchestration script?** See [`ERROR_HANDLING.md`](./ERROR_HANDLING.md) for the unified error-handling pattern. One code example works for all 14 clawable commands: parse the exit code, classify by `error.kind`, apply recovery strategies (retry, timeout recovery, validation, logging). Use that pattern instead of reimplementing error handling per command.
 
 ### Inspect worker state
 
