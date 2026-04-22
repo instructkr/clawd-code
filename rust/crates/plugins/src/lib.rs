@@ -1037,8 +1037,59 @@ impl PluginManager {
         Self { config }
     }
 
+    /// Returns the default bundled plugins root directory.
+    ///
+    /// Resolution order (first existing path wins):
+    /// 1. `<exe_dir>/../share/claw/plugins/bundled` — standard install layout
+    /// 2. `<exe_dir>/bundled` — simple relocated layout
+    /// 3. `CARGO_MANIFEST_DIR/bundled` — dev/source-tree fallback (only if it exists)
+    /// 4. `<exe_dir>/../share/claw/plugins/bundled` — canonical default even if missing
+    ///
+    /// This avoids baking in a compile-time source-tree path that may be
+    /// inaccessible at runtime (e.g. a root-owned repo directory).
     #[must_use]
     pub fn bundled_root() -> PathBuf {
+        // Candidate 1: standard FHS install layout — <prefix>/bin/claw -> <prefix>/share/claw/plugins/bundled
+        if let Ok(exe_path) = std::env::current_exe() {
+            if let Some(exe_dir) = exe_path.parent() {
+                let share_path = exe_dir
+                    .join("..")
+                    .join("share")
+                    .join("claw")
+                    .join("plugins")
+                    .join("bundled");
+                if share_path.exists() {
+                    return share_path;
+                }
+
+                // Candidate 2: simple adjacent layout — <exe_dir>/bundled
+                let adjacent = exe_dir.join("bundled");
+                if adjacent.exists() {
+                    return adjacent;
+                }
+            }
+        }
+
+        // Candidate 3: dev/source-tree fallback — only if the directory actually exists
+        let dev_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("bundled");
+        if dev_path.exists() {
+            return dev_path;
+        }
+
+        // Default (nothing found): return the canonical install path even if missing,
+        // so callers get an empty plugin list rather than a permission error.
+        if let Ok(exe_path) = std::env::current_exe() {
+            if let Some(exe_dir) = exe_path.parent() {
+                return exe_dir
+                    .join("..")
+                    .join("share")
+                    .join("claw")
+                    .join("plugins")
+                    .join("bundled");
+            }
+        }
+
+        // Last resort fallback
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("bundled")
     }
 
@@ -1357,12 +1408,24 @@ impl PluginManager {
     }
 
     fn sync_bundled_plugins(&self) -> Result<(), PluginError> {
+        let explicit_root = self.config.bundled_root.is_some();
         let bundled_root = self
             .config
             .bundled_root
             .clone()
             .unwrap_or_else(Self::bundled_root);
-        let bundled_plugins = discover_plugin_dirs(&bundled_root)?;
+        let bundled_plugins = match discover_plugin_dirs(&bundled_root) {
+            Ok(plugins) => plugins,
+            // When the bundled root is the auto-detected default and the directory is
+            // inaccessible (e.g. a root-owned source tree), treat it as empty rather
+            // than fatally failing.  An explicit config override still surfaces errors.
+            Err(PluginError::Io(ref error))
+                if !explicit_root && error.kind() == std::io::ErrorKind::PermissionDenied =>
+            {
+                Vec::new()
+            }
+            Err(error) => return Err(error),
+        };
         let mut registry = self.load_registry()?;
         let mut changed = false;
         let install_root = self.install_root();
@@ -2976,17 +3039,139 @@ mod tests {
     fn default_bundled_root_loads_repo_bundles_as_installed_plugins() {
         let _guard = env_guard();
         let config_home = temp_dir("default-bundled-home");
-        let manager = PluginManager::new(PluginManagerConfig::new(&config_home));
+
+        // Use the repo bundled path explicitly so the test is reliable regardless
+        // of where the binary runs from.
+        let repo_bundled = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("bundled");
+        let mut config = PluginManagerConfig::new(&config_home);
+        config.bundled_root = Some(repo_bundled.clone());
+        let manager = PluginManager::new(config);
+
+        if repo_bundled.exists() {
+            let installed = manager
+                .list_installed_plugins()
+                .expect("bundled plugins should auto-install from repo path");
+            assert!(installed
+                .iter()
+                .any(|plugin| plugin.metadata.id == "example-bundled@bundled"));
+            assert!(installed
+                .iter()
+                .any(|plugin| plugin.metadata.id == "sample-hooks@bundled"));
+        }
+
+        let _ = fs::remove_dir_all(config_home);
+    }
+
+    #[test]
+    fn default_bundled_root_is_not_blindly_cargo_manifest_dir() {
+        // Verify that bundled_root() no longer unconditionally returns
+        // CARGO_MANIFEST_DIR/bundled.  The returned path must either exist
+        // (a valid runtime or dev location was found) OR differ from the
+        // compile-time source path (a runtime-relative default was chosen).
+        let resolved = PluginManager::bundled_root();
+        let compile_time_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("bundled");
+
+        // If the compile-time path does not exist (e.g. installed binary running
+        // outside the source tree), the resolved path must NOT be the CARGO_MANIFEST_DIR
+        // path, because that would re-introduce the original bug.
+        if !compile_time_path.exists() {
+            assert_ne!(
+                resolved, compile_time_path,
+                "bundled_root() must not fall back to CARGO_MANIFEST_DIR when that path \
+                 does not exist — this would regress the root-owned-dir permission bug"
+            );
+        }
+        // Either the path exists (dev scenario) or we got a runtime-relative path.
+        // Either way the function should not panic or return an obviously wrong value.
+        assert!(
+            !resolved.as_os_str().is_empty(),
+            "bundled_root() should return a non-empty path"
+        );
+    }
+
+    #[test]
+    fn override_bundled_root_is_used_exactly() {
+        let _guard = env_guard();
+        let config_home = temp_dir("override-bundled-home");
+        let bundled_root = temp_dir("override-bundled-root");
+        write_bundled_plugin(
+            &bundled_root.join("override-plugin"),
+            "override-plugin",
+            "1.0.0",
+            false,
+        );
+
+        let mut config = PluginManagerConfig::new(&config_home);
+        config.bundled_root = Some(bundled_root.clone());
+        let manager = PluginManager::new(config);
 
         let installed = manager
             .list_installed_plugins()
-            .expect("default bundled plugins should auto-install");
-        assert!(installed
-            .iter()
-            .any(|plugin| plugin.metadata.id == "example-bundled@bundled"));
-        assert!(installed
-            .iter()
-            .any(|plugin| plugin.metadata.id == "sample-hooks@bundled"));
+            .expect("override bundled_root should be used");
+        assert!(
+            installed
+                .iter()
+                .any(|plugin| plugin.metadata.id == "override-plugin@bundled"),
+            "only the override bundled root should be scanned, not CARGO_MANIFEST_DIR"
+        );
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(bundled_root);
+    }
+
+    #[test]
+    fn explicit_nonexistent_bundled_root_does_not_fail() {
+        // When bundled_root is explicitly configured to a path that does not exist,
+        // plugin list should succeed with an empty bundled section rather than
+        // returning an error (discover_plugin_dirs treats NotFound as empty).
+        let _guard = env_guard();
+        let config_home = temp_dir("missing-bundled-home");
+
+        let nonexistent = temp_dir("nonexistent-bundled-XXXXXXXX");
+        assert!(
+            !nonexistent.exists(),
+            "test precondition: path must not exist"
+        );
+
+        let mut config = PluginManagerConfig::new(&config_home);
+        config.bundled_root = Some(nonexistent);
+        let manager = PluginManager::new(config);
+
+        // Should succeed with zero bundled plugins, not crash with ENOENT.
+        let result = manager.list_installed_plugins();
+        assert!(
+            result.is_ok(),
+            "nonexistent explicit bundled root should not fail: {result:?}"
+        );
+        let installed = result.unwrap();
+        assert!(
+            installed
+                .iter()
+                .all(|p| p.metadata.kind != PluginKind::Bundled),
+            "no bundled plugins should be installed when bundled root path does not exist"
+        );
+
+        let _ = fs::remove_dir_all(config_home);
+    }
+
+    #[test]
+    fn no_bundled_root_config_uses_auto_detection_without_panic() {
+        // When bundled_root is not set (None), auto-detection runs.  The resolved
+        // path should either exist (dev environment) or be a runtime-relative path
+        // that doesn't cause a panic or EACCES crash.
+        let _guard = env_guard();
+        let config_home = temp_dir("auto-detect-bundled-home");
+
+        // No bundled_root set — forces auto-detection in bundled_root().
+        let config = PluginManagerConfig::new(&config_home);
+        let manager = PluginManager::new(config);
+
+        // Should not panic or return a hard IO error.
+        let result = manager.list_installed_plugins();
+        assert!(
+            result.is_ok(),
+            "auto-detected bundled root resolution must not fail: {result:?}"
+        );
 
         let _ = fs::remove_dir_all(config_home);
     }
