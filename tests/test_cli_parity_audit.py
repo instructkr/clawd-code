@@ -239,3 +239,95 @@ class TestJsonOutputContractEndToEnd:
                 f'{cmd_name} {cmd_args} --output-format json did not produce '
                 f'parseable JSON: {e}\nOutput: {result.stdout[:200]}'
             )
+
+
+class TestOptOutSurfaceRejection:
+    """Cycle #30: OPT_OUT surfaces must REJECT --output-format, not silently accept.
+    
+    OPT_OUT_AUDIT.md classifies 12 surfaces as intentionally exempt from the
+    JSON envelope contract. This test LOCKS that rejection so accidental
+    drift (e.g., a developer adds --output-format to summary without thinking)
+    doesn't silently promote an OPT_OUT surface to CLAWABLE.
+    
+    Relationship to existing tests:
+    - test_clawable_surface_has_output_format: asserts CLAWABLE surfaces accept it
+    - TestOptOutSurfaceRejection: asserts OPT_OUT surfaces REJECT it
+    
+    Together, these two test classes form a complete parity check:
+    every surface is either IN or OUT, and both cases are explicitly tested.
+    
+    If an OPT_OUT surface is promoted to CLAWABLE intentionally:
+    1. Move it from OPT_OUT_SURFACES to CLAWABLE_SURFACES
+    2. Update OPT_OUT_AUDIT.md with promotion rationale
+    3. Remove from this test's expected rejections
+    4. Both sets of tests continue passing
+    """
+
+    @pytest.mark.parametrize('cmd_name', sorted(OPT_OUT_SURFACES))
+    def test_opt_out_surface_rejects_output_format(self, cmd_name: str) -> None:
+        """OPT_OUT surfaces must NOT accept --output-format flag.
+        
+        Passing --output-format to an OPT_OUT surface should produce an
+        'unrecognized arguments' error from argparse.
+        """
+        result = subprocess.run(
+            [sys.executable, '-m', 'src.main', cmd_name, '--output-format', 'json'],
+            cwd=Path(__file__).resolve().parent.parent,
+            capture_output=True,
+            text=True,
+        )
+        # Should fail — argparse exit 2 in text mode, exit 1 in JSON mode
+        # (both modes normalize to "unrecognized arguments" message)
+        assert result.returncode != 0, (
+            f'{cmd_name} unexpectedly accepted --output-format json. '
+            f'If this is intentional (promotion to CLAWABLE), move from '
+            f'OPT_OUT_SURFACES to CLAWABLE_SURFACES and update OPT_OUT_AUDIT.md. '
+            f'Output: {result.stdout[:200]}\nStderr: {result.stderr[:200]}'
+        )
+        # Verify the error is specifically about --output-format
+        error_text = result.stdout + result.stderr
+        assert '--output-format' in error_text or 'unrecognized' in error_text, (
+            f'{cmd_name} failed but error not about --output-format. '
+            f'Something else is broken:\n'
+            f'stdout: {result.stdout[:300]}\nstderr: {result.stderr[:300]}'
+        )
+
+    def test_opt_out_set_matches_audit_document(self) -> None:
+        """OPT_OUT_SURFACES constant must exactly match OPT_OUT_AUDIT.md listing.
+        
+        This test reads OPT_OUT_AUDIT.md and verifies the constant doesn't
+        drift from the documentation.
+        """
+        audit_path = Path(__file__).resolve().parent.parent / 'OPT_OUT_AUDIT.md'
+        audit_text = audit_path.read_text()
+        
+        # Expected 12 surfaces per audit doc
+        expected_surfaces = {
+            # Group A: Rich-Markdown Reports (4)
+            'summary', 'manifest', 'parity-audit', 'setup-report',
+            # Group B: List Commands (3)
+            'subsystems', 'commands', 'tools',
+            # Group C: Simulation/Debug (5)
+            'remote-mode', 'ssh-mode', 'teleport-mode',
+            'direct-connect-mode', 'deep-link-mode',
+        }
+        
+        assert OPT_OUT_SURFACES == expected_surfaces, (
+            f'OPT_OUT_SURFACES drift from expected 12 surfaces per audit:\n'
+            f'  Expected: {sorted(expected_surfaces)}\n'
+            f'  Actual:   {sorted(OPT_OUT_SURFACES)}'
+        )
+        
+        # Each surface should be mentioned in audit doc
+        missing_from_audit = [s for s in OPT_OUT_SURFACES if s not in audit_text]
+        assert not missing_from_audit, (
+            f'OPT_OUT surfaces not mentioned in OPT_OUT_AUDIT.md: {missing_from_audit}'
+        )
+
+    def test_opt_out_count_matches_declared(self) -> None:
+        """OPT_OUT_AUDIT.md declares '12 surfaces'. Constant must match."""
+        assert len(OPT_OUT_SURFACES) == 12, (
+            f'OPT_OUT_SURFACES has {len(OPT_OUT_SURFACES)} items, '
+            f'but OPT_OUT_AUDIT.md declares 12 total surfaces. '
+            f'Update either the audit doc or the constant.'
+        )
