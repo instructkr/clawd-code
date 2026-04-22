@@ -1,14 +1,20 @@
 # JSON Envelope Schemas — Clawable CLI Contract
 
-This document locks the field-level contract for all clawable-surface commands. Every command accepting `--output-format json` must conform to the envelope shapes below.
+> **⚠️ CRITICAL: This document describes the TARGET v2.0 envelope schema, not the current v1.0 binary behavior.** The Rust binary currently emits a **flat v1.0 envelope** that does NOT include `timestamp`, `command`, `exit_code`, `output_format`, or `schema_version` fields. See [`FIX_LOCUS_164.md`](./FIX_LOCUS_164.md) for the full migration plan and timeline. **Do not build automation against the field shapes below without first testing against the actual binary output.** Use `claw <command> --output-format json` to inspect what your binary version actually emits.
 
-**Target audience:** Claws building orchestrators, automation, or monitoring against claw-code's JSON output.
+This document locks the **target** field-level contract for all clawable-surface commands. After the v1.0→v2.0 migration (FIX_LOCUS_164 Phase 2), every command accepting `--output-format json` will conform to the envelope shapes documented here.
+
+**Target audience:** Claws planning v2.0 migration, reference implementers, contract validators.
+
+**Current v1.0 reality:** See [`ERROR_HANDLING.md`](./ERROR_HANDLING.md) Appendix A for the flat envelope shape the binary actually emits today.
 
 ---
 
-## Common Fields (All Envelopes)
+## Common Fields (All Envelopes) — TARGET v2.0 SCHEMA
 
-Every command response, success or error, carries:
+**This section describes the v2.0 target schema. The current v1.0 binary does NOT emit these fields.** See FIX_LOCUS_164.md for the migration timeline.
+
+After v2.0 migration, every command response, success or error, will carry:
 
 ```json
 {
@@ -16,7 +22,7 @@ Every command response, success or error, carries:
   "command": "list-sessions",
   "exit_code": 0,
   "output_format": "json",
-  "schema_version": "1.0"
+  "schema_version": "2.0"
 }
 ```
 
@@ -452,3 +458,118 @@ cargo test --release test_json_envelope_field_consistency
 - `show-command` reports `found: bool` (inventory signal: "does this exist?")
 - `exec-command` reports `handled: bool` (operational signal: "was this work performed?")
 - The names matter: a command can be found but not handled (e.g. too large for context window), or handled silently (no output message)
+
+---
+
+## Appendix: Current v1.0 vs. Target v2.0 Envelope Shapes
+
+### ⚠️ IMPORTANT: Binary Reality vs. This Document
+
+**This entire SCHEMAS.md document describes the TARGET v2.0 schema.** The actual Rust binary currently emits v1.0 (flat) envelopes.
+
+**Do not assume the fields documented above are in the binary right now.** They are not.
+
+### Current v1.0 Envelope (What the Rust Binary Actually Emits)
+
+The Rust binary in `rust/` currently emits a **flat v1.0 envelope** without common metadata wrapper:
+
+#### v1.0 Success Envelope Example
+
+```json
+{
+  "kind": "list-sessions",
+  "sessions": [
+    {"id": "abc123", "created": "2026-04-22T10:00:00Z", "turns": 5}
+  ],
+  "type": "success"
+}
+```
+
+**Key differences from v2.0 above:**
+- NO `timestamp`, `command`, `exit_code`, `output_format`, `schema_version` fields
+- `kind` field contains the verb name (or is entirely absent for success)
+- `type: "success"` flag at top level
+- Verb-specific fields (`sessions`, `turn`, etc.) at top level
+
+#### v1.0 Error Envelope Example
+
+```json
+{
+  "error": "session 'xyz789' not found in .claw/sessions",
+  "hint": "use 'list-sessions' to see available sessions",
+  "kind": "session_not_found",
+  "type": "error"
+}
+```
+
+**Key differences from v2.0 error above:**
+- `error` field is a **STRING**, not a nested object
+- NO `error.operation`, `error.target`, `error.retryable` structured fields
+- `kind` is at top-level, not nested
+- NO `timestamp`, `command`, `exit_code`, `output_format`, `schema_version`
+- Extra `type: "error"` flag
+
+### Migration Timeline (FIX_LOCUS_164)
+
+See [`FIX_LOCUS_164.md`](./FIX_LOCUS_164.md) for the full phased migration:
+
+- **Phase 1 (Opt-in):** `claw <cmd> --output-format json --envelope-version=2.0` emits v2.0 shape
+- **Phase 2 (Default):** v2.0 becomes default; `--legacy-envelope` flag opts into v1.0
+- **Phase 3 (Deprecation):** v1.0 warnings, then removal
+
+### Building Automation Against v1.0 (Current)
+
+**For claws building automation today** (against the real binary, not this schema):
+
+1. **Check `type` field first** (string: "success" or "error")
+2. **For success:** verb-specific fields are at top level. Use `jq .kind` for verb ID (if present)
+3. **For error:** access `error` (string), `hint` (string), `kind` (string) all at top level
+4. **Do not expect:** `timestamp`, `command`, `exit_code`, `output_format`, `schema_version` — they don't exist yet
+5. **Test your code** against `claw <cmd> --output-format json` output to verify assumptions before deploying
+
+### Example: Python Consumer Code (v1.0)
+
+**Correct pattern for v1.0 (current binary):**
+
+```python
+import json
+import subprocess
+
+result = subprocess.run(
+    ["claw", "list-sessions", "--output-format", "json"],
+    capture_output=True,
+    text=True
+)
+envelope = json.loads(result.stdout)
+
+# v1.0: type is at top level
+if envelope.get("type") == "error":
+    error_msg = envelope.get("error", "unknown error")  # error is a STRING
+    error_kind = envelope.get("kind")  # kind is at TOP LEVEL
+    print(f"Error: {error_kind} — {error_msg}")
+else:
+    # Success path: verb-specific fields at top level
+    sessions = envelope.get("sessions", [])
+    for session in sessions:
+        print(f"Session: {session['id']}")
+```
+
+**After v2.0 migration, this code will break.** Claws building for v2.0 compatibility should:
+
+1. Check `schema_version` field
+2. Parse differently based on version
+3. Or wait until Phase 2 default bump is announced, then migrate
+
+### Why This Mismatch Exists
+
+SCHEMAS.md was written as the **target design** for v2.0. The Rust binary is still on v1.0. The migration (FIX_LOCUS_164) will bring the binary in line with this schema, but it hasn't happened yet.
+
+**This mismatch is the root cause of doc-truthfulness issues #78, #79, #165.** All three docs were documenting the v2.0 target as if it were current reality.
+
+### Questions?
+
+- **"Is v2.0 implemented?"** No. The binary is v1.0. See FIX_LOCUS_164.md for the implementation roadmap.
+- **"Should I build against v2.0 schema?"** No. Build against v1.0 (current). Test your code with `claw` to verify.
+- **"When does v2.0 ship?"** See FIX_LOCUS_164.md Phase 1 estimate: ~6 dev-days. Not scheduled yet.
+- **"Can I use v2.0 now?"** Only if you explicitly pass `--envelope-version=2.0` (which doesn't exist yet in v1.0 binary).
+
