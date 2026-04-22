@@ -36,6 +36,60 @@ cargo build --workspace
 
 The CLI binary is available at `rust/target/debug/claw` after a debug build. Make the doctor check above your first post-build step.
 
+### Add binary to PATH
+
+To run `claw` from anywhere without typing the full path:
+
+**Option 1: Symlink to a directory already in your PATH**
+
+```bash
+# Find a PATH directory (usually ~/.local/bin or /usr/local/bin)
+echo $PATH
+
+# Create symlink (adjust path and PATH-dir as needed)
+ln -s /Users/yeongyu/clawd/claw-code/rust/target/debug/claw ~/.local/bin/claw
+
+# Verify it's in PATH
+which claw
+```
+
+**Option 2: Add the binary directory to PATH directly**
+
+Add this to your shell rc file (`~/.bashrc`, `~/.zshrc`, etc.):
+
+```bash
+export PATH="$PATH:/Users/yeongyu/clawd/claw-code/rust/target/debug"
+```
+
+Then reload:
+
+```bash
+source ~/.zshrc  # or ~/.bashrc
+```
+
+### Verify install
+
+After adding to PATH, verify the binary works:
+
+```bash
+# Should print version and exit successfully
+claw version
+
+# Should run health check (shows which components are initialized)
+claw doctor
+
+# Should show available commands
+claw --help
+```
+
+If `claw: command not found`, the PATH addition didn't take. Re-check:
+
+```bash
+echo $PATH                    # verify your PATH directory is listed
+which claw                    # should show full path to binary
+ls -la ~/.local/bin/claw      # if using symlink, verify it exists and points to target/debug/claw
+```
+
 ## Quick start
 
 ### First-run doctor check
