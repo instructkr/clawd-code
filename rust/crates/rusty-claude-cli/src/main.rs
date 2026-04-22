@@ -735,6 +735,10 @@ enum LocalHelpTopic {
     Diff,
     // #130d: help parity for `claw config --help`
     Config,
+    // #130e: help parity — dispatch-order bugs (help, submit, resume)
+    Meta,
+    Submit,
+    Resume,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1278,6 +1282,10 @@ fn parse_local_help_action(rest: &[String]) -> Option<Result<CliAction, String>>
         "diff" => LocalHelpTopic::Diff,
         // #130d: help parity for `claw config --help`
         "config" => LocalHelpTopic::Config,
+        // #130e: help parity — dispatch-order fixes
+        "help" => LocalHelpTopic::Meta,
+        "submit" => LocalHelpTopic::Submit,
+        "resume" => LocalHelpTopic::Resume,
         _ => return None,
     };
     Some(Ok(CliAction::HelpTopic(topic)))
@@ -6119,6 +6127,30 @@ fn render_help_topic(topic: LocalHelpTopic) -> String {
   Formats          text (default), json
   Related          claw status · claw doctor · claw init"
             .to_string(),
+        // #130e: help topic for `claw help --help` (meta-help).
+        LocalHelpTopic::Meta => "Help
+  Usage            claw help [--output-format <format>]
+  Purpose          show the full CLI help text (all subcommands, flags, environment)
+  Aliases          claw --help · claw -h
+  Formats          text (default), json
+  Related          claw <subcommand> --help · claw version"
+            .to_string(),
+        // #130e: help topic for `claw submit --help`.
+        LocalHelpTopic::Submit => "Submit
+  Usage            claw submit [--session <id|latest>] <prompt-text>
+  Purpose          send a prompt to an existing managed session without starting a new one
+  Defaults         --session latest (resumes the most recent managed session)
+  Requires         valid Anthropic credentials (ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY)
+  Related          claw prompt · claw --resume · /session list"
+            .to_string(),
+        // #130e: help topic for `claw resume --help`.
+        LocalHelpTopic::Resume => "Resume
+  Usage            claw resume [<session-id|latest>]
+  Purpose          restart an interactive REPL attached to a managed session
+  Defaults         latest session if no argument provided
+  Requires         valid Anthropic credentials (ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY)
+  Related          claw submit · claw --resume · /session list"
+            .to_string(),
     }
 }
 
@@ -10467,6 +10499,47 @@ mod tests {
             matches!(config_section, CliAction::Config { section: Some(ref s), .. } if s == "permissions"),
             "#130d: config with section must still work"
         );
+        // #130e: dispatch-order help fixes for help, submit, resume
+        // These previously emitted `missing_credentials` instead of showing help,
+        // because parse_local_help_action() didn't route them. Now they route
+        // to dedicated help topics before credential check.
+        let help_help = parse_args(&[
+            "help".to_string(),
+            "--help".to_string(),
+        ])
+        .expect("help --help must parse as help action");
+        assert!(
+            matches!(help_help, CliAction::HelpTopic(LocalHelpTopic::Meta)),
+            "#130e: help --help must route to LocalHelpTopic::Meta, got: {help_help:?}"
+        );
+        let submit_help = parse_args(&[
+            "submit".to_string(),
+            "--help".to_string(),
+        ])
+        .expect("submit --help must parse as help action");
+        assert!(
+            matches!(submit_help, CliAction::HelpTopic(LocalHelpTopic::Submit)),
+            "#130e: submit --help must route to LocalHelpTopic::Submit"
+        );
+        let resume_help = parse_args(&[
+            "resume".to_string(),
+            "--help".to_string(),
+        ])
+        .expect("resume --help must parse as help action");
+        assert!(
+            matches!(resume_help, CliAction::HelpTopic(LocalHelpTopic::Resume)),
+            "#130e: resume --help must route to LocalHelpTopic::Resume"
+        );
+        // Short form `-h` works for all three
+        let help_h = parse_args(&["help".to_string(), "-h".to_string()])
+            .expect("help -h must parse");
+        assert!(matches!(help_h, CliAction::HelpTopic(LocalHelpTopic::Meta)));
+        let submit_h = parse_args(&["submit".to_string(), "-h".to_string()])
+            .expect("submit -h must parse");
+        assert!(matches!(submit_h, CliAction::HelpTopic(LocalHelpTopic::Submit)));
+        let resume_h = parse_args(&["resume".to_string(), "-h".to_string()])
+            .expect("resume -h must parse");
+        assert!(matches!(resume_h, CliAction::HelpTopic(LocalHelpTopic::Resume)));
         // #147: empty / whitespace-only positional args must be rejected
         // with a specific error instead of falling through to the prompt
         // path (where they surface a misleading "missing Anthropic
