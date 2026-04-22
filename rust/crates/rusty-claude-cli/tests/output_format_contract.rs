@@ -638,6 +638,168 @@ fn emission_contract_no_silent_success_under_output_format_json_168c_task2() {
     }
 }
 
+/// #168c Phase 0 Task 4: Shape parity / regression guard.
+///
+/// Locks the v1.5 emission baseline (documented in SCHEMAS.md § v1.5 Emission
+/// Baseline) so any future PR that introduces shape drift in a documented
+/// verb fails this test at PR time.
+///
+/// This complements Task 2 (no-silent guarantee) by asserting the SPECIFIC
+/// top-level key sets documented in the catalog. If a verb adds/removes a
+/// top-level field, this test fails — forcing the PR author to:
+/// (a) update SCHEMAS.md § v1.5 Emission Baseline with the new shape, and
+/// (b) acknowledge the v1.5 baseline is changing.
+///
+/// Phase 0 Task 4 deliverable: prevents undocumented shape drift in v1.5
+/// baseline before Phase 1 (shape normalization) begins.
+///
+/// Note: This test intentionally asserts the CURRENT (possibly imperfect)
+/// shape, NOT the target. Phase 1 will update these expectations as shapes
+/// normalize.
+#[test]
+fn v1_5_emission_baseline_shape_parity_168c_task4() {
+    let root = unique_temp_dir("168c-task4-shape-parity");
+    fs::create_dir_all(&root).expect("temp dir should exist");
+
+    // v1.5 baseline per-verb shape catalog (from SCHEMAS.md § v1.5 Emission Baseline).
+    // Each entry: (verb, args, expected_top_level_keys_sorted).
+    //
+    // This catalog was captured by the cycle #87 controlled matrix and is
+    // enforced by SCHEMAS.md § v1.5 Emission Baseline documentation.
+    let baseline: &[(&str, &[&str], &[&str])] = &[
+        // Verbs using `kind` field (12 of 13 success paths)
+        ("help", &["help"], &["kind", "message"]),
+        (
+            "version",
+            &["version"],
+            &["git_sha", "kind", "message", "target", "version"],
+        ),
+        (
+            "doctor",
+            &["doctor"],
+            &["checks", "has_failures", "kind", "message", "report", "summary"],
+        ),
+        (
+            "skills",
+            &["skills"],
+            &["action", "kind", "skills", "summary"],
+        ),
+        (
+            "agents",
+            &["agents"],
+            &["action", "agents", "count", "kind", "summary", "working_directory"],
+        ),
+        (
+            "system-prompt",
+            &["system-prompt"],
+            &["kind", "message", "sections"],
+        ),
+        (
+            "bootstrap-plan",
+            &["bootstrap-plan", "test"],
+            &["kind", "phases"],
+        ),
+        // Verb using `command` field (the 1-of-13 deviation — Phase 1 target)
+        (
+            "list-sessions",
+            &["list-sessions"],
+            &["command", "sessions"],
+        ),
+    ];
+
+    for (verb, args, expected_keys) in baseline {
+        let mut full_args = vec!["--output-format", "json"];
+        full_args.extend_from_slice(args);
+        let output = run_claw(&root, &full_args, &[]);
+
+        assert!(
+            output.status.success(),
+            "#168c Task 4: `{verb}` expected success path but exited with {:?}. stdout:\n{}\nstderr:\n{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let envelope: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|err| {
+            panic!(
+                "#168c Task 4: `{verb}` stdout not valid JSON: {err}\nstdout:\n{}",
+                String::from_utf8_lossy(&output.stdout)
+            )
+        });
+
+        let actual_keys: Vec<String> = envelope
+            .as_object()
+            .unwrap_or_else(|| panic!("#168c Task 4: `{verb}` envelope not a JSON object"))
+            .keys()
+            .cloned()
+            .collect();
+        let mut actual_sorted = actual_keys.clone();
+        actual_sorted.sort();
+
+        let mut expected_sorted: Vec<String> = expected_keys.iter().map(|s| s.to_string()).collect();
+        expected_sorted.sort();
+
+        assert_eq!(
+            actual_sorted, expected_sorted,
+            "#168c Task 4: shape drift detected in `{verb}`!\n\
+             Expected top-level keys (v1.5 baseline): {expected_sorted:?}\n\
+             Actual top-level keys: {actual_sorted:?}\n\
+             If this is intentional, update:\n\
+             1. SCHEMAS.md § v1.5 Emission Baseline catalog\n\
+             2. This test's `baseline` array\n\
+             Envelope: {envelope}"
+        );
+    }
+
+    // Error envelope shape parity (all error paths).
+    // Standard v1.5 error envelope: {error, hint, kind, type} (always 4 keys).
+    let error_cases: &[(&str, &[&str])] = &[
+        ("prompt-no-arg", &["prompt"]),
+        ("doctor-bad-arg", &["doctor", "--foo"]),
+    ];
+
+    let expected_error_keys = ["error", "hint", "kind", "type"];
+    let mut expected_error_sorted: Vec<String> =
+        expected_error_keys.iter().map(|s| s.to_string()).collect();
+    expected_error_sorted.sort();
+
+    for (label, args) in error_cases {
+        let mut full_args = vec!["--output-format", "json"];
+        full_args.extend_from_slice(args);
+        let output = run_claw(&root, &full_args, &[]);
+
+        assert!(
+            !output.status.success(),
+            "{label}: expected error exit, got success"
+        );
+
+        let envelope: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|err| {
+            panic!(
+                "#168c Task 4: {label} stdout not valid JSON: {err}\nstdout:\n{}",
+                String::from_utf8_lossy(&output.stdout)
+            )
+        });
+
+        let actual_keys: Vec<String> = envelope
+            .as_object()
+            .unwrap_or_else(|| panic!("#168c Task 4: {label} envelope not a JSON object"))
+            .keys()
+            .cloned()
+            .collect();
+        let mut actual_sorted = actual_keys.clone();
+        actual_sorted.sort();
+
+        assert_eq!(
+            actual_sorted, expected_error_sorted,
+            "#168c Task 4: error envelope shape drift detected in {label}!\n\
+             Expected v1.5 error envelope keys: {expected_error_sorted:?}\n\
+             Actual keys: {actual_sorted:?}\n\
+             If this is intentional, update SCHEMAS.md § Standard Error Envelope (v1.5).\n\
+             Envelope: {envelope}"
+        );
+    }
+}
+
 #[test]
 fn unrecognized_argument_still_classifies_as_cli_parse_247_regression_guard() {
     // #247 regression guard: the new empty-prompt / prompt-subcommand
