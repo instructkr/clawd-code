@@ -422,6 +422,93 @@ cd rust
 ./target/debug/claw system-prompt --cwd .. --date 2026-04-04
 ```
 
+### `dump-manifests` — Export upstream plugin/MCP manifests
+
+**Purpose:** Dump built-in tool and plugin manifests to stdout as JSON, for parity comparison against the upstream Claude Code TypeScript implementation.
+
+**Prerequisite:** This command requires access to upstream source files (`src/commands.ts`, `src/tools.ts`, `src/entrypoints/cli.tsx`). Set `CLAUDE_CODE_UPSTREAM` env var or pass `--manifests-dir`.
+
+```bash
+# Via env var
+CLAUDE_CODE_UPSTREAM=/path/to/upstream claw dump-manifests
+
+# Via flag
+claw dump-manifests --manifests-dir /path/to/upstream
+```
+
+**When to use:** Parity work (comparing the Rust port's tool/plugin surface against the canonical TypeScript implementation). Not needed for normal operation.
+
+**Error mode:** If upstream sources are missing, exits with `error-kind: missing_manifests` and a hint about how to provide them.
+
+### `bootstrap-plan` — Show startup component graph
+
+**Purpose:** Print the ordered list of startup components that are initialized when `claw` begins a session. Useful for debugging startup issues or verifying that fast-path optimizations are in place.
+
+```bash
+claw bootstrap-plan
+```
+
+**Sample output:**
+```
+- CliEntry
+- FastPathVersion
+- StartupProfiler
+- SystemPromptFastPath
+- ChromeMcpFastPath
+```
+
+**When to use:**
+- Debugging why startup is slow (compare your plan to the expected one)
+- Verifying that fast-path components are registered
+- Understanding the load order before customizing hooks or plugins
+
+**Related:** See `claw doctor` for health checks against these startup components.
+
+### `acp` — Agent Context Protocol / Zed editor integration status
+
+**Purpose:** Report the current state of the ACP (Agent Context Protocol) / Zed editor integration. Currently **discoverability only** — no editor daemon is available yet.
+
+```bash
+claw acp
+claw acp serve   # same output; `serve` is accepted but not yet launchable
+claw --acp       # alias
+claw -acp        # alias
+```
+
+**Sample output:**
+```
+ACP / Zed
+  Status           discoverability only
+  Launch           `claw acp serve` / `claw --acp` / `claw -acp` report status only; no editor daemon is available yet
+  Today            use `claw prompt`, the REPL, or `claw doctor` for local verification
+  Tracking         ROADMAP #76
+```
+
+**When to use:** Check whether ACP/Zed integration is ready in your current build. Plan around its availability (track ROADMAP #76 for status).
+
+**Today's alternatives:** Use `claw prompt` for one-shot runs, the interactive REPL for iterative work, or `claw doctor` for local verification.
+
+### `export` — Export session transcript
+
+**Purpose:** Export a managed session's transcript to a file or stdout. Operates on the currently-resumed session (requires `--resume`).
+
+```bash
+# Export latest session
+claw --resume latest export
+
+# Export specific session
+claw --resume <session-id> export
+```
+
+**Prerequisite:** A managed session must exist under `.claw/sessions/<workspace-fingerprint>/`. If no sessions exist, the command exits with `error-kind: no_managed_sessions` and a hint to start a session first.
+
+**When to use:**
+- Archive session transcripts for review
+- Share session context with teammates
+- Feed session history into downstream tooling
+
+**Related:** Inside the REPL, `/export` is also available as a slash command for the active session.
+
 ## Session management
 
 REPL turns are persisted under `.claw/sessions/` in the current workspace.
