@@ -15,7 +15,7 @@ Every clawable command returns JSON on stdout when `--output-format json` is req
 | Exit Code | Meaning | Response Format | Example |
 |---|---|---|---|
 | **0** | Success | `{success fields}` | `{"session_id": "...", "loaded": true}` |
-| **1** | Error / Not Found | `{error: {kind, message, ...}}` | `{"error": {"kind": "session_not_found", ...}}` |
+| **1** | Error / Not Found | `{error: "...", hint: "...", kind: "...", type: "error"}` (flat, v1.0) | `{"error": "session not found", "kind": "session_not_found", "type": "error"}` |
 | **2** | Timeout | `{final_stop_reason: "timeout", final_cancel_observed: ...}` | `{"final_stop_reason": "timeout", ...}` |
 
 ### Text mode vs JSON mode exit codes
@@ -81,8 +81,12 @@ def run_claw_command(command: list[str], timeout_seconds: float = 30.0) -> dict[
             retryable=False,
         )
     
-    # Classify by exit code and error.kind
-    match (result.returncode, envelope.get('error', {}).get('kind')):
+    # Classify by exit code and top-level kind field (v1.0 flat envelope shape)
+    # NOTE: v1.0 envelopes have error as a STRING, not a nested object.
+    # The v2.0 schema (SCHEMAS.md) specifies nested error.{kind, message, ...},
+    # but the current binary emits flat {error: "...", kind: "...", type: "error"}.
+    # See FIX_LOCUS_164.md for the migration timeline.
+    match (result.returncode, envelope.get('kind')):
         case (0, _):
             # Success
             return envelope
@@ -91,8 +95,8 @@ def run_claw_command(command: list[str], timeout_seconds: float = 30.0) -> dict[
             # #179: argparse error — typically a typo or missing required argument
             raise ClawError(
                 kind='parse',
-                message=envelope['error']['message'],
-                hint=envelope['error'].get('hint'),
+                message=envelope.get('error', ''),  # error field is a string in v1.0
+                hint=envelope.get('hint'),
                 retryable=False,  # Typos don't fix themselves
             )
         
@@ -100,7 +104,7 @@ def run_claw_command(command: list[str], timeout_seconds: float = 30.0) -> dict[
             # Common: load-session on nonexistent ID
             raise ClawError(
                 kind='session_not_found',
-                message=envelope['error']['message'],
+                message=envelope.get('error', ''),  # error field is a string in v1.0
                 session_id=envelope.get('session_id'),
                 retryable=False,  # Session won't appear on retry
             )
@@ -109,7 +113,7 @@ def run_claw_command(command: list[str], timeout_seconds: float = 30.0) -> dict[
             # Directory missing, permission denied, disk full
             raise ClawError(
                 kind='filesystem',
-                message=envelope['error']['message'],
+                message=envelope.get('error', ''),  # error field is a string in v1.0
                 retryable=True,  # Might be transient (disk space, NFS flake)
             )
         
@@ -117,16 +121,16 @@ def run_claw_command(command: list[str], timeout_seconds: float = 30.0) -> dict[
             # Generic engine error (unexpected exception, malformed input, etc.)
             raise ClawError(
                 kind='runtime',
-                message=envelope['error']['message'],
-                retryable=envelope['error'].get('retryable', False),
+                message=envelope.get('error', ''),  # error field is a string in v1.0
+                retryable=envelope.get('retryable', False),  # v1.0 may or may not have this
             )
         
         case (1, _):
             # Catch-all for any new error.kind values
             raise ClawError(
-                kind=envelope['error']['kind'],
-                message=envelope['error']['message'],
-                retryable=envelope['error'].get('retryable', False),
+                kind=envelope.get('kind', 'unknown'),
+                message=envelope.get('error', ''),  # error field is a string in v1.0
+                retryable=envelope.get('retryable', False),  # v1.0 may or may not have this
             )
         
         case (2, _):
@@ -456,9 +460,28 @@ def test_error_handler_not_found():
 
 ---
 
-## Appendix: SCHEMAS.md Error Shape
+## Appendix A: v1.0 Error Envelope (Current Binary)
 
-For reference, the canonical JSON error envelope shape (SCHEMAS.md):
+The actual shape emitted by the current binary (v1.0, flat):
+
+```json
+{
+  "error": "session 'nonexistent' not found in .claw/sessions",
+  "hint": "use 'list-sessions' to see available sessions",
+  "kind": "session_not_found",
+  "type": "error"
+}
+```
+
+**Key differences from v2.0 schema (below):**
+- `error` field is a **string**, not a structured object
+- `kind` is at **top-level**, not nested under `error`
+- Missing: `timestamp`, `command`, `exit_code`, `output_format`, `schema_version`
+- Extra: `type: "error"` field (not in schema)
+
+## Appendix B: SCHEMAS.md Target Shape (v2.0)
+
+For reference, the target JSON error envelope shape (SCHEMAS.md, v2.0):
 
 ```json
 {
@@ -466,7 +489,7 @@ For reference, the canonical JSON error envelope shape (SCHEMAS.md):
   "command": "load-session",
   "exit_code": 1,
   "output_format": "json",
-  "schema_version": "1.0",
+  "schema_version": "2.0",
   "error": {
     "kind": "session_not_found",
     "operation": "session_store.load_session",
@@ -478,7 +501,7 @@ For reference, the canonical JSON error envelope shape (SCHEMAS.md):
 }
 ```
 
-All commands that emit errors follow this shape (with error.kind varying). See `SCHEMAS.md` for the complete contract.
+**This is the target schema after [`FIX_LOCUS_164`](./FIX_LOCUS_164.md) is implemented.** The migration plan includes a dual-mode `--envelope-version=2.0` flag in Phase 1, default version bump in Phase 2, and deprecation in Phase 3. For now, code against v1.0 (Appendix A).
 
 ---
 
