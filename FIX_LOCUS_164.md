@@ -1,10 +1,49 @@
 # Fix-Locus #164 — JSON Envelope Contract Migration
 
-**Status:** 📋 Proposed (2026-04-23, cycle #77). Escalated from pinpoint #164 after gaebal-gajae review recognized product-wide scope.
+**Status:** 📋 Proposed (2026-04-23, cycle #77). Updated cycle #85 (2026-04-23) with v1.5 baseline phase after fresh-dogfood discovery (#168) proved v1.0 was never coherent.
 
 **Class:** Contract migration (not a patch). Affects EVERY `--output-format json` command.
 
 **Bundle:** Typed-error family — joins #102 + #121 + #127 + #129 + #130 + #245 + **#164**. Contract-level implementation of §4.44 typed-error envelope.
+
+---
+
+## 0. CRITICAL UPDATE (Cycle #85 via #168 Evidence)
+
+**Premise revision:** This locus document originally framed the problem as **"v1.0 (incoherent) → v2.0 (target schema)"** migration. **Fresh-dogfood validation in cycle #84 proved this framing was underspecified.**
+
+**Actual problem (evidence from #168):**
+
+- There is **no coherent v1.0 envelope contract**. Each verb has a bespoke JSON shape.
+- `claw list-sessions --output-format json` emits `{command, sessions}` — has `command` field
+- `claw doctor --output-format json` emits `{checks, kind, message, ...}` — no `command` field
+- `claw bootstrap hello --output-format json` emits **NOTHING** (silent failure with exit 0)
+- Each verb renderer was written independently with no coordinating contract
+
+**Revised migration plan — three phases instead of two:**
+
+1. **Phase 0 (Emergency):** Fix silent failures (#168 bootstrap JSON). Every `--output-format json` command must emit valid JSON.
+2. **Phase 1 (v1.5 Baseline):** Establish minimal JSON invariants across all 14 verbs without breaking existing consumers:
+   - Every command emits valid JSON when `--output-format json` is passed
+   - Every command has a top-level `kind` field identifying the verb
+   - Every error envelope follows the confirmed `{error, hint, kind, type}` shape
+   - Every success envelope has the verb name in a predictable location
+   - **Effort:** ~3 dev-days (no new design, just fill gaps and normalize bugs)
+3. **Phase 2 (v2.0 Wrapped Envelope):** Execute the original Phase 1 plan documented below — common metadata wrapper, nested data/error objects, opt-in via `--envelope-version=2.0`.
+4. **Phase 3 (v2.0 Default):** Original Phase 2 plan below.
+5. **Phase 4 (v1.0/v1.5 Deprecation):** Original Phase 3 plan below.
+
+**Why add Phase 0 + Phase 1 (v1.5)?**
+
+- You can't migrate from "incoherent" to "coherent v2.0" in one jump. Intermediate coherence (v1.5 baseline) is required.
+- Consumer code built against "whatever v1 emits today" needs a stable target to transition from.
+- **Silent failures (bootstrap JSON) must be fixed BEFORE any migration** — otherwise consumers have no way to detect breakage.
+
+**Blocker resolved:** The original blocker "v1.0 design vs v2.0 design" is actually "no v1 design exists; let's make one (v1.5) then migrate." This is a **clearer, lower-risk migration path**.
+
+**Revised effort estimate:** ~9 dev-days total (Phase 0: 1 day + Phase 1/v1.5: 3 days + Phase 2/v2.0: 5 days) instead of ~6 dev-days for a direct v1.0→v2.0 migration (which would have failed given the incoherent baseline).
+
+**Doctrine implication:** Cycles #76–#82 diagnosed "aspirational vs current" correctly but missed that "current" was never a single thing. Cycle #84 fresh-dogfood caught this. **Fresh-dogfood discipline (principle #9) prevented a 6-day migration effort from hitting an unsolvable baseline problem.**
 
 ---
 
