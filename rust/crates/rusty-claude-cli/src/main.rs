@@ -223,7 +223,12 @@ fn main() {
             if hint.is_none() && kind == "cli_parse" && !short_reason.contains("`claw --help`") {
                 hint = Some("Run `claw --help` for usage.".to_string());
             }
-            eprintln!(
+            // #168c: Under --output-format json, emit the error envelope to
+            // stdout so JSON consumers can parse it without reading stderr.
+            // Text mode continues to route errors to stderr (conventional).
+            // Emission contract: when --output-format json, stdout carries the
+            // envelope (success OR error); stderr is for non-contractual diagnostics only.
+            println!(
                 "{}",
                 serde_json::json!({
                     "type": "error",

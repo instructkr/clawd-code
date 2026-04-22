@@ -389,8 +389,13 @@ fn assert_json_command(current_dir: &Path, args: &[&str]) -> Value {
 }
 
 /// #247 regression helper: run claw expecting a non-zero exit and return
-/// the JSON error envelope parsed from stderr. Asserts exit != 0 and that
+/// the JSON error envelope parsed from stdout. Asserts exit != 0 and that
 /// the envelope includes `type: "error"` at the very least.
+///
+/// #168c: Error envelopes under --output-format json are now emitted to
+/// STDOUT (not stderr). This matches the emission contract that stdout
+/// carries the contractual envelope (success OR error) while stderr is
+/// reserved for non-contractual diagnostics.
 fn assert_json_error_envelope(current_dir: &Path, args: &[&str]) -> Value {
     let output = run_claw(current_dir, args, &[]);
     assert!(
@@ -399,10 +404,12 @@ fn assert_json_error_envelope(current_dir: &Path, args: &[&str]) -> Value {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    // The JSON envelope is written to stderr for error cases (see main.rs).
-    let envelope: Value = serde_json::from_slice(&output.stderr).unwrap_or_else(|err| {
+    // #168c: The JSON envelope is written to STDOUT for error cases under
+    // --output-format json (see main.rs). Previously was stderr.
+    let envelope: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|err| {
         panic!(
-            "stderr should be a JSON error envelope but failed to parse: {err}\nstderr bytes:\n{}",
+            "stdout should be a JSON error envelope but failed to parse: {err}\nstdout bytes:\n{}\nstderr bytes:\n{}",
+            String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         )
     });
@@ -411,6 +418,63 @@ fn assert_json_error_envelope(current_dir: &Path, args: &[&str]) -> Value {
         "envelope should carry type=error"
     );
     envelope
+}
+
+/// #168c regression test: under `--output-format json`, error envelopes
+/// must be emitted to STDOUT (not stderr). This is the emission contract:
+/// stdout carries the JSON envelope regardless of success/error; stderr
+/// is reserved for non-contractual diagnostics.
+///
+/// Refutes cycle #84's "bootstrap silent failure" claim (cycle #87 controlled
+/// matrix showed errors were on stderr, not silent; cycle #88 locked the
+/// emission contract to require stdout).
+#[test]
+fn error_envelope_emitted_to_stdout_under_output_format_json_168c() {
+    let root = unique_temp_dir("168c-emission-stdout");
+    fs::create_dir_all(&root).expect("temp dir should exist");
+
+    // Trigger an error via `prompt` without arg (known cli_parse error).
+    let output = run_claw(&root, &["--output-format", "json", "prompt"], &[]);
+
+    // Exit code must be non-zero (error).
+    assert!(
+        !output.status.success(),
+        "prompt without arg must fail; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // #168c primary assertion: stdout carries the JSON envelope.
+    let stdout_text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout_text.trim().is_empty(),
+        "stdout must contain JSON envelope under --output-format json (#168c emission contract). stderr was:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|err| {
+        panic!(
+            "stdout should be valid JSON under --output-format json (#168c): {err}\nstdout bytes:\n{stdout_text}"
+        )
+    });
+    assert_eq!(envelope["type"], "error", "envelope must be typed error");
+    assert!(
+        envelope["kind"].as_str().is_some(),
+        "envelope must carry machine-readable kind"
+    );
+
+    // #168c secondary assertion: stderr should NOT carry the JSON envelope
+    // (it may be empty or contain non-JSON diagnostics, but the envelope
+    // belongs on stdout under --output-format json).
+    let stderr_text = String::from_utf8_lossy(&output.stderr);
+    let stderr_trimmed = stderr_text.trim();
+    if !stderr_trimmed.is_empty() {
+        // If stderr has content, it must NOT be the JSON envelope.
+        let stderr_is_json: Result<Value, _> = serde_json::from_slice(&output.stderr);
+        assert!(
+            stderr_is_json.is_err(),
+            "stderr must not duplicate the JSON envelope (#168c); stderr was:\n{stderr_trimmed}"
+        );
+    }
 }
 
 #[test]
