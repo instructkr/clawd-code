@@ -323,6 +323,17 @@ fn classify_error_kind(message: &str) -> &'static str {
         // misuse — more specific than cli_parse, give it its own kind so
         // consumers can offer REPL-launch guidance.
         "slash_command_requires_repl"
+    } else if message.contains("unexpected extra arguments after `claw") {
+        // #171: `claw <verb> --help` where <verb> doesn't accept suffix args
+        // (e.g., `claw list-sessions --help`, `claw plugins list --foo`).
+        // This is a parse error. Message template:
+        //   `unexpected extra arguments after \`claw <verb>\`: <args>`
+        //
+        // Covers: plugins, config, diff, list-sessions, load-session.
+        // #141-related: `claw list-sessions --help` specifically fails here
+        // instead of showing help. Classifier fix unblocks typed-error
+        // handling even while the help-for-that-verb gap remains open.
+        "cli_parse"
     } else if message.contains("invalid model syntax") {
         "invalid_model_syntax"
     } else if message.contains("is not yet implemented") {
@@ -11564,6 +11575,54 @@ mod tests {
             classify_error_kind("slash command exists and works fine"),
             "unknown",
             "generic mention of `slash command` without `interactive-only` should fall through"
+        );
+    }
+
+    #[test]
+    fn classify_error_kind_covers_unexpected_extra_args_171() {
+        // #171: `claw <verb> <extra-args>` where the verb doesn't accept
+        // trailing positional args (e.g., `claw list-sessions --help`,
+        // `claw plugins list --foo`). Message template is:
+        //   `unexpected extra arguments after \`claw <verb>\`: <args>`
+        //
+        // Affects: list-sessions, plugins, config, diff, load-session.
+        // Before #171, these were classified `unknown`, breaking typed-error
+        // consumer dispatch on what is clearly a CLI parse error.
+        assert_eq!(
+            classify_error_kind(
+                "unexpected extra arguments after `claw list-sessions`: --help"
+            ),
+            "cli_parse",
+            "list-sessions extra args must classify as cli_parse"
+        );
+        assert_eq!(
+            classify_error_kind(
+                "unexpected extra arguments after `claw plugins list`: --foo"
+            ),
+            "cli_parse",
+            "plugins subcommand extra args must classify as cli_parse"
+        );
+        assert_eq!(
+            classify_error_kind("unexpected extra arguments after `claw diff`: --bar"),
+            "cli_parse",
+            "diff extra args must classify as cli_parse"
+        );
+        assert_eq!(
+            classify_error_kind(
+                "unexpected extra arguments after `claw config show`: --baz"
+            ),
+            "cli_parse",
+            "config subcommand extra args must classify as cli_parse"
+        );
+        // Sanity: the pattern requires the exact `after \`claw` prefix to
+        // match, so unrelated prose with "unexpected extra arguments" in a
+        // different structure falls through.
+        assert_eq!(
+            classify_error_kind(
+                "the API returned unexpected extra arguments in some response"
+            ),
+            "unknown",
+            "generic prose with 'unexpected extra arguments' should fall through"
         );
     }
 
