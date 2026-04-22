@@ -60,12 +60,15 @@ python3 -m mypy src/ --ignore-missing-imports 2>&1 | tail -5
   - `test_submit_message_*.py` — budget, cancellation contracts
   - `test_*_cli.py` — command-specific JSON output validation
 
-- **`SCHEMAS.md`** — canonical JSON contract
-  - Common fields (all envelopes): timestamp, command, exit_code, output_format, schema_version
-  - Error envelope shape
-  - Not-found envelope shape
+- **`SCHEMAS.md`** — canonical JSON contract (**target v2.0 design; see note below**)
+  - **Target v2.0 common fields** (all envelopes): timestamp, command, exit_code, output_format, schema_version
+  - **Current v1.0 binary fields** (what the Rust binary actually emits): flat top-level `kind` + verb-specific fields OR `{error, hint, kind, type}` for errors
+  - Error envelope shape (target v2.0: nested error object)
+  - Not-found envelope shape (target v2.0)
   - Per-command success schemas (14 commands documented)
   - Turn Result fields (including cancel_observed as of #164 Stage B)
+
+  > **Important:** SCHEMAS.md describes the **v2.0 target envelope**, not the current v1.0 binary behavior. The binary does NOT currently emit `timestamp`, `command`, `exit_code`, `output_format`, or `schema_version` fields. See [`FIX_LOCUS_164.md`](./FIX_LOCUS_164.md) for the migration plan (Phase 1: dual-mode flag; Phase 2: default bump; Phase 3: deprecation).
 
 - **`.gitignore`** — excludes `.port_sessions/` (dogfood-run state)
 
@@ -75,9 +78,12 @@ python3 -m mypy src/ --ignore-missing-imports 2>&1 | tail -5
 
 Every clawable command **must**:
 1. Accept `--output-format {text,json}`
-2. Return JSON envelopes matching SCHEMAS.md
-3. Use common fields (timestamp, command, exit_code, output_format, schema_version)
-4. Exit 0 on success, 1 on error/not-found, 2 on timeout
+2. Return JSON envelopes (current v1.0: flat shape with top-level `kind`; target v2.0: nested with common fields per SCHEMAS.md)
+3. **v1.0 (current):** Emit flat top-level fields: verb-specific data + `kind` (verb identity for success, error classification for errors)
+4. **v2.0 (target, post-FIX_LOCUS_164):** Use common wrapper fields (timestamp, command, exit_code, output_format, schema_version) with nested `data` or `error` objects
+5. Exit 0 on success, 1 on error/not-found, 2 on timeout
+
+**Migration note:** The Python reference harness in `src/` was written against the v2.0 target schema (SCHEMAS.md). The Rust binary in `rust/` currently emits v1.0 (flat). See [`FIX_LOCUS_164.md`](./FIX_LOCUS_164.md) for the full migration plan and timeline.
 
 **Commands:** list-sessions, delete-session, load-session, flush-transcript, show-command, show-tool, exec-command, exec-tool, route, bootstrap, command-graph, tool-pool, bootstrap-graph, turn-loop
 
