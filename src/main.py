@@ -32,8 +32,10 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser('manifest', help='print the current Python workspace manifest')
     subparsers.add_parser('parity-audit', help='compare the Python workspace against the local ignored TypeScript archive when available')
     subparsers.add_parser('setup-report', help='render the startup/prefetch setup report')
-    subparsers.add_parser('command-graph', help='show command graph segmentation')
-    subparsers.add_parser('tool-pool', help='show assembled tool pool with default settings')
+    command_graph_parser = subparsers.add_parser('command-graph', help='show command graph segmentation')
+    command_graph_parser.add_argument('--output-format', choices=['text', 'json'], default='text')
+    tool_pool_parser = subparsers.add_parser('tool-pool', help='show assembled tool pool with default settings')
+    tool_pool_parser.add_argument('--output-format', choices=['text', 'json'], default='text')
     subparsers.add_parser('bootstrap-graph', help='show the mirrored bootstrap/runtime graph stages')
     list_parser = subparsers.add_parser('subsystems', help='list the current Python modules in the workspace')
     list_parser.add_argument('--limit', type=int, default=32)
@@ -197,10 +199,35 @@ def main(argv: list[str] | None = None) -> int:
         print(run_setup().as_markdown())
         return 0
     if args.command == 'command-graph':
-        print(build_command_graph().as_markdown())
+        graph = build_command_graph()
+        if args.output_format == 'json':
+            import json
+            envelope = {
+                'builtins_count': len(graph.builtins),
+                'plugin_like_count': len(graph.plugin_like),
+                'skill_like_count': len(graph.skill_like),
+                'total_count': len(graph.flattened()),
+                'builtins': [{'name': m.name, 'source_hint': m.source_hint} for m in graph.builtins],
+                'plugin_like': [{'name': m.name, 'source_hint': m.source_hint} for m in graph.plugin_like],
+                'skill_like': [{'name': m.name, 'source_hint': m.source_hint} for m in graph.skill_like],
+            }
+            print(json.dumps(envelope))
+        else:
+            print(graph.as_markdown())
         return 0
     if args.command == 'tool-pool':
-        print(assemble_tool_pool().as_markdown())
+        pool = assemble_tool_pool()
+        if args.output_format == 'json':
+            import json
+            envelope = {
+                'simple_mode': pool.simple_mode,
+                'include_mcp': pool.include_mcp,
+                'tool_count': len(pool.tools),
+                'tools': [{'name': t.name, 'source_hint': t.source_hint} for t in pool.tools],
+            }
+            print(json.dumps(envelope))
+        else:
+            print(pool.as_markdown())
         return 0
     if args.command == 'bootstrap-graph':
         print(build_bootstrap_graph().as_markdown())
