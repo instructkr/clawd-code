@@ -4,15 +4,20 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use api::{
-    max_tokens_for_model, resolve_model_alias, ApiError, ContentBlockDelta, InputContentBlock,
-    InputMessage, MessageRequest, MessageResponse, OutputContentBlock, ProviderClient,
-    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
+    ApiError, ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
+    OutputContentBlock, ProviderClient, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
+    ToolResultContentBlock, max_tokens_for_model, resolve_model_alias,
 };
 use plugins::PluginTool;
 use reqwest::blocking::Client;
 use runtime::{
-    check_freshness, dedupe_superseded_commit_events, edit_file, execute_bash, glob_search,
-    grep_search, load_system_prompt,
+    ApiClient, ApiRequest, AssistantEvent, BashCommandInput, BashCommandOutput, BranchFreshness,
+    ConfigLoader, ContentBlock, ConversationMessage, ConversationRuntime, GrepSearchInput,
+    LaneCommitProvenance, LaneEvent, LaneEventBlocker, LaneEventName, LaneEventStatus,
+    LaneFailureClass, McpDegradedReport, MessageRole, PermissionMode, PermissionPolicy,
+    PromptCacheEvent, ProviderFallbackConfig, RuntimeError, Session, TaskPacket, ToolError,
+    ToolExecutor, check_freshness, dedupe_superseded_commit_events, edit_file, execute_bash,
+    glob_search, grep_search, load_system_prompt,
     lsp_client::LspRegistry,
     mcp_tool_bridge::McpToolRegistry,
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
@@ -21,15 +26,10 @@ use runtime::{
     task_registry::TaskRegistry,
     team_cron_registry::{CronRegistry, TeamRegistry},
     worker_boot::{WorkerReadySnapshot, WorkerRegistry, WorkerTaskReceipt},
-    write_file, ApiClient, ApiRequest, AssistantEvent, BashCommandInput, BashCommandOutput,
-    BranchFreshness, ConfigLoader, ContentBlock, ConversationMessage, ConversationRuntime,
-    GrepSearchInput, LaneCommitProvenance, LaneEvent, LaneEventBlocker, LaneEventName,
-    LaneEventStatus, LaneFailureClass, McpDegradedReport, MessageRole, PermissionMode,
-    PermissionPolicy, PromptCacheEvent, ProviderFallbackConfig, RuntimeError, Session, TaskPacket,
-    ToolError, ToolExecutor,
+    write_file,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Global task registry shared across tool invocations within a session.
 fn global_lsp_registry() -> &'static LspRegistry {
@@ -104,6 +104,16 @@ pub struct ToolSpec {
     pub input_schema: Value,
     pub required_permission: PermissionMode,
 }
+
+pub const IMAGE_QUALITY_TOOL_NAMES: &[&str] = &[
+    "generate_image",
+    "detect_hands_feet",
+    "check_symmetry",
+    "check_pattern_consistency",
+    "inpaint_region",
+    "ImageQualityGate",
+    "ImageQualityLoopPlan",
+];
 
 #[derive(Debug, Clone)]
 pub struct GlobalToolRegistry {
@@ -229,6 +239,12 @@ impl GlobalToolRegistry {
                 .split(|ch: char| ch == ',' || ch.is_whitespace())
                 .filter(|token| !token.is_empty())
             {
+                if normalize_tool_name(token) == "image_only" {
+                    for image_tool in IMAGE_QUALITY_TOOL_NAMES {
+                        allowed.insert((*image_tool).to_string());
+                    }
+                    continue;
+                }
                 let normalized = normalize_tool_name(token);
                 let canonical = name_map.get(&normalized).ok_or_else(|| {
                     format!(
@@ -367,6 +383,18 @@ impl GlobalToolRegistry {
     }
 }
 
+#[must_use]
+pub fn image_quality_tool_specs() -> Vec<ToolSpec> {
+    let names = IMAGE_QUALITY_TOOL_NAMES
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    mvp_tool_specs()
+        .into_iter()
+        .filter(|spec| names.contains(spec.name))
+        .collect()
+}
+
 fn normalize_tool_name(value: &str) -> String {
     value.trim().replace('-', "_").to_ascii_lowercase()
 }
@@ -492,8 +520,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "WebFetch",
-            description:
-                "Fetch a URL, convert it into readable text, and answer a prompt about it.",
+            description: "Fetch a URL, convert it into readable text, and answer a prompt about it.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1141,6 +1168,180 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::DangerFullAccess,
         },
         ToolSpec {
+            name: "generate_image",
+            description: "Generate one or more candidate images through an image backend adapter endpoint.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "backend_url": { "type": "string" },
+                    "prompt": { "type": "string" },
+                    "negative_prompt": { "type": "string" },
+                    "width": { "type": "integer", "minimum": 256, "maximum": 2048 },
+                    "height": { "type": "integer", "minimum": 256, "maximum": 2048 },
+                    "steps": { "type": "integer", "minimum": 8, "maximum": 150 },
+                    "cfg": { "type": "number", "minimum": 1.0, "maximum": 20.0 },
+                    "seed": { "type": "integer", "minimum": 0 },
+                    "sampler": { "type": "string" },
+                    "model": { "type": "string" },
+                    "batch_size": { "type": "integer", "minimum": 1, "maximum": 16 },
+                    "style_preset": { "type": "string" },
+                    "control_inputs": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "type": { "type": "string" },
+                                "uri": { "type": "string" },
+                                "strength": { "type": "number", "minimum": 0.0, "maximum": 1.0 }
+                            },
+                            "required": ["type", "uri", "strength"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": ["backend_url", "prompt", "negative_prompt", "width", "height", "steps", "cfg", "seed", "sampler", "model"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "detect_hands_feet",
+            description: "Detect hand/foot anatomy regions and issues through an image validator endpoint.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "backend_url": { "type": "string" },
+                    "image_uri": { "type": "string" },
+                    "min_confidence": { "type": "number", "minimum": 0.0, "maximum": 1.0 }
+                },
+                "required": ["backend_url", "image_uri"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "check_symmetry",
+            description: "Validate bilateral symmetry constraints through an image validator endpoint.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "backend_url": { "type": "string" },
+                    "image_uri": { "type": "string" },
+                    "expectations": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "label": { "type": "string" },
+                                "left_region": { "type": "array", "items": { "type": "number" }, "minItems": 4, "maxItems": 4 },
+                                "right_region": { "type": "array", "items": { "type": "number" }, "minItems": 4, "maxItems": 4 },
+                                "tolerance": { "type": "number", "minimum": 0.0, "maximum": 1.0 }
+                            },
+                            "required": ["label", "left_region", "right_region"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": ["backend_url", "image_uri", "expectations"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "check_pattern_consistency",
+            description: "Validate repeating motif/pattern consistency through an image validator endpoint.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "backend_url": { "type": "string" },
+                    "image_uri": { "type": "string" },
+                    "pattern_regions": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "label": { "type": "string" },
+                                "bbox": { "type": "array", "items": { "type": "number" }, "minItems": 4, "maxItems": 4 }
+                            },
+                            "required": ["label", "bbox"],
+                            "additionalProperties": false
+                        }
+                    },
+                    "reference_region": {
+                        "type": "object",
+                        "properties": {
+                            "bbox": { "type": "array", "items": { "type": "number" }, "minItems": 4, "maxItems": 4 }
+                        },
+                        "additionalProperties": false
+                    }
+                },
+                "required": ["backend_url", "image_uri", "pattern_regions"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "inpaint_region",
+            description: "Apply localized inpainting through an image backend adapter endpoint.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "backend_url": { "type": "string" },
+                    "image_uri": { "type": "string" },
+                    "mask_uri": { "type": "string" },
+                    "prompt": { "type": "string" },
+                    "negative_prompt": { "type": "string" },
+                    "denoise_strength": { "type": "number", "minimum": 0.05, "maximum": 0.85 },
+                    "steps": { "type": "integer", "minimum": 8, "maximum": 150 },
+                    "cfg": { "type": "number", "minimum": 1.0, "maximum": 20.0 },
+                    "seed": { "type": "integer", "minimum": 0 },
+                    "model": { "type": "string" },
+                    "preserve_edges": { "type": "boolean" }
+                },
+                "required": ["backend_url", "image_uri", "mask_uri", "prompt", "negative_prompt", "denoise_strength", "steps", "cfg", "seed", "model"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "ImageQualityGate",
+            description: "Evaluate weighted image quality policy scores and return pass/fail verdict.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "anatomy_score": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+                    "symmetry_score": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+                    "pattern_score": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+                    "artifact_score": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+                    "creative_score": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+                    "require_symmetry": { "type": "boolean" },
+                    "require_pattern": { "type": "boolean" }
+                },
+                "required": ["anatomy_score", "symmetry_score", "pattern_score", "artifact_score"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "ImageQualityLoopPlan",
+            description: "Plan next action for iterative image repair (accept, repair, or reject) with targeted prompts.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "iteration": { "type": "integer", "minimum": 0 },
+                    "max_iterations": { "type": "integer", "minimum": 1 },
+                    "gate_passed": { "type": "boolean" },
+                    "anatomy_issues": { "type": "array", "items": { "type": "string" } },
+                    "symmetry_violations": { "type": "array", "items": { "type": "string" } },
+                    "pattern_violations": { "type": "array", "items": { "type": "string" } },
+                    "artifact_issues": { "type": "array", "items": { "type": "string" } }
+                },
+                "required": ["iteration", "max_iterations", "gate_passed"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
             name: "MCP",
             description: "Execute a tool provided by a connected MCP server.",
             input_schema: json!({
@@ -1282,6 +1483,20 @@ fn execute_tool_with_enforcer(
         "ReadMcpResource" => from_value::<McpResourceInput>(input).and_then(run_read_mcp_resource),
         "McpAuth" => from_value::<McpAuthInput>(input).and_then(run_mcp_auth),
         "RemoteTrigger" => from_value::<RemoteTriggerInput>(input).and_then(run_remote_trigger),
+        "generate_image" => from_value::<GenerateImageInput>(input).and_then(run_generate_image),
+        "detect_hands_feet" => {
+            from_value::<DetectHandsFeetInput>(input).and_then(run_detect_hands_feet)
+        }
+        "check_symmetry" => from_value::<CheckSymmetryInput>(input).and_then(run_check_symmetry),
+        "check_pattern_consistency" => from_value::<CheckPatternConsistencyInput>(input)
+            .and_then(run_check_pattern_consistency),
+        "inpaint_region" => from_value::<InpaintRegionInput>(input).and_then(run_inpaint_region),
+        "ImageQualityGate" => {
+            from_value::<ImageQualityGateInput>(input).and_then(run_image_quality_gate)
+        }
+        "ImageQualityLoopPlan" => {
+            from_value::<ImageQualityLoopPlanInput>(input).and_then(run_image_quality_loop_plan)
+        }
         "MCP" => from_value::<McpToolInput>(input).and_then(run_mcp_tool),
         "TestingPermission" => {
             from_value::<TestingPermissionInput>(input).and_then(run_testing_permission)
@@ -1804,6 +2019,192 @@ fn run_remote_trigger(input: RemoteTriggerInput) -> Result<String, String> {
             "success": false
         })),
     }
+}
+
+fn post_json_to_backend(backend_url: &str, payload: &Value) -> Result<Value, String> {
+    let client = Client::new();
+    let request = client
+        .post(backend_url)
+        .timeout(Duration::from_secs(60))
+        .json(payload);
+    let response = request.send().map_err(|error| error.to_string())?;
+    let status = response.status();
+    let body = response.text().map_err(|error| error.to_string())?;
+    if !status.is_success() {
+        return Err(format!(
+            "backend returned HTTP {}: {}",
+            status.as_u16(),
+            body
+        ));
+    }
+    serde_json::from_str(&body)
+        .map_err(|error| format!("backend response is not valid JSON: {error}"))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_generate_image(input: GenerateImageInput) -> Result<String, String> {
+    let payload = serde_json::to_value(&input).map_err(|error| error.to_string())?;
+    let backend = input.backend_url.clone();
+    let result = post_json_to_backend(&backend, &payload)?;
+    to_pretty_json(json!({
+        "tool": "generate_image",
+        "backend_url": backend,
+        "result": result
+    }))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_detect_hands_feet(input: DetectHandsFeetInput) -> Result<String, String> {
+    let payload = serde_json::to_value(&input).map_err(|error| error.to_string())?;
+    let backend = input.backend_url.clone();
+    let result = post_json_to_backend(&backend, &payload)?;
+    to_pretty_json(json!({
+        "tool": "detect_hands_feet",
+        "backend_url": backend,
+        "result": result
+    }))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_check_symmetry(input: CheckSymmetryInput) -> Result<String, String> {
+    let payload = serde_json::to_value(&input).map_err(|error| error.to_string())?;
+    let backend = input.backend_url.clone();
+    let result = post_json_to_backend(&backend, &payload)?;
+    to_pretty_json(json!({
+        "tool": "check_symmetry",
+        "backend_url": backend,
+        "result": result
+    }))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_check_pattern_consistency(input: CheckPatternConsistencyInput) -> Result<String, String> {
+    let payload = serde_json::to_value(&input).map_err(|error| error.to_string())?;
+    let backend = input.backend_url.clone();
+    let result = post_json_to_backend(&backend, &payload)?;
+    to_pretty_json(json!({
+        "tool": "check_pattern_consistency",
+        "backend_url": backend,
+        "result": result
+    }))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_inpaint_region(input: InpaintRegionInput) -> Result<String, String> {
+    let payload = serde_json::to_value(&input).map_err(|error| error.to_string())?;
+    let backend = input.backend_url.clone();
+    let result = post_json_to_backend(&backend, &payload)?;
+    to_pretty_json(json!({
+        "tool": "inpaint_region",
+        "backend_url": backend,
+        "result": result
+    }))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_image_quality_gate(input: ImageQualityGateInput) -> Result<String, String> {
+    let require_symmetry = input.require_symmetry.unwrap_or(true);
+    let require_pattern = input.require_pattern.unwrap_or(true);
+    let creative_score = input.creative_score.unwrap_or(0.0);
+    let symmetry_score = input.symmetry_score.unwrap_or(1.0);
+    let pattern_score = input.pattern_score.unwrap_or(1.0);
+    let weighted_total = 0.40 * input.anatomy_score
+        + 0.25 * symmetry_score
+        + 0.20 * pattern_score
+        + 0.10 * input.artifact_score
+        + 0.05 * creative_score;
+    let symmetry_pass = !require_symmetry || symmetry_score >= 0.90;
+    let pattern_pass = !require_pattern || pattern_score >= 0.88;
+    let passed = input.anatomy_score >= 0.92
+        && input.artifact_score >= 0.85
+        && symmetry_pass
+        && pattern_pass
+        && weighted_total >= 0.90;
+
+    to_pretty_json(json!({
+        "passed": passed,
+        "scores": {
+            "anatomy_score": input.anatomy_score,
+            "symmetry_score": symmetry_score,
+            "pattern_score": pattern_score,
+            "artifact_score": input.artifact_score,
+            "creative_score": creative_score,
+            "weighted_total": weighted_total
+        },
+        "thresholds": {
+            "anatomy_score": 0.92,
+            "symmetry_score": if require_symmetry { Value::from(0.90) } else { Value::Null },
+            "pattern_score": if require_pattern { Value::from(0.88) } else { Value::Null },
+            "artifact_score": 0.85,
+            "weighted_total": 0.90
+        }
+    }))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_image_quality_loop_plan(input: ImageQualityLoopPlanInput) -> Result<String, String> {
+    if input.gate_passed {
+        return to_pretty_json(json!({
+            "action": "accept",
+            "reason": "quality gate passed",
+            "iteration": input.iteration
+        }));
+    }
+
+    if input.iteration >= input.max_iterations {
+        return to_pretty_json(json!({
+            "action": "reject",
+            "reason": "max iterations reached without passing gate",
+            "iteration": input.iteration,
+            "max_iterations": input.max_iterations
+        }));
+    }
+
+    let mut repairs = Vec::new();
+    if !input.anatomy_issues.is_empty() {
+        repairs.push(json!({
+            "type": "anatomy",
+            "priority": 1,
+            "issues": input.anatomy_issues,
+            "positive_prompt": "anatomically correct hand and foot structure, natural joints, proper digit separation",
+            "negative_prompt": "extra digits, fused fingers, malformed toes, deformed joints"
+        }));
+    }
+    if !input.symmetry_violations.is_empty() {
+        repairs.push(json!({
+            "type": "symmetry",
+            "priority": 2,
+            "issues": input.symmetry_violations,
+            "positive_prompt": "left and right sides mirror-consistent in design, trim, and stitching",
+            "negative_prompt": "asymmetrical clothing details, mismatched mirrored elements"
+        }));
+    }
+    if !input.pattern_violations.is_empty() {
+        repairs.push(json!({
+            "type": "pattern",
+            "priority": 3,
+            "issues": input.pattern_violations,
+            "positive_prompt": "continuous repeating motif with stable scale and orientation",
+            "negative_prompt": "broken repeats, warped motif scale, seam discontinuity"
+        }));
+    }
+    if !input.artifact_issues.is_empty() {
+        repairs.push(json!({
+            "type": "artifact",
+            "priority": 4,
+            "issues": input.artifact_issues,
+            "positive_prompt": "clean detail and coherent edges preserving original style",
+            "negative_prompt": "smudging, ringing artifacts, over-sharpened halos"
+        }));
+    }
+
+    to_pretty_json(json!({
+        "action": "repair",
+        "iteration": input.iteration,
+        "next_iteration": input.iteration + 1,
+        "repairs": repairs,
+        "repair_count": repairs.len()
+    }))
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -2525,6 +2926,125 @@ struct RemoteTriggerInput {
     headers: Option<Value>,
     #[serde(default)]
     body: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ControlInput {
+    #[serde(rename = "type")]
+    control_type: String,
+    uri: String,
+    strength: f64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct GenerateImageInput {
+    backend_url: String,
+    prompt: String,
+    negative_prompt: String,
+    width: u32,
+    height: u32,
+    steps: u32,
+    cfg: f64,
+    seed: u64,
+    sampler: String,
+    model: String,
+    #[serde(default)]
+    batch_size: Option<u32>,
+    #[serde(default)]
+    style_preset: Option<String>,
+    #[serde(default)]
+    control_inputs: Option<Vec<ControlInput>>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct DetectHandsFeetInput {
+    backend_url: String,
+    image_uri: String,
+    #[serde(default)]
+    min_confidence: Option<f64>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct SymmetryExpectation {
+    label: String,
+    left_region: Vec<f64>,
+    right_region: Vec<f64>,
+    #[serde(default)]
+    tolerance: Option<f64>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct CheckSymmetryInput {
+    backend_url: String,
+    image_uri: String,
+    expectations: Vec<SymmetryExpectation>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct PatternRegion {
+    label: String,
+    bbox: Vec<f64>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ReferenceRegion {
+    bbox: Vec<f64>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct CheckPatternConsistencyInput {
+    backend_url: String,
+    image_uri: String,
+    pattern_regions: Vec<PatternRegion>,
+    #[serde(default)]
+    reference_region: Option<ReferenceRegion>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct InpaintRegionInput {
+    backend_url: String,
+    image_uri: String,
+    mask_uri: String,
+    prompt: String,
+    negative_prompt: String,
+    denoise_strength: f64,
+    steps: u32,
+    cfg: f64,
+    seed: u64,
+    model: String,
+    #[serde(default)]
+    preserve_edges: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ImageQualityGateInput {
+    anatomy_score: f64,
+    #[serde(default)]
+    symmetry_score: Option<f64>,
+    #[serde(default)]
+    pattern_score: Option<f64>,
+    artifact_score: f64,
+    #[serde(default)]
+    creative_score: Option<f64>,
+    #[serde(default)]
+    require_symmetry: Option<bool>,
+    #[serde(default)]
+    require_pattern: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ImageQualityLoopPlanInput {
+    iteration: u32,
+    max_iterations: u32,
+    gate_passed: bool,
+    #[serde(default)]
+    anatomy_issues: Vec<String>,
+    #[serde(default)]
+    symmetry_violations: Vec<String>,
+    #[serde(default)]
+    pattern_violations: Vec<String>,
+    #[serde(default)]
+    artifact_issues: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5704,7 +6224,7 @@ fn normalize_config_value(spec: ConfigSettingSpec, value: ConfigValue) -> Result
             }
         }
         (ConfigKind::Boolean, ConfigValue::Number(_)) => {
-            return Err(String::from("setting requires true or false"))
+            return Err(String::from("setting requires true or false"));
         }
         (ConfigKind::String, ConfigValue::String(value)) => Value::String(value),
         (ConfigKind::String, ConfigValue::Bool(value)) => Value::String(value.to_string()),
@@ -6127,18 +6647,18 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        agent_permission_policy, allowed_tools_for_subagent, classify_lane_failure,
-        derive_agent_state, execute_agent_with_spawn, execute_tool, extract_recovery_outcome,
-        final_assistant_text, global_cron_registry, maybe_commit_provenance, mvp_tool_specs,
-        permission_mode_from_plugin, persist_agent_terminal_state, push_output_block,
-        run_task_packet, AgentInput, AgentJob, GlobalToolRegistry, LaneEventName, LaneFailureClass,
-        ProviderRuntimeClient, SubagentToolExecutor,
+        AgentInput, AgentJob, GlobalToolRegistry, LaneEventName, LaneFailureClass,
+        ProviderRuntimeClient, SubagentToolExecutor, agent_permission_policy,
+        allowed_tools_for_subagent, classify_lane_failure, derive_agent_state,
+        execute_agent_with_spawn, execute_tool, extract_recovery_outcome, final_assistant_text,
+        global_cron_registry, maybe_commit_provenance, mvp_tool_specs, permission_mode_from_plugin,
+        persist_agent_terminal_state, push_output_block, run_task_packet,
     };
     use api::OutputContentBlock;
     use runtime::ProviderFallbackConfig;
     use runtime::{
-        permission_enforcer::PermissionEnforcer, ApiRequest, AssistantEvent, ConversationRuntime,
-        PermissionMode, PermissionPolicy, RuntimeError, Session, TaskPacket, ToolExecutor,
+        ApiRequest, AssistantEvent, ConversationRuntime, PermissionMode, PermissionPolicy,
+        RuntimeError, Session, TaskPacket, ToolExecutor, permission_enforcer::PermissionEnforcer,
     };
     use serde_json::json;
 
@@ -6243,6 +6763,90 @@ mod tests {
     fn rejects_unknown_tool_names() {
         let error = execute_tool("nope", &json!({})).expect_err("tool should be rejected");
         assert!(error.contains("unsupported tool"));
+    }
+
+    #[test]
+    fn image_quality_gate_passes_with_strict_scores() {
+        let output = execute_tool(
+            "ImageQualityGate",
+            &json!({
+                "anatomy_score": 0.95,
+                "symmetry_score": 0.93,
+                "pattern_score": 0.91,
+                "artifact_score": 0.89,
+                "creative_score": 0.80,
+                "require_symmetry": true,
+                "require_pattern": true
+            }),
+        )
+        .expect("gate should evaluate");
+        let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid json");
+        assert_eq!(parsed["passed"], true);
+        assert!(
+            parsed["scores"]["weighted_total"]
+                .as_f64()
+                .expect("weighted total")
+                >= 0.90
+        );
+    }
+
+    #[test]
+    fn image_quality_gate_can_skip_symmetry_and_pattern_requirements() {
+        let output = execute_tool(
+            "ImageQualityGate",
+            &json!({
+                "anatomy_score": 0.95,
+                "artifact_score": 0.90,
+                "require_symmetry": false,
+                "require_pattern": false
+            }),
+        )
+        .expect("gate should evaluate");
+        let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid json");
+        assert_eq!(parsed["passed"], true);
+        assert_eq!(
+            parsed["thresholds"]["symmetry_score"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            parsed["thresholds"]["pattern_score"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn image_quality_loop_plan_accepts_when_gate_passes() {
+        let output = execute_tool(
+            "ImageQualityLoopPlan",
+            &json!({
+                "iteration": 1,
+                "max_iterations": 4,
+                "gate_passed": true
+            }),
+        )
+        .expect("loop planner should evaluate");
+        let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid json");
+        assert_eq!(parsed["action"], "accept");
+    }
+
+    #[test]
+    fn image_quality_loop_plan_returns_repair_plan_when_gate_fails() {
+        let output = execute_tool(
+            "ImageQualityLoopPlan",
+            &json!({
+                "iteration": 1,
+                "max_iterations": 4,
+                "gate_passed": false,
+                "anatomy_issues": ["extra_digits"],
+                "symmetry_violations": ["left-right mismatch"],
+                "pattern_violations": ["broken_repeat"]
+            }),
+        )
+        .expect("loop planner should evaluate");
+        let parsed: serde_json::Value = serde_json::from_str(&output).expect("valid json");
+        assert_eq!(parsed["action"], "repair");
+        assert_eq!(parsed["repair_count"], 3);
+        assert_eq!(parsed["repairs"][0]["type"], "anatomy");
     }
 
     #[test]
@@ -6867,9 +7471,11 @@ mod tests {
             .expect_err("subagent write tool should be denied before dispatch");
 
         // then
-        assert!(error
-            .to_string()
-            .contains("requires workspace-write permission"));
+        assert!(
+            error
+                .to_string()
+                .contains("requires workspace-write permission")
+        );
     }
 
     #[test]
@@ -6950,6 +7556,29 @@ mod tests {
     }
 
     #[test]
+    fn image_only_allowed_tools_alias_expands_to_image_toolset() {
+        let registry = GlobalToolRegistry::builtin();
+        let allowed = registry
+            .normalize_allowed_tools(&["image_only".to_string()])
+            .expect("image_only alias should be accepted")
+            .expect("allow list should be returned");
+        for tool_name in super::IMAGE_QUALITY_TOOL_NAMES {
+            assert!(allowed.contains(*tool_name), "missing {tool_name}");
+        }
+    }
+
+    #[test]
+    fn image_quality_tool_specs_returns_only_image_tools() {
+        let specs = super::image_quality_tool_specs();
+        let names = specs.iter().map(|spec| spec.name).collect::<BTreeSet<_>>();
+        let expected = super::IMAGE_QUALITY_TOOL_NAMES
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(names, expected);
+    }
+
+    #[test]
     fn web_fetch_returns_prompt_aware_summary() {
         let server = TestServer::spawn(Arc::new(|request_line: &str| {
             assert!(request_line.starts_with("GET /page "));
@@ -7007,10 +7636,12 @@ mod tests {
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
         assert_eq!(output["url"], format!("http://{}/plain", server.addr()));
-        assert!(output["result"]
-            .as_str()
-            .expect("result")
-            .contains("plain text response"));
+        assert!(
+            output["result"]
+                .as_str()
+                .expect("result")
+                .contains("plain text response")
+        );
 
         let error = execute_tool(
             "WebFetch",
@@ -7308,14 +7939,18 @@ mod tests {
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
         assert_eq!(output["skill"], "help");
-        assert!(output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with("/help/SKILL.md"));
-        assert!(output["prompt"]
-            .as_str()
-            .expect("prompt")
-            .contains("Guide on using oh-my-codex plugin"));
+        assert!(
+            output["path"]
+                .as_str()
+                .expect("path")
+                .ends_with("/help/SKILL.md")
+        );
+        assert!(
+            output["prompt"]
+                .as_str()
+                .expect("prompt")
+                .contains("Guide on using oh-my-codex plugin")
+        );
 
         let dollar_result = execute_tool(
             "Skill",
@@ -7327,10 +7962,12 @@ mod tests {
         let dollar_output: serde_json::Value =
             serde_json::from_str(&dollar_result).expect("valid json");
         assert_eq!(dollar_output["skill"], "$help");
-        assert!(dollar_output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with("/help/SKILL.md"));
+        assert!(
+            dollar_output["path"]
+                .as_str()
+                .expect("path")
+                .ends_with("/help/SKILL.md")
+        );
 
         if let Some(home) = original_home {
             std::env::set_var("HOME", home);
@@ -7366,19 +8003,23 @@ mod tests {
             .expect("project-local skill should resolve");
         let skill_output: serde_json::Value =
             serde_json::from_str(&skill_result).expect("valid json");
-        assert!(skill_output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with(".claw/skills/plan/SKILL.md"));
+        assert!(
+            skill_output["path"]
+                .as_str()
+                .expect("path")
+                .ends_with(".claw/skills/plan/SKILL.md")
+        );
 
         let command_result = execute_tool("Skill", &json!({ "skill": "/handoff" }))
             .expect("legacy command should resolve");
         let command_output: serde_json::Value =
             serde_json::from_str(&command_result).expect("valid json");
-        assert!(command_output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with(".claw/commands/handoff.md"));
+        assert!(
+            command_output["path"]
+                .as_str()
+                .expect("path")
+                .ends_with(".claw/commands/handoff.md")
+        );
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
         fs::remove_dir_all(root).expect("temp project should clean up");
@@ -7413,10 +8054,12 @@ mod tests {
             .expect("project-local skill should resolve");
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
-        assert!(output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with(".claude/skills/trace/SKILL.md"));
+        assert!(
+            output["path"]
+                .as_str()
+                .expect("path")
+                .ends_with(".claude/skills/trace/SKILL.md")
+        );
         assert_eq!(output["description"], "Project-local trace helper");
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
@@ -7475,15 +8118,19 @@ mod tests {
         let omc_output: serde_json::Value = serde_json::from_str(&omc_result).expect("valid json");
         let agents_output: serde_json::Value =
             serde_json::from_str(&agents_result).expect("valid json");
-        assert!(omc_output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with(".omc/skills/hud/SKILL.md"));
+        assert!(
+            omc_output["path"]
+                .as_str()
+                .expect("path")
+                .ends_with(".omc/skills/hud/SKILL.md")
+        );
         assert_eq!(omc_output["description"], "Project-local OMC HUD helper");
-        assert!(agents_output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with(".agents/skills/trace/SKILL.md"));
+        assert!(
+            agents_output["path"]
+                .as_str()
+                .expect("path")
+                .ends_with(".agents/skills/trace/SKILL.md")
+        );
         assert_eq!(
             agents_output["description"],
             "Project-local agents compatibility helper"
@@ -7535,10 +8182,12 @@ mod tests {
             .expect("learned skill should resolve");
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
-        assert!(output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with("skills/omc-learned/learned/SKILL.md"));
+        assert!(
+            output["path"]
+                .as_str()
+                .expect("path")
+                .ends_with("skills/omc-learned/learned/SKILL.md")
+        );
         assert_eq!(output["description"], "Learned OMC skill");
 
         match original_home {
@@ -7594,20 +8243,24 @@ mod tests {
             execute_tool("Skill", &json!({ "skill": "statusline" })).expect("direct skill");
         let direct_skill_output: serde_json::Value =
             serde_json::from_str(&direct_skill).expect("valid skill json");
-        assert!(direct_skill_output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with("skills/statusline/SKILL.md"));
+        assert!(
+            direct_skill_output["path"]
+                .as_str()
+                .expect("path")
+                .ends_with("skills/statusline/SKILL.md")
+        );
         assert_eq!(direct_skill_output["description"], "Claude config skill");
 
         let legacy_command =
             execute_tool("Skill", &json!({ "skill": "doctor-check" })).expect("direct command");
         let legacy_command_output: serde_json::Value =
             serde_json::from_str(&legacy_command).expect("valid command json");
-        assert!(legacy_command_output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with("commands/doctor-check.md"));
+        assert!(
+            legacy_command_output["path"]
+                .as_str()
+                .expect("path")
+                .ends_with("commands/doctor-check.md")
+        );
         assert_eq!(
             legacy_command_output["description"],
             "Claude config command"
@@ -7661,10 +8314,12 @@ mod tests {
             .expect("legacy command markdown should resolve");
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
-        assert!(output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with(".claude/commands/team.md"));
+        assert!(
+            output["path"]
+                .as_str()
+                .expect("path")
+                .ends_with(".claude/commands/team.md")
+        );
         assert_eq!(output["description"], "Legacy team workflow");
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
@@ -8447,16 +9102,18 @@ mod tests {
             final_assistant_text(&summary),
             "Scope: completed mock review"
         );
-        assert!(runtime
-            .session()
-            .messages
-            .iter()
-            .flat_map(|message| message.blocks.iter())
-            .any(|block| matches!(
-                block,
-                runtime::ContentBlock::ToolResult { output, .. }
-                    if output.contains("hello from child")
-            )));
+        assert!(
+            runtime
+                .session()
+                .messages
+                .iter()
+                .flat_map(|message| message.blocks.iter())
+                .any(|block| matches!(
+                    block,
+                    runtime::ContentBlock::ToolResult { output, .. }
+                        if output.contains("hello from child")
+                ))
+        );
 
         let _ = std::fs::remove_file(path);
     }
@@ -8620,20 +9277,24 @@ mod tests {
             .expect("bash failure should still return structured output");
         let failure_output: serde_json::Value = serde_json::from_str(&failure).expect("json");
         assert_eq!(failure_output["returnCodeInterpretation"], "exit_code:7");
-        assert!(failure_output["stderr"]
-            .as_str()
-            .expect("stderr")
-            .contains("oops"));
+        assert!(
+            failure_output["stderr"]
+                .as_str()
+                .expect("stderr")
+                .contains("oops")
+        );
 
         let timeout = execute_tool("bash", &json!({ "command": "sleep 1", "timeout": 10 }))
             .expect("bash timeout should return output");
         let timeout_output: serde_json::Value = serde_json::from_str(&timeout).expect("json");
         assert_eq!(timeout_output["interrupted"], true);
         assert_eq!(timeout_output["returnCodeInterpretation"], "timeout");
-        assert!(timeout_output["stderr"]
-            .as_str()
-            .expect("stderr")
-            .contains("Command exceeded timeout"));
+        assert!(
+            timeout_output["stderr"]
+                .as_str()
+                .expect("stderr")
+                .contains("Command exceeded timeout")
+        );
 
         let background = execute_tool(
             "bash",
@@ -8674,10 +9335,12 @@ mod tests {
             output_json["returnCodeInterpretation"],
             "preflight_blocked:branch_divergence"
         );
-        assert!(output_json["stderr"]
-            .as_str()
-            .expect("stderr")
-            .contains("branch divergence detected before workspace tests"));
+        assert!(
+            output_json["stderr"]
+                .as_str()
+                .expect("stderr")
+                .contains("branch divergence detected before workspace tests")
+        );
         assert_eq!(
             output_json["structuredContent"][0]["event"],
             "branch.stale_against_main"
@@ -8861,10 +9524,12 @@ mod tests {
             .expect("glob should succeed");
         let globbed_output: serde_json::Value = serde_json::from_str(&globbed).expect("json");
         assert_eq!(globbed_output["numFiles"], 1);
-        assert!(globbed_output["filenames"][0]
-            .as_str()
-            .expect("filename")
-            .ends_with("nested/lib.rs"));
+        assert!(
+            globbed_output["filenames"][0]
+                .as_str()
+                .expect("filename")
+                .ends_with("nested/lib.rs")
+        );
 
         let glob_error = execute_tool("glob_search", &json!({ "pattern": "[" }))
             .expect_err("invalid glob should fail");
@@ -8888,10 +9553,12 @@ mod tests {
         assert_eq!(grep_content_output["numFiles"], 0);
         assert!(grep_content_output["appliedLimit"].is_null());
         assert_eq!(grep_content_output["appliedOffset"], 1);
-        assert!(grep_content_output["content"]
-            .as_str()
-            .expect("content")
-            .contains("let alpha = 2;"));
+        assert!(
+            grep_content_output["content"]
+                .as_str()
+                .expect("content")
+                .contains("let alpha = 2;")
+        );
 
         let grep_count = execute_tool(
             "grep_search",
@@ -8920,10 +9587,12 @@ mod tests {
         let elapsed = started.elapsed();
         let output: serde_json::Value = serde_json::from_str(&result).expect("json");
         assert_eq!(output["duration_ms"], 20);
-        assert!(output["message"]
-            .as_str()
-            .expect("message")
-            .contains("Slept for 20ms"));
+        assert!(
+            output["message"]
+                .as_str()
+                .expect("message")
+                .contains("Slept for 20ms")
+        );
         assert!(elapsed >= Duration::from_millis(15));
     }
 
@@ -9091,11 +9760,12 @@ mod tests {
         let local_settings = std::fs::read_to_string(cwd.join(".claw").join("settings.local.json"))
             .expect("local settings after exit");
         assert!(local_settings.contains(r#""defaultMode": "acceptEdits""#));
-        assert!(!cwd
-            .join(".claw")
-            .join("tool-state")
-            .join("plan-mode.json")
-            .exists());
+        assert!(
+            !cwd.join(".claw")
+                .join("tool-state")
+                .join("plan-mode.json")
+                .exists()
+        );
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
         match original_home {
@@ -9152,11 +9822,12 @@ mod tests {
             None,
             "permissions override should be removed on exit"
         );
-        assert!(!cwd
-            .join(".claw")
-            .join("tool-state")
-            .join("plan-mode.json")
-            .exists());
+        assert!(
+            !cwd.join(".claw")
+                .join("tool-state")
+                .join("plan-mode.json")
+                .exists()
+        );
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
         match original_home {
@@ -9313,8 +9984,8 @@ printf 'pwsh:%s' "$1"
     }
 
     fn read_only_registry() -> super::GlobalToolRegistry {
-        use runtime::permission_enforcer::PermissionEnforcer;
         use runtime::PermissionPolicy;
+        use runtime::permission_enforcer::PermissionEnforcer;
 
         let policy = mvp_tool_specs().into_iter().fold(
             PermissionPolicy::new(runtime::PermissionMode::ReadOnly),
@@ -9599,26 +10270,29 @@ printf 'pwsh:%s' "$1"
             let addr = listener.local_addr().expect("local addr");
             let (tx, rx) = std::sync::mpsc::channel::<()>();
 
-            let handle = thread::spawn(move || loop {
-                if rx.try_recv().is_ok() {
-                    break;
-                }
+            let handle = thread::spawn(move || {
+                loop {
+                    if rx.try_recv().is_ok() {
+                        break;
+                    }
 
-                match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        let mut buffer = [0_u8; 4096];
-                        let size = stream.read(&mut buffer).expect("read request");
-                        let request = String::from_utf8_lossy(&buffer[..size]).into_owned();
-                        let request_line = request.lines().next().unwrap_or_default().to_string();
-                        let response = handler(&request_line);
-                        stream
-                            .write_all(response.to_bytes().as_slice())
-                            .expect("write response");
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            let mut buffer = [0_u8; 4096];
+                            let size = stream.read(&mut buffer).expect("read request");
+                            let request = String::from_utf8_lossy(&buffer[..size]).into_owned();
+                            let request_line =
+                                request.lines().next().unwrap_or_default().to_string();
+                            let response = handler(&request_line);
+                            stream
+                                .write_all(response.to_bytes().as_slice())
+                                .expect("write response");
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("server accept failed: {error}"),
                     }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(error) => panic!("server accept failed: {error}"),
                 }
             });
 
