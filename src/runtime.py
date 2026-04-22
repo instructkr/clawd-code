@@ -249,7 +249,10 @@ class PortRuntime:
                         # submitted yet this turn.
                         assert cancel_event is not None
                         cancel_event.set()
-                        results.append(self._build_timeout_result(turn_prompt, command_names, tool_names))
+                        results.append(self._build_timeout_result(
+                            turn_prompt, command_names, tool_names,
+                            cancel_observed=cancel_event.is_set()
+                        ))
                         break
                     assert executor is not None
                     future = executor.submit(
@@ -268,7 +271,10 @@ class PortRuntime:
                         assert cancel_event is not None
                         cancel_event.set()
                         future.cancel()
-                        results.append(self._build_timeout_result(turn_prompt, command_names, tool_names))
+                        results.append(self._build_timeout_result(
+                            turn_prompt, command_names, tool_names,
+                            cancel_observed=cancel_event.is_set()
+                        ))
                         break
 
                 results.append(result)
@@ -287,8 +293,11 @@ class PortRuntime:
         prompt: str,
         command_names: tuple[str, ...],
         tool_names: tuple[str, ...],
+        cancel_observed: bool = False,
     ) -> TurnResult:
-        """Synthesize a TurnResult representing a wall-clock timeout (#161)."""
+        """Synthesize a TurnResult representing a wall-clock timeout (#161).
+        #164 Stage B: cancel_observed signals cancellation event was set.
+        """
         return TurnResult(
             prompt=prompt,
             output='Wall-clock timeout exceeded before turn completed.',
@@ -297,6 +306,7 @@ class PortRuntime:
             permission_denials=(),
             usage=UsageSummary(),
             stop_reason='timeout',
+            cancel_observed=cancel_observed,
         )
 
     def _infer_permission_denials(self, matches: list[RoutedMatch]) -> list[PermissionDenial]:

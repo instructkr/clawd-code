@@ -30,6 +30,19 @@ Every command response, success or error, carries:
 
 ---
 
+## Turn Result Fields (Multi-Turn Sessions)
+
+When a command's response includes a `turn` object (e.g., in `bootstrap` or `turn-loop`), it carries:
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `prompt` | string | Yes | User input for this turn |
+| `output` | string | Yes | Assistant response |
+| `stop_reason` | enum | Yes | One of: `completed`, `timeout`, `cancelled`, `max_budget_reached`, `max_turns_reached` |
+| `cancel_observed` | bool | Yes | #164 Stage B: cancellation was signaled and observed (#161/#164) |
+
+---
+
 ## Error Envelope
 
 When a command fails (exit code 1), responses carry:

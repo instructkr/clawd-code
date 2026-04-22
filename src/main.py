@@ -332,6 +332,7 @@ def main(argv: list[str] | None = None) -> int:
                     'prompt': session.turn_result.prompt,
                     'output': session.turn_result.output,
                     'stop_reason': session.turn_result.stop_reason,
+                    'cancel_observed': session.turn_result.cancel_observed,
                 },
                 'persisted_session_path': session.persisted_session_path,
             }

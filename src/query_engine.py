@@ -31,6 +31,7 @@ class TurnResult:
     permission_denials: tuple[PermissionDenial, ...]
     usage: UsageSummary
     stop_reason: str
+    cancel_observed: bool = False
 
 
 @dataclass
