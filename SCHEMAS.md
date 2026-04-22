@@ -107,6 +107,24 @@ When an entity does not exist (exit code 1, but not a failure):
 
 ### `list-sessions`
 
+**Status**: ✅ Implemented (closed #251 cycle #45, 2026-04-23).
+
+**Actual binary envelope** (as of #251 fix):
+```json
+{
+  "command": "list-sessions",
+  "sessions": [
+    {
+      "id": "session-1775777421902-1",
+      "path": "/path/to/.claw/sessions/session-1775777421902-1.jsonl",
+      "updated_at_ms": 1775777421902,
+      "message_count": 0
+    }
+  ]
+}
+```
+
+**Aspirational (future) shape**:
 ```json
 {
   "timestamp": "2026-04-22T10:10:00Z",
@@ -128,8 +146,25 @@ When an entity does not exist (exit code 1, but not a failure):
 }
 ```
 
+**Gap**: Current impl lacks `timestamp`, `exit_code`, `output_format`, `schema_version`, `directory`, `sessions_count` (derivable), and the session object uses `id`/`updated_at_ms`/`message_count` instead of `session_id`/`last_modified`/`prompt_count`. Follow-up #250 Option B to align field names and add common-envelope fields.
+
 ### `delete-session`
 
+**Status**: ⚠️ Stub only (closed #251 dispatch-order fix; full impl deferred).
+
+**Actual binary envelope** (as of #251 fix):
+```json
+{
+  "type": "error",
+  "command": "delete-session",
+  "error": "not_yet_implemented",
+  "kind": "not_yet_implemented"
+}
+```
+
+Exit code: 1. No credentials required. The stub ensures the verb does NOT fall through to Prompt/auth (the #251 fix), but the actual delete operation is not yet wired.
+
+**Aspirational (future) shape**:
 ```json
 {
   "timestamp": "2026-04-22T10:10:00Z",
@@ -143,6 +178,31 @@ When an entity does not exist (exit code 1, but not a failure):
 
 ### `load-session`
 
+**Status**: ✅ Implemented (closed #251 cycle #45, 2026-04-23).
+
+**Actual binary envelope** (as of #251 fix):
+```json
+{
+  "command": "load-session",
+  "session": {
+    "id": "session-abc123",
+    "path": "/path/to/.claw/sessions/session-abc123.jsonl",
+    "messages": 5
+  }
+}
+```
+
+For nonexistent sessions, emits a local `session_not_found` error (NOT `missing_credentials`):
+```json
+{
+  "error": "session not found: nonexistent",
+  "kind": "session_not_found",
+  "type": "error",
+  "hint": "Hint: managed sessions live in .claw/sessions/<hash>/ ..."
+}
+```
+
+**Aspirational (future) shape**:
 ```json
 {
   "timestamp": "2026-04-22T10:10:00Z",
@@ -155,8 +215,25 @@ When an entity does not exist (exit code 1, but not a failure):
 }
 ```
 
+**Gap**: Current impl uses nested `session: {...}` instead of flat fields, and omits common-envelope fields. Follow-up #250 Option B to align.
+
 ### `flush-transcript`
 
+**Status**: ⚠️ Stub only (closed #251 dispatch-order fix; full impl deferred).
+
+**Actual binary envelope** (as of #251 fix):
+```json
+{
+  "type": "error",
+  "command": "flush-transcript",
+  "error": "not_yet_implemented",
+  "kind": "not_yet_implemented"
+}
+```
+
+Exit code: 1. No credentials required. Like `delete-session`, this stub resolves the #251 dispatch-order bug but the actual flush operation is not yet wired.
+
+**Aspirational (future) shape**:
 ```json
 {
   "timestamp": "2026-04-22T10:10:00Z",
