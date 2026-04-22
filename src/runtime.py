@@ -204,6 +204,9 @@ class PortRuntime:
         matches = self.route_prompt(prompt, limit=limit)
         command_names = tuple(match.name for match in matches if match.kind == 'command')
         tool_names = tuple(match.name for match in matches if match.kind == 'tool')
+        # #159: infer permission denials from the routed matches, not hardcoded empty tuple.
+        # Multi-turn sessions must have the same security posture as bootstrap_session.
+        denied_tools = tuple(self._infer_permission_denials(matches))
         results: list[TurnResult] = []
         deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
 
@@ -225,7 +228,8 @@ class PortRuntime:
 
                 if deadline is None:
                     # Legacy path: unbounded call, preserves existing behaviour exactly.
-                    result = engine.submit_message(turn_prompt, command_names, tool_names, ())
+                    # #159: pass inferred denied_tools (no longer hardcoded empty tuple)
+                    result = engine.submit_message(turn_prompt, command_names, tool_names, denied_tools)
                 else:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
@@ -233,7 +237,7 @@ class PortRuntime:
                         break
                     assert executor is not None
                     future = executor.submit(
-                        engine.submit_message, turn_prompt, command_names, tool_names, ()
+                        engine.submit_message, turn_prompt, command_names, tool_names, denied_tools
                     )
                     try:
                         result = future.result(timeout=remaining)
