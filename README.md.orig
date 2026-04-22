@@ -86,11 +86,8 @@ mkdir tauri-ui\src-tauri\binaries
 # Claw motorunu kopyala ve ismini değiştir
 copy rust\target\release\claw.exe tauri-ui\src-tauri\binaries\claw-x86_64-pc-windows-msvc.exe
 
-# Donanım dinleyicisini (Python) derle ve kopyala
-pip install pyinstaller pynvml
-pyinstaller --onefile --name hardware_daemon hardware_daemon.py
-mkdir tauri-ui\src-tauri\binaries
-copy dist\hardware_daemon.exe tauri-ui\src-tauri\binaries\hardware_daemon-x86_64-pc-windows-msvc.exe
+# Donanım dinleyicisini (Python) kopyala ve ismini değiştir
+copy hardware_daemon.py tauri-ui\src-tauri\binaries\hardware_daemon-x86_64-pc-windows-msvc
 ```
 
 **Linux / macOS (Intel) için:**
@@ -100,10 +97,8 @@ mkdir -p tauri-ui/src-tauri/binaries
 
 cp rust/target/release/claw tauri-ui/src-tauri/binaries/claw-x86_64-unknown-linux-gnu
 
-# Compile and copy the hardware daemon (Python)
-pip install pyinstaller pynvml
-pyinstaller --onefile --name hardware_daemon hardware_daemon.py
-cp dist/hardware_daemon tauri-ui/src-tauri/binaries/hardware_daemon-x86_64-unknown-linux-gnu
+chmod +x hardware_daemon.py
+cp hardware_daemon.py tauri-ui/src-tauri/binaries/hardware_daemon-x86_64-unknown-linux-gnu
 ```
 
 ### Bölüm 5: IDE'yi Başlatma
@@ -179,20 +174,15 @@ We need to copy the compiled binary to the Tauri app's expected sidecar director
 ```powershell
 mkdir tauri-ui\src-tauri\binaries
 copy rust\target\release\claw.exe tauri-ui\src-tauri\binaries\claw-x86_64-pc-windows-msvc.exe
-# Compile and copy the hardware daemon (Python)
-pip install pyinstaller pynvml
-pyinstaller --onefile --name hardware_daemon hardware_daemon.py
-copy dist\hardware_daemon.exe tauri-ui\src-tauri\binaries\hardware_daemon-x86_64-pc-windows-msvc.exe
+copy hardware_daemon.py tauri-ui\src-tauri\binaries\hardware_daemon-x86_64-pc-windows-msvc
 ```
 
 **Linux / macOS (Intel/AMD):**
 ```text
 mkdir -p tauri-ui/src-tauri/binaries
 cp rust/target/release/claw tauri-ui/src-tauri/binaries/claw-x86_64-unknown-linux-gnu
-# Donanım dinleyicisini (Python) derle ve kopyala
-pip install pyinstaller pynvml
-pyinstaller --onefile --name hardware_daemon hardware_daemon.py
-cp dist/hardware_daemon tauri-ui/src-tauri/binaries/hardware_daemon-x86_64-unknown-linux-gnu
+chmod +x hardware_daemon.py
+cp hardware_daemon.py tauri-ui/src-tauri/binaries/hardware_daemon-x86_64-unknown-linux-gnu
 ```
 
 ### Part 5: Run

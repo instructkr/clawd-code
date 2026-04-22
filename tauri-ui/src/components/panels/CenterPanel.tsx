@@ -6,11 +6,13 @@ import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 // @ts-ignore
 import { vscDarkPlus } from "react-syntax-highlighter/dist/esm/styles/prism";
 import { useClawEngine } from "../../hooks/useClawEngine";
+import { useSettings } from "../../hooks/useSettings";
 
 export default function CenterPanel({ onOpenSettings }: { onOpenSettings: () => void }) {
   const [input, setInput] = useState("");
   const [isThinkingOpen, setIsThinkingOpen] = useState(false);
 
+  const { settings } = useSettings();
   const { messages, sendMessage, isProcessing, tokenUsage } = useClawEngine();
 
   const handleSend = () => {
@@ -33,7 +35,7 @@ export default function CenterPanel({ onOpenSettings }: { onOpenSettings: () => 
         <div className="flex items-center gap-3">
           <div className="flex items-center gap-1.5 px-2 py-1 bg-surface0 rounded-md text-xs font-medium text-text border border-surface1">
             <Cpu size={14} className="text-mauve" />
-            claude-3-5-sonnet
+            {settings.modelName || "Select Model"}
           </div>
           <div className="text-xs text-subtext0 flex items-center gap-1">
             <Terminal size={14} />

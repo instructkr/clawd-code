@@ -3,7 +3,7 @@ import LeftPanel from "./components/panels/LeftPanel";
 import CenterPanel from "./components/panels/CenterPanel";
 import RightPanel from "./components/panels/RightPanel";
 import SettingsModal from "./components/modals/SettingsModal";
-import "./App.css";
+
 
 function App() {
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);

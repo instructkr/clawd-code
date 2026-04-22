@@ -1,8 +1,42 @@
-import { useState } from "react";
-import { X } from "lucide-react";
+import { useState, useEffect } from "react";
+import { X, RefreshCw } from "lucide-react";
+import { useSettings } from "../../hooks/useSettings";
 
 export default function SettingsModal({ onClose }: { onClose: () => void }) {
   const [activeTab, setActiveTab] = useState("main-chat-model");
+  const { settings, saveSettings } = useSettings();
+
+  // Local state for editing before saving
+  const [localSettings, setLocalSettings] = useState(settings);
+  const [ollamaModels, setOllamaModels] = useState<string[]>([]);
+  const [isLoadingModels, setIsLoadingModels] = useState(false);
+
+  const handleSave = () => {
+    saveSettings(localSettings);
+    onClose();
+  };
+
+  const fetchOllamaModels = async () => {
+    setIsLoadingModels(true);
+    try {
+      const url = localSettings.baseUrl || "http://localhost:11434";
+      const response = await fetch(`${url}/api/tags`);
+      const data = await response.json();
+      if (data.models && Array.isArray(data.models)) {
+        setOllamaModels(data.models.map((m: any) => m.name));
+      }
+    } catch (e) {
+      console.error("Failed to fetch Ollama models:", e);
+    } finally {
+      setIsLoadingModels(false);
+    }
+  };
+
+  useEffect(() => {
+    if (localSettings.provider === 'Ollama (Local)' && activeTab === 'main-chat-model') {
+      fetchOllamaModels();
+    }
+  }, [localSettings.provider, activeTab]);
 
   return (
     <div className="fixed inset-0 bg-crust/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
@@ -47,7 +81,11 @@ export default function SettingsModal({ onClose }: { onClose: () => void }) {
               <div className="space-y-6">
                 <div>
                   <h3 className="text-sm font-medium text-text mb-3">Model Provider</h3>
-                  <select className="w-full bg-mantle border border-surface1 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-blue text-text">
+                  <select
+                    value={localSettings.provider}
+                    onChange={(e) => setLocalSettings({...localSettings, provider: e.target.value})}
+                    className="w-full bg-mantle border border-surface1 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-blue text-text"
+                  >
                     <option>Anthropic</option>
                     <option>OpenAI / OpenRouter</option>
                     <option>Ollama (Local)</option>
@@ -57,14 +95,37 @@ export default function SettingsModal({ onClose }: { onClose: () => void }) {
 
                 <div>
                   <h3 className="text-sm font-medium text-text mb-3">Model Name</h3>
-                  <input
-                    type="text"
-                    placeholder="e.g. claude-3-5-sonnet"
-                    defaultValue="claude-3-5-sonnet"
-                    className="w-full bg-mantle border border-surface1 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-blue text-text"
-                  />
+                  {localSettings.provider === 'Ollama (Local)' ? (
+                    <div className="flex gap-2">
+                      <select
+                        value={localSettings.modelName}
+                        onChange={(e) => setLocalSettings({...localSettings, modelName: e.target.value})}
+                        className="flex-1 bg-mantle border border-surface1 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-blue text-text"
+                      >
+                        {ollamaModels.length === 0 && <option value={localSettings.modelName}>{localSettings.modelName}</option>}
+                        {ollamaModels.map(model => (
+                          <option key={model} value={model}>{model}</option>
+                        ))}
+                      </select>
+                      <button
+                        onClick={fetchOllamaModels}
+                        className="p-2 bg-surface0 hover:bg-surface1 rounded-md border border-surface1 transition-colors flex items-center justify-center"
+                        title="Refresh models"
+                      >
+                        <RefreshCw size={18} className={`text-subtext0 ${isLoadingModels ? 'animate-spin' : ''}`} />
+                      </button>
+                    </div>
+                  ) : (
+                    <input
+                      type="text"
+                      placeholder="e.g. claude-3-5-sonnet"
+                      value={localSettings.modelName}
+                      onChange={(e) => setLocalSettings({...localSettings, modelName: e.target.value})}
+                      className="w-full bg-mantle border border-surface1 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-blue text-text"
+                    />
+                  )}
                   <p className="text-xs text-subtext0 mt-2">
-                    For Ollama, select the provider above and enter your model tag (e.g. <code>llama3.2</code>).
+                    For Ollama, select the provider above to scan local models.
                   </p>
                 </div>
 
@@ -72,7 +133,9 @@ export default function SettingsModal({ onClose }: { onClose: () => void }) {
                   <h3 className="text-sm font-medium text-text mb-3">Base URL (Optional)</h3>
                   <input
                     type="text"
-                    placeholder="http://localhost:11434/v1"
+                    placeholder="http://localhost:11434"
+                    value={localSettings.baseUrl}
+                    onChange={(e) => setLocalSettings({...localSettings, baseUrl: e.target.value})}
                     className="w-full bg-mantle border border-surface1 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-blue text-text"
                   />
                 </div>
@@ -86,6 +149,8 @@ export default function SettingsModal({ onClose }: { onClose: () => void }) {
                   <input
                     type="password"
                     placeholder="sk-ant-..."
+                    value={localSettings.anthropicKey}
+                    onChange={(e) => setLocalSettings({...localSettings, anthropicKey: e.target.value})}
                     className="w-full bg-mantle border border-surface1 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-blue text-text"
                   />
                 </div>
@@ -94,6 +159,8 @@ export default function SettingsModal({ onClose }: { onClose: () => void }) {
                   <input
                     type="password"
                     placeholder="sk-..."
+                    value={localSettings.openAiKey}
+                    onChange={(e) => setLocalSettings({...localSettings, openAiKey: e.target.value})}
                     className="w-full bg-mantle border border-surface1 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-blue text-text"
                   />
                 </div>
@@ -101,8 +168,29 @@ export default function SettingsModal({ onClose }: { onClose: () => void }) {
             )}
 
             {activeTab === "general" && (
-              <div className="text-sm text-subtext0">
-                General application settings will appear here.
+              <div className="space-y-6">
+                <div>
+                  <h3 className="text-sm font-medium text-text mb-3">Language</h3>
+                  <select
+                    value={localSettings.language}
+                    onChange={(e) => setLocalSettings({...localSettings, language: e.target.value as 'en' | 'tr'})}
+                    className="w-full bg-mantle border border-surface1 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-blue text-text"
+                  >
+                    <option value="en">English</option>
+                    <option value="tr">Turkish (Türkçe)</option>
+                  </select>
+                </div>
+                <div>
+                  <h3 className="text-sm font-medium text-text mb-3">Theme</h3>
+                  <select
+                    value={localSettings.theme}
+                    onChange={(e) => setLocalSettings({...localSettings, theme: e.target.value as 'dark' | 'light'})}
+                    className="w-full bg-mantle border border-surface1 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-blue text-text"
+                  >
+                    <option value="dark">Dark (Catppuccin)</option>
+                    <option value="light">Light</option>
+                  </select>
+                </div>
               </div>
             )}
 
@@ -123,7 +211,7 @@ export default function SettingsModal({ onClose }: { onClose: () => void }) {
             Cancel
           </button>
           <button
-            onClick={onClose}
+            onClick={handleSave}
             className="px-4 py-2 text-sm font-medium bg-blue text-crust hover:bg-blue/90 rounded-md transition-colors"
           >
             Save Changes
