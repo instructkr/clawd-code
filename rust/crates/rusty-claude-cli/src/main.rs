@@ -739,6 +739,8 @@ enum LocalHelpTopic {
     SystemPrompt,
     DumpManifests,
     BootstrapPlan,
+    // #130c: help parity for `claw diff --help`
+    Diff,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1068,6 +1070,12 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         // #146: `diff` is pure-local (shells out to `git diff --cached` +
         // `git diff`). No session needed to inspect the working tree.
         "diff" => {
+            // #130c: accept --help / -h as first argument and route to help topic,
+            // matching the behavior of status/sandbox/doctor/etc.
+            // Without this guard, `claw diff --help` was rejected as extra arguments.
+            if rest.len() == 2 && is_help_flag(&rest[1]) {
+                return Ok(CliAction::HelpTopic(LocalHelpTopic::Diff));
+            }
             if rest.len() > 1 {
                 return Err(format!(
                     "unexpected extra arguments after `claw diff`: {}",
@@ -1267,6 +1275,8 @@ fn parse_local_help_action(rest: &[String]) -> Option<Result<CliAction, String>>
         "system-prompt" => LocalHelpTopic::SystemPrompt,
         "dump-manifests" => LocalHelpTopic::DumpManifests,
         "bootstrap-plan" => LocalHelpTopic::BootstrapPlan,
+        // #130c: help parity for `claw diff --help`
+        "diff" => LocalHelpTopic::Diff,
         _ => return None,
     };
     Some(Ok(CliAction::HelpTopic(topic)))
@@ -6349,6 +6359,15 @@ fn render_help_topic(topic: LocalHelpTopic) -> String {
   Formats          text (default), json
   Related          claw doctor · claw status"
             .to_string(),
+        // #130c: help topic for `claw diff --help`.
+        LocalHelpTopic::Diff => "Diff
+  Usage            claw diff [--output-format <format>]
+  Purpose          show local git staged + unstaged changes for the current workspace
+  Requires         workspace must be inside a git repository
+  Output           unified diff (text) or structured diff object (json)
+  Formats          text (default), json
+  Related          claw status · claw config"
+            .to_string(),
     }
 }
 
@@ -10629,6 +10648,47 @@ mod tests {
             classify_error_kind(&enriched),
             "filesystem_io_error",
             "#130b: enriched messages must be classifier-recognizable"
+        );
+        // #130c: `claw diff --help` must route to help topic, not reject as extra args.
+        // Regression: `diff` was the outlier among local introspection commands
+        // (status/config/mcp all accepted --help) because its parser arm rejected
+        // all extra args before help detection could run.
+        let diff_help_action = parse_args(&[
+            "diff".to_string(),
+            "--help".to_string(),
+        ])
+        .expect("diff --help must parse as help action");
+        assert!(
+            matches!(diff_help_action, CliAction::HelpTopic(LocalHelpTopic::Diff)),
+            "#130c: diff --help must route to LocalHelpTopic::Diff, got: {diff_help_action:?}"
+        );
+        let diff_h_action = parse_args(&[
+            "diff".to_string(),
+            "-h".to_string(),
+        ])
+        .expect("diff -h must parse as help action");
+        assert!(
+            matches!(diff_h_action, CliAction::HelpTopic(LocalHelpTopic::Diff)),
+            "#130c: diff -h (short form) must route to LocalHelpTopic::Diff"
+        );
+        // #130c: bare `claw diff` still routes to Diff action, not help.
+        let diff_action = parse_args(&[
+            "diff".to_string(),
+        ])
+        .expect("bare diff must parse as diff action");
+        assert!(
+            matches!(diff_action, CliAction::Diff { .. }),
+            "#130c: bare diff must still route to Diff action, got: {diff_action:?}"
+        );
+        // #130c: unknown args still rejected (non-regression).
+        let diff_bad_arg = parse_args(&[
+            "diff".to_string(),
+            "foo".to_string(),
+        ])
+        .expect_err("diff foo must still be rejected as extra args");
+        assert!(
+            diff_bad_arg.contains("unexpected extra arguments"),
+            "#130c: diff with unknown arg must still error, got: {diff_bad_arg}"
         );
         // #147: empty / whitespace-only positional args must be rejected
         // with a specific error instead of falling through to the prompt
