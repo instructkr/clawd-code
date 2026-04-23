@@ -887,6 +887,29 @@ The #134/#135 session-identity work tightened model-syntax validation but the te
 - `cargo test --workspace` passes with 0 failures on the `feat/134-135-session-identity` branch
 - No regression on the 162 tests currently passing
 
+### 194. Prunable-worktree accumulation — no gate, no `claw state` visibility, no auto-prune lifecycle contract
+
+**Filed:** 2026-04-23 from dogfood cycle #130 observation (Jobdori).
+
+**Problem:** `git worktree list` on the live `claw-code` workspace currently reports **109 prunable worktrees** (batch cycles b3–b8, stale test forks, detached b8-trust-00 through b8-trust-09). There is no product surface that:
+- reports prunable-worktree count in `claw doctor` or `claw state` output
+- runs `git worktree prune` at a defined lifecycle point (post-batch-complete, post-lane-close, or on-doctor)
+- blocks new batch-lane spawns when prunable count exceeds a safe threshold
+
+This makes `git worktree list` effectively unreadable for active monitoring, wastes inode/ref budget, and silently accumulates debt each dogfood cycle. Claws currently have no signal that the worktree namespace is degraded.
+
+**Fix shape:**
+- Add `worktree_health` section to `claw doctor --output-format json`: emit `prunable_count`, `detached_count`, `active_count`
+- Add a `claw worktree prune` (or `claw doctor --prune-worktrees`) action that calls `git worktree prune` and reports what was removed
+- Integrate a lightweight prunable-count check into `LanePreflight` (§3.5): emit `worktree_namespace_degraded` warning when prunable count exceeds threshold (suggest 20)
+- Distinguish between `prunable` (safely removable) and `detached HEAD` (may need explicit cleanup)
+
+**Acceptance:**
+- `claw doctor --output-format json` includes `{worktree_health: {prunable: N, detached: N, active: N}}`
+- `claw doctor` warns when prunable count > 20: `"109 prunable worktrees found; run 'claw worktree prune' to reclaim"`
+- Batch-lane spawn includes worktree-namespace preflight so cycle N+1 does not silently inherit N's prunable debt
+- A single `claw worktree prune` call reduces the count to 0 prunable and reports the delta
+
 ### 133. Blocked-state subphase contract (was §6.5)
 **Filed:** 2026-04-20 from dogfood cycle — previous cycle identified §4.44.5 provenance gap, this cycle targets §6.5 implementation.
 
