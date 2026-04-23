@@ -7,6 +7,14 @@
 
 ---
 
+## One-Liner (reviewer-ready)
+
+> **Phase 0 is now frozen, reviewer-mapped, and merge-ready; Phase 1 remains intentionally deferred behind the locked priority order.**
+
+This is the single sentence that captures branch state. Use it in PR titles, review summaries, and Phase 1 handoff notes.
+
+---
+
 ## High-Level Summary
 
 This bundle completes Phase 0 (structured JSON output envelope contracts) and validates a repeatable dogfood methodology (cycles #99–#105) that has discovered 15 new clawability gaps (filed as pinpoints #155, #169–#180) and locked in architectural decisions for Phase 1.
@@ -184,6 +192,12 @@ cargo clippy --workspace --all-targets -- -D warnings  # No warnings
 - **For leadership:** Is the Phase 0 shape guarantee (error.kind + error.operation + error.target + error.hint always together) a contract we want to support for 2+ major versions?
 - **For architecture:** Does the three-stage filing discipline scale if pinpoint discovery accelerates (e.g. 10+ new gaps per cycle)?
 - **For product:** Should the SCHEMAS.md version be bumped to 2.1 after Phase 0 lands to signal the new guarantees?
+
+---
+
+## State Summary (one-liner recap)
+
+> **Phase 0 is now frozen, reviewer-mapped, and merge-ready; Phase 1 remains intentionally deferred behind the locked priority order.**
 
 ---
 
