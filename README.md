@@ -76,7 +76,7 @@ pip install pynvml
 
 Masaüstü uygulamamızın, bizim bir üst adımda ürettiğimiz `claw.exe` ve `hardware_daemon.py` programlarına ulaşabilmesi gerekir. Bunun için özel bir `binaries` (çalıştırılabilir dosyalar) klasörü açıp içine kopyalamalıyız.
 
-Bu dosyaların sonuna, işletim sisteminizin mimari adını eklemeniz **şarttır** (örneğin: `x86_64-pc-windows-msvc`).
+Bu dosyaların sonuna, işletim sisteminizin mimari adını eklemeniz **şarttır** (örneğin: `x86_64-pc-windows-msvc`). Ayrıca Tauri, yan uygulamaların (sidecar) Windows'ta bile sonlarında **`.exe` uzantısının OLMAMASINI** bekler.
 
 **Windows için (Powershell'de çalıştırın):**
 ```powershell
@@ -84,13 +84,16 @@ Bu dosyaların sonuna, işletim sisteminizin mimari adını eklemeniz **şarttı
 mkdir tauri-ui\src-tauri\binaries
 
 # Claw motorunu kopyala ve ismini değiştir
-copy rust\target\release\claw.exe tauri-ui\src-tauri\binaries\claw-x86_64-pc-windows-msvc.exe
+copy rust\target\release\claw.exe tauri-ui\src-tauri\binaries\claw-x86_64-pc-windows-msvc
+ren tauri-ui\src-tauri\binaries\claw-x86_64-pc-windows-msvc.exe claw-x86_64-pc-windows-msvc
 
 # Donanım dinleyicisini (Python) derle ve kopyala
 pip install pyinstaller pynvml
 pyinstaller --onefile --name hardware_daemon hardware_daemon.py
 mkdir tauri-ui\src-tauri\binaries
-copy dist\hardware_daemon.exe tauri-ui\src-tauri\binaries\hardware_daemon-x86_64-pc-windows-msvc.exe
+copy dist\hardware_daemon.exe tauri-ui\src-tauri\binaries\hardware_daemon-x86_64-pc-windows-msvc
+# Tauri, yan uygulamaların uzantısız olmasını bekler, bu yüzden .exe uzantısını kaldırmalıyız
+ren tauri-ui\src-tauri\binaries\hardware_daemon-x86_64-pc-windows-msvc.exe hardware_daemon-x86_64-pc-windows-msvc
 ```
 
 **Linux / macOS (Intel) için:**
@@ -100,7 +103,7 @@ mkdir -p tauri-ui/src-tauri/binaries
 
 cp rust/target/release/claw tauri-ui/src-tauri/binaries/claw-x86_64-unknown-linux-gnu
 
-# Compile and copy the hardware daemon (Python)
+# Donanım dinleyicisini (Python) derle ve kopyala
 pip install pyinstaller pynvml
 pyinstaller --onefile --name hardware_daemon hardware_daemon.py
 cp dist/hardware_daemon tauri-ui/src-tauri/binaries/hardware_daemon-x86_64-unknown-linux-gnu
@@ -173,7 +176,7 @@ pip install pynvml
 ### Part 4: Build and Run the IDE (Tauri)
 
 The Desktop IDE requires the compiled `claw` engine and `hardware_daemon.py` to be available to it.
-We need to copy the compiled binary to the Tauri app's expected sidecar directory. Tauri expects sidecars to have the target triple appended.
+We need to copy the compiled binary to the Tauri app's expected sidecar directory. Tauri expects sidecars to have the target triple appended. **NOTE: Tauri requires sidecars to NOT have a `.exe` extension**, even on Windows.
 
 **Windows:**
 ```powershell
@@ -189,7 +192,7 @@ copy dist\hardware_daemon.exe tauri-ui\src-tauri\binaries\hardware_daemon-x86_64
 ```text
 mkdir -p tauri-ui/src-tauri/binaries
 cp rust/target/release/claw tauri-ui/src-tauri/binaries/claw-x86_64-unknown-linux-gnu
-# Donanım dinleyicisini (Python) derle ve kopyala
+# Compile and copy the hardware daemon (Python)
 pip install pyinstaller pynvml
 pyinstaller --onefile --name hardware_daemon hardware_daemon.py
 cp dist/hardware_daemon tauri-ui/src-tauri/binaries/hardware_daemon-x86_64-unknown-linux-gnu
