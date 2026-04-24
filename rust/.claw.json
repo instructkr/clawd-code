@@ -2,13 +2,13 @@
   "permissions": {
     "defaultMode": "default",
     "deny": [
-      "Bash(curl:*)",
-      "Bash(wget:*)",
-      "Bash(sudo:*)",
-      "Bash(rm:*)"
+      "bash(curl:*)",
+      "bash(wget:*)",
+      "bash(sudo:*)",
+      "bash(rm:*)"
     ],
     "ask": [
-      "Bash"
+      "bash"
     ]
   }
 }
