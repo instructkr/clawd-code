@@ -46,9 +46,9 @@ use runtime::{
     load_system_prompt, pricing_for_model, resolve_expected_base, resolve_sandbox_status,
     ApiClient, ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource,
     ContentBlock, ConversationMessage, ConversationRuntime, McpServer, McpServerManager,
-    McpServerSpec, McpTool, MessageRole, ModelPricing, PermissionMode, PermissionPolicy,
-    ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError, Session, TokenUsage,
-    ToolError, ToolExecutor, UsageTracker,
+    McpServerSpec, McpTool, MessageRole, ModelPricing, PermissionEnforcer, PermissionMode,
+    PermissionPolicy, ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError,
+    Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -7301,6 +7301,11 @@ fn build_runtime_with_plugin_state(
     plugin_registry.initialize()?;
     let policy = permission_policy(permission_mode, &feature_config, &tool_registry)
         .map_err(std::io::Error::other)?;
+    // Defense-in-depth: attach the policy as a registry-level enforcer so bash
+    // invocations get per-command classification (classify_bash_permission)
+    // applied in addition to the ConversationRuntime gate. Only bites when
+    // active mode is below DangerFullAccess.
+    let tool_registry = tool_registry.with_enforcer(PermissionEnforcer::new(policy.clone()));
     let mut runtime = ConversationRuntime::new_with_features(
         session,
         AnthropicRuntimeClient::new(
