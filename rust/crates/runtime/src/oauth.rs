@@ -371,11 +371,29 @@ fn read_credentials_root(path: &PathBuf) -> io::Result<Map<String, Value>> {
 fn write_credentials_root(path: &PathBuf, root: &Map<String, Value>) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
+        // Best-effort: tighten the config dir. Failure is non-fatal — the
+        // per-file 0600 below is the actual guarantee against multi-user
+        // snooping of OAuth tokens.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+        }
     }
     let rendered = serde_json::to_string_pretty(&Value::Object(root.clone()))
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     let temp_path = path.with_extension("json.tmp");
     fs::write(&temp_path, format!("{rendered}\n"))?;
+
+    // Restrict to owner read/write before publishing. The mode survives the
+    // rename because rename(2) preserves the inode and its permission bits,
+    // so the destination never exists with default-umask perms.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&temp_path, fs::Permissions::from_mode(0o600))?;
+    }
+
     fs::rename(temp_path, path)
 }
 
