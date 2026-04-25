@@ -1,9 +1,6 @@
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-
 use runtime::{
-    ApiRequest, AssistantEvent, CompactionConfig, ConversationRuntime, PermissionMode,
-    PermissionPolicy, RuntimeError, Session, TurnSummary,
+    ApiRequest, AssistantEvent, CompactionConfig, CompactionResult, ConversationRuntime,
+    HookAbortSignal, PermissionMode, PermissionPolicy, RuntimeError, Session, TurnSummary,
 };
 
 use crate::event_bus::{AgentSessionEvent, EventBus, SessionLifecycleEvent, TurnEvent};
@@ -146,13 +143,16 @@ impl AgentSessionBuilder {
             .api_client
             .unwrap_or_else(|| BoxedApiClient::new(DummyApiClient));
 
+        let abort_signal = HookAbortSignal::new();
+
         let runtime = ConversationRuntime::new(
             session.clone(),
             api_client,
             tool_executor,
             PermissionPolicy::new(self.permission_mode),
             self.system_prompt.clone(),
-        );
+        )
+        .with_hook_abort_signal(abort_signal.clone());
 
         event_bus.emit(AgentSessionEvent::SessionLifecycle(
             SessionLifecycleEvent::Created {
@@ -169,7 +169,7 @@ impl AgentSessionBuilder {
                 session,
                 event_bus,
                 permission_mode: self.permission_mode,
-                abort_requested: Arc::new(AtomicBool::new(false)),
+                abort_signal,
                 disposed: false,
             },
             returned_bus,
@@ -210,14 +210,14 @@ pub struct AgentSession {
     system_prompt: Vec<String>,
     /// The runtime instance.
     runtime: ConversationRuntime<BoxedApiClient, SdkToolExecutor>,
-    /// The underlying session state.
+    /// The underlying session state (also stored inside runtime; kept for cheap reads).
     session: Session,
     /// Event bus for subscribing to lifecycle events.
     event_bus: EventBus,
     /// Permission mode.
     permission_mode: PermissionMode,
     /// Abort signal shared with the runtime turn loop.
-    abort_requested: Arc<AtomicBool>,
+    abort_signal: HookAbortSignal,
     /// Whether this session has been disposed.
     disposed: bool,
 }
@@ -277,6 +277,7 @@ impl AgentSession {
 
     /// Run a single turn with the given user input.
     pub fn run_turn(&mut self, input: &str) -> Result<TurnSummary, RuntimeError> {
+        self.ensure_not_disposed()?;
         self.event_bus.emit(AgentSessionEvent::TurnStarted);
 
         let result = self.runtime.run_turn(input.to_string(), None);
@@ -315,9 +316,11 @@ impl AgentSession {
     /// Returns an error if the session has been disposed.
     pub fn steer(&mut self, message: &str) -> Result<(), RuntimeError> {
         self.ensure_not_disposed()?;
-        self.session
+        self.runtime
+            .session_mut()
             .push_user_text(message)
             .map_err(|e| RuntimeError::new(e.to_string()))?;
+        self.session = self.runtime.session().clone();
         self.event_bus
             .emit(AgentSessionEvent::TextDelta(format!(
                 "[steer] {message}"
@@ -348,8 +351,9 @@ impl AgentSession {
         self.session.model = Some(model.to_string());
         self.event_bus
             .emit(AgentSessionEvent::SessionLifecycle(
-                SessionLifecycleEvent::Created {
-                    session_id: format!("{}:model={model}", self.session.session_id),
+                SessionLifecycleEvent::ModelChanged {
+                    previous: previous.clone(),
+                    current: model.to_string(),
                 },
             ));
         Ok(previous)
@@ -383,28 +387,32 @@ impl AgentSession {
                 SessionLifecycleEvent::CompactionStarted,
             ));
 
-        let result = self.runtime.compact(CompactionConfig::default());
+        let CompactionResult {
+            compacted_session,
+            removed_message_count,
+            ..
+        } = self.runtime.compact(CompactionConfig::default());
+
+        // Apply the compacted session back to the runtime
+        *self.runtime.session_mut() = compacted_session;
+        self.session = self.runtime.session().clone();
 
         self.event_bus
             .emit(AgentSessionEvent::SessionLifecycle(
                 SessionLifecycleEvent::CompactionCompleted {
-                    removed_count: result.removed_message_count,
+                    removed_count: removed_message_count,
                 },
             ));
 
-        Ok(result.removed_message_count)
+        Ok(removed_message_count)
     }
 
     /// Request that the current turn abort as soon as possible. The abort
-    /// signal is checked between tool execution iterations in the runtime
-    /// turn loop.
-    ///
-    /// Note: the actual abort is cooperative — the running turn must check
-    /// this signal. If no turn is running, the next turn will see the
-    /// abort flag and reset it immediately.
+    /// signal is shared with the runtime's hook abort signal, so it will be
+    /// checked between tool execution iterations in the turn loop.
     pub fn abort(&mut self) -> Result<(), RuntimeError> {
         self.ensure_not_disposed()?;
-        self.abort_requested.store(true, Ordering::SeqCst);
+        self.abort_signal.abort();
         self.event_bus
             .emit(AgentSessionEvent::Error("abort requested".to_string()));
         Ok(())
@@ -414,7 +422,7 @@ impl AgentSession {
     /// executors or extension callbacks).
     #[must_use]
     pub fn is_abort_requested(&self) -> bool {
-        self.abort_requested.load(Ordering::SeqCst)
+        self.abort_signal.is_aborted()
     }
 
     /// Cleanly tear down the session. Emits a `Closed` lifecycle event,
@@ -434,8 +442,11 @@ impl AgentSession {
                 },
             ));
 
+        // Clear both the SDK's reference and the runtime's session
         self.session.messages.clear();
         self.session.compaction = None;
+        self.runtime.session_mut().messages.clear();
+        self.runtime.session_mut().compaction = None;
         self.disposed = true;
         Ok(())
     }

@@ -50,6 +50,7 @@ pub enum SessionLifecycleEvent {
     Loaded { session_id: String },
     Saved { session_id: String },
     Closed { session_id: String },
+    ModelChanged { previous: String, current: String },
     CompactionStarted,
     CompactionCompleted { removed_count: usize },
 }
