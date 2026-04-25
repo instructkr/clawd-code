@@ -1,38 +1,46 @@
 use runtime::{
-    AssistantEvent, ConversationRuntime, PermissionMode, RuntimeError, Session, TurnSummary,
+    ApiRequest, AssistantEvent, ConversationRuntime, PermissionMode, PermissionPolicy,
+    RuntimeError, Session, TurnSummary,
 };
 
 use crate::event_bus::{AgentSessionEvent, EventBus, SessionLifecycleEvent, TurnEvent};
 use crate::tool_registry::{SdkToolExecutor, ToolRegistry};
 
-/// An agent session that wraps the runtime and provides a high-level API.
+/// A type-erased API client that wraps any `runtime::ApiClient` in a `Box`.
 ///
-/// `AgentSession` owns a `ConversationRuntime` and provides methods for
-/// running turns, subscribing to events, and managing session state.
-pub struct AgentSession {
-    /// The model identifier being used.
-    model: String,
-    /// The system prompt.
-    system_prompt: Vec<String>,
-    /// The runtime instance.
-    runtime: ConversationRuntime<DummyApiClient, SdkToolExecutor>,
-    /// The underlying session state.
-    session: Session,
-    /// Event bus for subscribing to lifecycle events.
-    event_bus: EventBus,
-    /// Permission mode.
-    permission_mode: PermissionMode,
+/// This allows `AgentSession` to accept any provider implementation without
+/// being generic over the client type.
+pub struct BoxedApiClient {
+    inner: Box<dyn runtime::ApiClient>,
+}
+
+impl BoxedApiClient {
+    /// Create a new boxed API client from any type implementing `ApiClient`.
+    pub fn new(client: impl runtime::ApiClient + 'static) -> Self {
+        Self {
+            inner: Box::new(client),
+        }
+    }
+}
+
+impl runtime::ApiClient for BoxedApiClient {
+    fn stream(
+        &mut self,
+        request: ApiRequest,
+    ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+        self.inner.stream(request)
+    }
 }
 
 /// A minimal API client used by the SDK when no real provider is configured.
-/// Emits events but performs no actual API calls.
+/// Returns an error on every call.
 #[derive(Debug, Clone)]
 pub struct DummyApiClient;
 
 impl runtime::ApiClient for DummyApiClient {
     fn stream(
         &mut self,
-        _request: runtime::ApiRequest,
+        _request: ApiRequest,
     ) -> Result<Vec<AssistantEvent>, RuntimeError> {
         Err(RuntimeError::new(
             "SDK mode: no API client configured. \
@@ -41,27 +49,98 @@ impl runtime::ApiClient for DummyApiClient {
     }
 }
 
-impl AgentSession {
-    /// Create a new agent session with an internally-managed event bus.
+/// Builder for constructing `AgentSession` with a fluent API.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use sdk::AgentSessionBuilder;
+/// use sdk::ToolRegistry;
+/// use runtime::PermissionMode;
+///
+/// // Build with default (dummy) client
+/// let (session, bus) = AgentSessionBuilder::new()
+///     .model("claude-sonnet-4-6")
+///     .system_prompt("You are a helpful assistant.")
+///     .tools(ToolRegistry::new())
+///     .permission_mode(PermissionMode::DangerFullAccess)
+///     .build()
+///     .expect("should create session");
+/// ```
+pub struct AgentSessionBuilder {
+    model: String,
+    system_prompt: Vec<String>,
+    tools: ToolRegistry,
+    permission_mode: PermissionMode,
+    api_client: Option<BoxedApiClient>,
+}
+
+impl AgentSessionBuilder {
+    /// Create a new builder with defaults.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            model: "claude-sonnet-4-6".to_string(),
+            system_prompt: Vec::new(),
+            tools: ToolRegistry::new(),
+            permission_mode: PermissionMode::DangerFullAccess,
+            api_client: None,
+        }
+    }
+
+    /// Set the model.
+    #[must_use]
+    pub fn model(mut self, model: &str) -> Self {
+        self.model = model.to_string();
+        self
+    }
+
+    /// Add a system prompt line.
+    #[must_use]
+    pub fn system_prompt(mut self, prompt: &str) -> Self {
+        self.system_prompt.push(prompt.to_string());
+        self
+    }
+
+    /// Set the tool registry.
+    #[must_use]
+    pub fn tools(mut self, tools: ToolRegistry) -> Self {
+        self.tools = tools;
+        self
+    }
+
+    /// Set the permission mode.
+    #[must_use]
+    pub fn permission_mode(mut self, mode: PermissionMode) -> Self {
+        self.permission_mode = mode;
+        self
+    }
+
+    /// Provide a custom API client. Any type implementing `runtime::ApiClient`.
+    #[must_use]
+    pub fn api_client(mut self, client: impl runtime::ApiClient + 'static) -> Self {
+        self.api_client = Some(BoxedApiClient::new(client));
+        self
+    }
+
+    /// Build the `AgentSession`.
     ///
-    /// Returns the session and an event bus you can subscribe to for events.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        model: &str,
-        system_prompt: Vec<String>,
-        tool_registry: ToolRegistry,
-        permission_mode: PermissionMode,
-    ) -> Result<(Self, EventBus), String> {
+    /// Returns the session and an event bus for subscribing to events.
+    pub fn build(self) -> Result<(AgentSession, EventBus), String> {
         let session = Session::new();
         let mut event_bus = EventBus::new();
-        let tool_executor = SdkToolExecutor::new(&tool_registry);
+        let tool_executor = SdkToolExecutor::new(&self.tools);
+
+        let api_client = self
+            .api_client
+            .unwrap_or_else(|| BoxedApiClient::new(DummyApiClient));
 
         let runtime = ConversationRuntime::new(
             session.clone(),
-            DummyApiClient,
+            api_client,
             tool_executor,
-            PermissionPolicy::new(permission_mode),
-            system_prompt.clone(),
+            PermissionPolicy::new(self.permission_mode),
+            self.system_prompt.clone(),
         );
 
         event_bus.emit(AgentSessionEvent::SessionLifecycle(
@@ -72,16 +151,81 @@ impl AgentSession {
 
         let returned_bus = event_bus.clone();
         Ok((
-            Self {
-                model: model.to_string(),
-                system_prompt,
+            AgentSession {
+                model: self.model,
+                system_prompt: self.system_prompt,
                 runtime,
                 session,
                 event_bus,
-                permission_mode,
+                permission_mode: self.permission_mode,
             },
             returned_bus,
         ))
+    }
+}
+
+impl Default for AgentSessionBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// An agent session that wraps the runtime and provides a high-level API.
+///
+/// `AgentSession` owns a `ConversationRuntime` and provides methods for
+/// running turns, subscribing to events, and managing session state.
+///
+/// Use [`AgentSessionBuilder`] to construct with a custom API client:
+///
+/// ```rust,no_run
+/// use sdk::AgentSessionBuilder;
+/// use sdk::DummyApiClient;
+/// use runtime::PermissionMode;
+///
+/// // Build with a custom API client
+/// let (session, bus) = AgentSessionBuilder::new()
+///     .model("claude-sonnet-4-6")
+///     .api_client(DummyApiClient)
+///     .permission_mode(PermissionMode::DangerFullAccess)
+///     .build()
+///     .expect("session should create");
+/// ```
+pub struct AgentSession {
+    /// The model identifier being used.
+    model: String,
+    /// The system prompt.
+    system_prompt: Vec<String>,
+    /// The runtime instance.
+    runtime: ConversationRuntime<BoxedApiClient, SdkToolExecutor>,
+    /// The underlying session state.
+    session: Session,
+    /// Event bus for subscribing to lifecycle events.
+    event_bus: EventBus,
+    /// Permission mode.
+    permission_mode: PermissionMode,
+}
+
+impl AgentSession {
+    /// Create a new agent session with default (dummy) API client.
+    ///
+    /// For production use, prefer [`AgentSessionBuilder`] with a real `api_client()`.
+    ///
+    /// Returns the session and an event bus you can subscribe to for events.
+    pub fn new(
+        model: &str,
+        system_prompt: Vec<String>,
+        tool_registry: ToolRegistry,
+        permission_mode: PermissionMode,
+    ) -> Result<(Self, EventBus), String> {
+        AgentSessionBuilder::new()
+            .model(model)
+            .tools(tool_registry)
+            .permission_mode(permission_mode)
+            .build()
+            .map(|(mut session, bus)| {
+                session.system_prompt = system_prompt;
+                (session, bus)
+            })
     }
 
     /// Get the session ID.
@@ -148,8 +292,6 @@ impl AgentSession {
     }
 }
 
-use runtime::PermissionPolicy;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,5 +328,29 @@ mod tests {
             err.contains("SDK mode"),
             "error should mention SDK mode: {err}"
         );
+    }
+
+    #[test]
+    fn builder_creates_session_with_custom_model() {
+        let (session, _bus) = AgentSessionBuilder::new()
+            .model("gpt-4o")
+            .system_prompt("You are helpful.")
+            .permission_mode(PermissionMode::DangerFullAccess)
+            .build()
+            .expect("builder should create session");
+
+        assert_eq!(session.model(), "gpt-4o");
+    }
+
+    #[test]
+    fn builder_accepts_custom_api_client() {
+        let (session, _bus) = AgentSessionBuilder::new()
+            .model("claude-sonnet-4-6")
+            .api_client(DummyApiClient)
+            .permission_mode(PermissionMode::DangerFullAccess)
+            .build()
+            .expect("builder with custom client should create session");
+
+        assert!(!session.session_id().is_empty());
     }
 }

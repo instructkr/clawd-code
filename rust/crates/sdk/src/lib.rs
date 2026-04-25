@@ -42,7 +42,7 @@ pub use event_bus::{
 };
 pub use extension::{Extension, ExtensionRegistry, SimpleExtension};
 pub use resource_loader::{DefaultResourceLoader, ResourceLoader};
-pub use session::AgentSession;
+pub use session::{AgentSession, AgentSessionBuilder, BoxedApiClient, DummyApiClient};
 pub use session_manager::{SessionManager, SessionManagerConfig};
 pub use session_tree::{SessionTree, SessionTreeNode};
 pub use tool_registry::{create_builtin_tools, SdkToolExecutor, ToolRegistry};

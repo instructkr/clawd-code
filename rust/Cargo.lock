@@ -1458,6 +1458,7 @@ dependencies = [
  "pulldown-cmark",
  "runtime",
  "rustyline",
+ "sdk",
  "serde",
  "serde_json",
  "syntect",
