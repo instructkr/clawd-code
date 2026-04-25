@@ -2,12 +2,12 @@ use serde_json;
 
 use std::fmt::Write as _;
 
+use crate::tui::tool_panel::{collapse_tool_output, ToolDisplayConfig};
+
 const DISPLAY_TRUNCATION_NOTICE: &str =
     "\x1b[2m… output truncated for display; full result preserved in session.\x1b[0m";
 const READ_DISPLAY_MAX_LINES: usize = 80;
 const READ_DISPLAY_MAX_CHARS: usize = 6_000;
-const TOOL_OUTPUT_DISPLAY_MAX_LINES: usize = 60;
-const TOOL_OUTPUT_DISPLAY_MAX_CHARS: usize = 4_000;
 
 pub(crate) fn format_tool_call_start(name: &str, input: &str) -> String {
     let parsed: serde_json::Value =
@@ -159,25 +159,17 @@ pub(crate) fn format_bash_result(icon: &str, parsed: &serde_json::Value) -> Stri
         write!(&mut lines[0], " {status}").expect("write to string");
     }
 
+    let config = ToolDisplayConfig::default();
     if let Some(stdout) = parsed.get("stdout").and_then(|value| value.as_str()) {
         if !stdout.trim().is_empty() {
-            lines.push(truncate_output_for_display(
-                stdout,
-                TOOL_OUTPUT_DISPLAY_MAX_LINES,
-                TOOL_OUTPUT_DISPLAY_MAX_CHARS,
-            ));
+            let collapsed = collapse_tool_output(stdout, "bash", false, &config);
+            lines.push(collapsed.visible);
         }
     }
     if let Some(stderr) = parsed.get("stderr").and_then(|value| value.as_str()) {
         if !stderr.trim().is_empty() {
-            lines.push(format!(
-                "\x1b[38;5;203m{}\x1b[0m",
-                truncate_output_for_display(
-                    stderr,
-                    TOOL_OUTPUT_DISPLAY_MAX_LINES,
-                    TOOL_OUTPUT_DISPLAY_MAX_CHARS,
-                )
-            ));
+            let collapsed = collapse_tool_output(stderr, "bash", true, &config);
+            lines.push(format!("\x1b[38;5;203m{}\x1b[0m", collapsed.visible));
         }
     }
 
@@ -332,14 +324,9 @@ pub(crate) fn format_grep_result(icon: &str, parsed: &serde_json::Value) -> Stri
         "{icon} \x1b[38;5;245mgrep_search\x1b[0m {num_matches} matches across {num_files} files"
     );
     if !content.trim().is_empty() {
-        format!(
-            "{summary}\n{}",
-            truncate_output_for_display(
-                content,
-                TOOL_OUTPUT_DISPLAY_MAX_LINES,
-                TOOL_OUTPUT_DISPLAY_MAX_CHARS,
-            )
-        )
+        let collapsed =
+            collapse_tool_output(content, "grep_search", false, &ToolDisplayConfig::default());
+        format!("{summary}\n{}", collapsed.visible)
     } else if !filenames.is_empty() {
         format!("{summary}\n{filenames}")
     } else {
@@ -360,11 +347,9 @@ pub(crate) fn format_generic_tool_result(
         }
         _ => parsed.to_string(),
     };
-    let preview = truncate_output_for_display(
-        &rendered_output,
-        TOOL_OUTPUT_DISPLAY_MAX_LINES,
-        TOOL_OUTPUT_DISPLAY_MAX_CHARS,
-    );
+    let collapsed =
+        collapse_tool_output(&rendered_output, name, false, &ToolDisplayConfig::default());
+    let preview = collapsed.visible;
 
     if preview.is_empty() {
         format!("{icon} \x1b[38;5;245m{name}\x1b[0m")

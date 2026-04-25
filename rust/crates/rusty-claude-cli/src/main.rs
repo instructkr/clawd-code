@@ -4959,7 +4959,8 @@ UU conflicted.rs",
         let rendered = format_tool_result("bash", &output, false);
 
         assert!(rendered.contains("stdout 000"));
-        assert!(rendered.contains("stdout 059"));
+        assert!(rendered.contains("stdout 009"));
+        assert!(!rendered.contains("stdout 010"));
         assert!(!rendered.contains("stdout 119"));
         assert!(rendered.contains("full result preserved in session"));
         assert!(output.contains("stdout 119"));
@@ -4980,7 +4981,8 @@ UU conflicted.rs",
 
         assert!(rendered.contains("plugin_echo"));
         assert!(rendered.contains("payload 000"));
-        assert!(rendered.contains("payload 040"));
+        assert!(rendered.contains("payload 007"));
+        assert!(!rendered.contains("payload 008"));
         assert!(!rendered.contains("payload 080"));
         assert!(!rendered.contains("payload 119"));
         assert!(rendered.contains("full result preserved in session"));
@@ -4998,7 +5000,8 @@ UU conflicted.rs",
 
         assert!(rendered.contains("plugin_echo"));
         assert!(rendered.contains("raw 000"));
-        assert!(rendered.contains("raw 059"));
+        assert!(rendered.contains("raw 009"));
+        assert!(!rendered.contains("raw 010"));
         assert!(!rendered.contains("raw 119"));
         assert!(rendered.contains("full result preserved in session"));
         assert!(output.contains("raw 119"));
