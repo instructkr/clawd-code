@@ -28,6 +28,8 @@ mod agent_context;
 mod event_bus;
 mod extension;
 mod resource_loader;
+#[cfg(feature = "rpc")]
+mod rpc;
 mod session;
 mod session_manager;
 mod session_tree;
@@ -44,6 +46,9 @@ pub use session::AgentSession;
 pub use session_manager::{SessionManager, SessionManagerConfig};
 pub use session_tree::{SessionTree, SessionTreeNode};
 pub use tool_registry::{create_builtin_tools, SdkToolExecutor, ToolRegistry};
+
+#[cfg(feature = "rpc")]
+pub use rpc::run_rpc_server;
 
 // Re-export key runtime types for convenience
 pub use runtime::{
