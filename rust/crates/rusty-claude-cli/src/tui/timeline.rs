@@ -1,4 +1,7 @@
+use std::fmt::Write as _;
 use std::time::Instant;
+
+use crate::tui::theme::Theme;
 
 /// A recorded tool call event in the session.
 #[derive(Debug, Clone)]
@@ -68,7 +71,7 @@ impl ToolCallTimeline {
         }
 
         let mut out = String::new();
-        out.push_str("\x1b[38;5;245m── Tool calls ──\x1b[0m\n");
+        writeln!(out, "{}── Tool calls ──{}", Theme::MUTED, Theme::RESET).expect("write to string");
 
         for event in &self.events {
             let elapsed = event
@@ -76,9 +79,9 @@ impl ToolCallTimeline {
                 .map(|c| c.duration_since(event.started_at))
                 .unwrap_or_default();
             let status_icon = if event.is_error {
-                "\x1b[1;31m✗\x1b[0m"
+                format!("{}✗{}", Theme::ERROR_BRIGHT, Theme::RESET)
             } else {
-                "\x1b[1;32m✓\x1b[0m"
+                format!("{}✓{}", Theme::SUCCESS_BOLD, Theme::RESET)
             };
             let truncated_mark = if event.was_truncated {
                 " (truncated)"
@@ -86,18 +89,30 @@ impl ToolCallTimeline {
                 ""
             };
             let secs = elapsed.as_secs_f64();
-            out.push_str(&format!(
-                "  {}. {status_icon} \x1b[1;36m{}\x1b[0m  \x1b[2m{:.1}s  {} lines{}\x1b[0m\n",
-                event.step, event.name, secs, event.output_lines, truncated_mark
-            ));
+            writeln!(
+                out,
+                "  {}. {status_icon} {h}{name}{r}  {d}{secs:.1}s  {lines} lines{truncated_mark}{r}",
+                event.step,
+                name = event.name,
+                secs = secs,
+                lines = event.output_lines,
+                h = Theme::HIGHLIGHT,
+                r = Theme::RESET,
+                d = Theme::DIM,
+            )
+            .expect("write to string");
         }
 
         if let Some(elapsed) = self.total_elapsed() {
-            out.push_str(&format!(
-                "\n  \x1b[2mTotal: {:.1}s across {} tool call(s)\x1b[0m\n",
-                elapsed.as_secs_f64(),
-                self.events.len(),
-            ));
+            writeln!(
+                out,
+                "\n  {d}Total: {secs:.1}s across {count} tool call(s){r}",
+                d = Theme::DIM,
+                r = Theme::RESET,
+                secs = elapsed.as_secs_f64(),
+                count = self.events.len(),
+            )
+            .expect("write to string");
         }
 
         out

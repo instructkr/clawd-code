@@ -1,6 +1,7 @@
 use serde_json;
 
 use crate::format::truncate_for_summary;
+use crate::tui::theme::Theme;
 
 /// Decision from parsing a user's permission prompt response.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,12 +73,12 @@ pub fn format_enhanced_permission_prompt(
     reason: Option<&str>,
 ) -> String {
     let action = describe_tool_action(tool_name, input);
-    let header = format!("\x1b[1;33m⚠ Permission Required\x1b[0m");
-    let border = "\x1b[38;5;245m────────────────────────────────────────────────\x1b[0m";
+    let header = format!("{}⚠ Permission Required{}", Theme::WARNING, Theme::RESET);
+    let border = Theme::permission_border();
     let mut lines = vec![
         String::new(),
         header,
-        border.to_string(),
+        border.clone(),
         format!("  Tool:\t{}", tool_name),
         format!("  Action:\t{}", action),
         format!(
@@ -88,9 +89,11 @@ pub fn format_enhanced_permission_prompt(
     if let Some(reason) = reason {
         lines.push(format!("  Reason:\t{}", reason));
     }
-    lines.push(border.to_string());
+    lines.push(border);
     lines.push(format!(
-        "  \x1b[2m[y]es | [n]o | [a]llow all | [v]iew input\x1b[0m"
+        "  {}[y]es | [n]o | [a]llow all | [v]iew input{}",
+        Theme::DIM,
+        Theme::RESET
     ));
     lines.push(String::new());
     lines.push("  [\x1b[1my\x1b[0m/\x1b[1mN\x1b[0m/\x1b[1ma\x1b[0m/\x1b[1mv\x1b[0m]: ".to_string());

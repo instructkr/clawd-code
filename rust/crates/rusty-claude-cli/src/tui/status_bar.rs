@@ -40,9 +40,9 @@ impl StatusBar {
             branch_display,
         );
 
-        // Truncate to terminal width
+        // Truncate to terminal width (character count, not byte length)
         let width = state.terminal_width as usize;
-        let display = if content.len() > width {
+        let display = if content.chars().count() > width {
             truncate_str(&content, width.saturating_sub(1))
         } else {
             content

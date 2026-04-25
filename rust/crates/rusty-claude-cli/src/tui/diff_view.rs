@@ -84,19 +84,23 @@ pub fn render_colored_diff(lines: &[DiffLine]) -> String {
                 writeln!(out, " {text}").expect("write to string");
             }
             DiffLine::Addition(text) => {
-                writeln!(out, "\x1b[38;5;70m+{text}\x1b[0m").expect("write to string");
+                writeln!(out, "{}+{}{}", Theme::SUCCESS, text, Theme::RESET)
+                    .expect("write to string");
             }
             DiffLine::Deletion(text) => {
-                writeln!(out, "\x1b[38;5;203m-{text}\x1b[0m").expect("write to string");
+                writeln!(out, "{}-{}{}", Theme::ERROR, text, Theme::RESET)
+                    .expect("write to string");
             }
             DiffLine::HunkHeader(text) => {
-                writeln!(out, "\x1b[1;36m{text}\x1b[0m").expect("write to string");
+                writeln!(out, "{}{}{}", Theme::HIGHLIGHT, text, Theme::RESET)
+                    .expect("write to string");
             }
             DiffLine::FileHeader(text) => {
+                // bold + muted — no dedicated Theme:: constant yet
                 writeln!(out, "\x1b[1;38;5;245m{text}\x1b[0m").expect("write to string");
             }
             DiffLine::Binary(text) => {
-                writeln!(out, "\x1b[38;5;245m{text}\x1b[0m").expect("write to string");
+                writeln!(out, "{}{}{}", Theme::MUTED, text, Theme::RESET).expect("write to string");
             }
         }
     }
@@ -117,8 +121,14 @@ pub fn render_diff_summary(lines: &[DiffLine]) -> String {
                     && (file_counts.additions > 0 || file_counts.deletions > 0)
                 {
                     files.push(format!(
-                        "  {}\t\x1b[38;5;70m+{}\x1b[0m/\x1b[38;5;203m-{}\x1b[0m",
-                        current_file, file_counts.additions, file_counts.deletions
+                        "  {}\t{}+{}{}/{}-{}{}",
+                        current_file,
+                        Theme::SUCCESS,
+                        file_counts.additions,
+                        Theme::RESET,
+                        Theme::ERROR,
+                        file_counts.deletions,
+                        Theme::RESET,
                     ));
                 }
                 // Extract the b/ path from "diff --git a/path b/path"
@@ -138,16 +148,28 @@ pub fn render_diff_summary(lines: &[DiffLine]) -> String {
     // Emit last file
     if !current_file.is_empty() && (file_counts.additions > 0 || file_counts.deletions > 0) {
         files.push(format!(
-            "  {}\t\x1b[38;5;70m+{}\x1b[0m/\x1b[38;5;203m-{}\x1b[0m",
-            current_file, file_counts.additions, file_counts.deletions
+            "  {}\t{}+{}{}/{}-{}{}",
+            current_file,
+            Theme::SUCCESS,
+            file_counts.additions,
+            Theme::RESET,
+            Theme::ERROR,
+            file_counts.deletions,
+            Theme::RESET,
         ));
     }
 
     let total_files = count_diff_files(lines);
     let total_counts = count_diff_lines(lines);
     let mut out = format!(
-        "{} file(s) changed\t\x1b[38;5;70m+{}\x1b[0m \x1b[38;5;203m-{}\x1b[0m\n",
-        total_files, total_counts.additions, total_counts.deletions
+        "{} file(s) changed\t{}+{}{} {}-{}{}\n",
+        total_files,
+        Theme::SUCCESS,
+        total_counts.additions,
+        Theme::RESET,
+        Theme::ERROR,
+        total_counts.deletions,
+        Theme::RESET,
     );
     for file in &files {
         writeln!(out, "{file}").expect("write to string");
@@ -158,7 +180,7 @@ pub fn render_diff_summary(lines: &[DiffLine]) -> String {
 /// Render full colored diff with summary header.
 pub fn format_colored_diff(diff: &str) -> String {
     if diff.trim().is_empty() {
-        return "\x1b[2m(empty diff)\x1b[0m".to_string();
+        return format!("{}(empty diff){}", Theme::DIM, Theme::RESET);
     }
     let lines = parse_unified_diff(diff);
     let summary = render_diff_summary(&lines);
@@ -237,9 +259,9 @@ index abc..def 100644
     fn colored_output_contains_ansi_codes() {
         let lines = parse_unified_diff(sample_diff());
         let colored = render_colored_diff(&lines);
-        assert!(colored.contains("\x1b[38;5;70m")); // green for additions
-        assert!(colored.contains("\x1b[38;5;203m")); // red for deletions
-        assert!(colored.contains("\x1b[1;36m")); // cyan for hunk headers
+        assert!(colored.contains(Theme::SUCCESS)); // green for additions
+        assert!(colored.contains(Theme::ERROR)); // red for deletions
+        assert!(colored.contains(Theme::HIGHLIGHT)); // cyan for hunk headers
     }
 
     #[test]

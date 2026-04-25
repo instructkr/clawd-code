@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+use crate::tui::theme::Theme;
+
 /// Generate animated thinking indicator frames (dot-wave).
 pub struct ThinkingFrames;
 
@@ -30,17 +32,29 @@ impl ThinkingFrames {
 /// Format the static "Reasoned for X.Xs" line after thinking completes.
 pub fn format_thinking_completed(elapsed: Duration) -> String {
     let secs = elapsed.as_secs_f64();
-    format!("\x1b[38;5;13m\u{25b6} Reasoned for {secs:.1}s\x1b[0m")
+    format!(
+        "{}\u{25b6} Reasoned for {secs:.1}s{}",
+        Theme::THINKING,
+        Theme::RESET
+    )
 }
 
 /// Render a short inline thinking indicator for non-animated use.
 pub fn render_thinking_inline(char_count: Option<usize>, redacted: bool) -> String {
     let summary = if redacted {
-        "\x1b[38;5;13m\u{25b6} Thinking block hidden by provider\x1b[0m".to_string()
+        format!(
+            "{}\u{25b6} Thinking block hidden by provider{}",
+            Theme::THINKING,
+            Theme::RESET
+        )
     } else if let Some(char_count) = char_count {
-        format!("\x1b[38;5;13m\u{25b6} Reasoning ({char_count} chars)\x1b[0m")
+        format!(
+            "{}\u{25b6} Reasoning ({char_count} chars){}",
+            Theme::THINKING,
+            Theme::RESET
+        )
     } else {
-        "\x1b[38;5;13m\u{25b6} Reasoning\x1b[0m".to_string()
+        format!("{}\u{25b6} Reasoning{}", Theme::THINKING, Theme::RESET)
     };
     format!("\n{summary}\n")
 }
@@ -63,7 +77,7 @@ mod tests {
         let result = format_thinking_completed(Duration::from_secs_f64(3.5));
         assert!(result.contains("Reasoned for"));
         assert!(result.contains("3.5s"));
-        assert!(result.contains("\x1b[38;5;13m")); // magenta
+        assert!(result.contains(Theme::THINKING)); // magenta
     }
 
     #[test]
@@ -71,7 +85,7 @@ mod tests {
         let result = render_thinking_inline(Some(42), false);
         assert!(result.contains("Reasoning"));
         assert!(result.contains("42 chars"));
-        assert!(result.contains("\x1b[38;5;13m"));
+        assert!(result.contains(Theme::THINKING));
     }
 
     #[test]
