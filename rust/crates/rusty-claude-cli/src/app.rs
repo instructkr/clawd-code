@@ -53,6 +53,7 @@ use crate::tui::permission::{
 };
 use crate::tui::status_bar::{StatusBar, StatusBarState};
 use crate::tui::terminal::TerminalSize;
+use crate::tui::theme::Theme;
 use crate::tui::timeline::ToolCallTimeline;
 use crate::{
     AllowedToolSet, RuntimePluginStateBuildOutput, DEFAULT_DATE,
@@ -167,14 +168,14 @@ impl LiveCli {
 ██║     ██║     ██╔══██║██║███╗██║\n\
 ╚██████╗███████╗██║  ██║╚███╔███╔╝\n\
  ╚═════╝╚══════╝╚═╝  ╚═╝ ╚══╝╚══╝\x1b[0m \x1b[38;5;208mCode\x1b[0m 🦞\n\n\
-  \x1b[2mModel\x1b[0m            {}\n\
-  \x1b[2mPermissions\x1b[0m      {}\n\
-  \x1b[2mBranch\x1b[0m           {}\n\
-  \x1b[2mWorkspace\x1b[0m        {}\n\
-  \x1b[2mDirectory\x1b[0m        {}\n\
-  \x1b[2mSession\x1b[0m          {}\n\
-  \x1b[2mAuto-save\x1b[0m        {}\n\n\
-  Type \x1b[1m/help\x1b[0m for commands · \x1b[1m/status\x1b[0m for live context · \x1b[2m/resume latest\x1b[0m jumps back to the newest session · \x1b[1m/diff\x1b[0m then \x1b[1m/commit\x1b[0m to ship · \x1b[2mTab\x1b[0m for workflow completions · \x1b[2mShift+Enter\x1b[0m for newline",
+  {d}Model{r}            {}\n\
+  {d}Permissions{r}      {}\n\
+  {d}Branch{r}           {}\n\
+  {d}Workspace{r}        {}\n\
+  {d}Directory{r}        {}\n\
+  {d}Session{r}          {}\n\
+  {d}Auto-save{r}        {}\n\n\
+  Type \x1b[1m/help{r} for commands · \x1b[1m/status{r} for live context · {d}/resume latest{r} jumps back to the newest session · \x1b[1m/diff{r} then \x1b[1m/commit{r} to ship · {d}Tab{r} for workflow completions · {d}Shift+Enter{r} for newline",
             self.model,
             self.permission_mode.as_str(),
             git_branch,
@@ -182,6 +183,8 @@ impl LiveCli {
             cwd,
             self.session.id,
             session_path,
+            d = Theme::DIM,
+            r = Theme::RESET,
         )
     }
 
@@ -197,15 +200,17 @@ impl LiveCli {
             .unwrap_or("unknown");
         format!(
             "\x1b[38;5;196mCLAW\x1b[0m \x1b[38;5;208mCode\x1b[0m 🦞  \
-             \x1b[2mmodel\x1b[0m {}  \
-             \x1b[2mperm\x1b[0m {}  \
-             \x1b[2mbranch\x1b[0m {}\n\
-             \x1b[2m{}/  \
-             Type \x1b[1m/help\x1b[0m for commands · \x1b[1m/diff\x1b[0m then \x1b[1m/commit\x1b[0m to ship · \x1b[2mTab\x1b[0m for completions\x1b[0m",
+             {d}model{r} {}  \
+             {d}perm{r} {}  \
+             {d}branch{r} {}\n\
+             {d}{}/  \
+             Type \x1b[1m/help\x1b[0m for commands · \x1b[1m/diff\x1b[0m then \x1b[1m/commit\x1b[0m to ship · {d}Tab{r} for completions{r}",
             self.model,
             self.permission_mode.as_str(),
             git_branch,
             cwd,
+            d = Theme::DIM,
+            r = Theme::RESET,
         )
     }
 
@@ -2528,11 +2533,19 @@ pub(crate) fn run_repl(
     base_commit: Option<String>,
     reasoning_effort: Option<String>,
     allow_broad_cwd: bool,
+    startup_banner: Option<BannerStyle>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     enforce_broad_cwd_policy(allow_broad_cwd, CliOutputFormat::Text)?;
     run_stale_base_preflight(base_commit.as_deref());
     let resolved_model = resolve_repl_model(model);
-    let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode, None)?;
+    // Resolve banner style from config if not explicitly provided
+    let banner = startup_banner.or_else(|| {
+        let cwd = env::current_dir().ok()?;
+        let loader = runtime::ConfigLoader::default_for(&cwd);
+        let config = loader.load().ok()?;
+        Some(BannerStyle::from_config(config.startup_banner()))
+    });
+    let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode, banner)?;
     cli.set_reasoning_effort(reasoning_effort);
     let mut editor =
         input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());

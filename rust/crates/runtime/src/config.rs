@@ -65,6 +65,7 @@ pub struct RuntimeFeatureConfig {
     sandbox: SandboxConfig,
     provider_fallbacks: ProviderFallbackConfig,
     trusted_roots: Vec<String>,
+    startup_banner: Option<String>,
 }
 
 /// Ordered chain of fallback model identifiers used when the primary
@@ -315,6 +316,7 @@ impl ConfigLoader {
             sandbox: parse_optional_sandbox_config(&merged_value)?,
             provider_fallbacks: parse_optional_provider_fallbacks(&merged_value)?,
             trusted_roots: parse_optional_trusted_roots(&merged_value)?,
+            startup_banner: parse_optional_startup_banner(&merged_value),
         };
 
         Ok(RuntimeConfig {
@@ -413,6 +415,11 @@ impl RuntimeConfig {
     #[must_use]
     pub fn trusted_roots(&self) -> &[String] {
         &self.feature_config.trusted_roots
+    }
+
+    #[must_use]
+    pub fn startup_banner(&self) -> Option<&str> {
+        self.feature_config.startup_banner.as_deref()
     }
 }
 
@@ -923,6 +930,13 @@ fn parse_filesystem_mode_label(value: &str) -> Result<FilesystemIsolationMode, C
             "merged settings.sandbox.filesystemMode: unsupported filesystem mode {other}"
         ))),
     }
+}
+
+fn parse_optional_startup_banner(root: &JsonValue) -> Option<String> {
+    root.as_object()
+        .and_then(|object| object.get("startupBanner"))
+        .and_then(JsonValue::as_str)
+        .map(ToOwned::to_owned)
 }
 
 fn parse_optional_oauth_config(

@@ -355,6 +355,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             base_commit,
             reasoning_effort,
             allow_broad_cwd,
+            None,
         )?,
         CliAction::HelpTopic(topic) => print_help_topic(topic),
         CliAction::Help { output_format } => print_help(output_format)?,
@@ -390,13 +391,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             }
             "--help" | "-h"
                 if !rest.is_empty()
-                    && matches!(
-                        rest[0].as_str(),
-                        "prompt"
-                            | "commit"
-                            | "pr"
-                            | "issue"
-                    ) =>
+                    && matches!(rest[0].as_str(), "prompt" | "commit" | "pr" | "issue") =>
             {
                 // `--help` following a subcommand that would otherwise forward
                 // the arg to the API (e.g. `claw prompt --help`) should show
@@ -620,9 +615,13 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     if let Some(action) = parse_local_help_action(&rest) {
         return action;
     }
-    if let Some(action) =
-        parse_single_word_command_alias(&rest, &model, model_flag_raw.as_deref(), permission_mode_override, output_format)
-    {
+    if let Some(action) = parse_single_word_command_alias(
+        &rest,
+        &model,
+        model_flag_raw.as_deref(),
+        permission_mode_override,
+        output_format,
+    ) {
         return action;
     }
 
