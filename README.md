@@ -41,7 +41,8 @@ Claw Code is an **autonomous coding harness** — a system where AI agents execu
 │  prompt · session · doctor · status · mcp · tools        │
 ├─────────────────────────────────────────────────────────┤
 │              Provider Layer (models.json)                 │
-│  Anthropic · OpenAI · xAI · DashScope · Ollama · custom │
+│  Anthropic · OpenAI · xAI · DeepSeek · DashScope · custom │
+│  Ollama · vLLM · Qwen (external) · models.json           │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -152,9 +153,44 @@ Subscribe to typed events — turn started/completed, tool execution, session li
 
 Register custom tools and lifecycle hooks via the `Extension` trait. Extensions receive turn start/complete/error notifications and can add tools to the registry.
 
+### Built-in Providers
+
+Claw Code ships with native routing for these providers. Prefix your model name to select a provider, or let the credential sniffer auto-detect from your environment.
+
+| Provider | Env var (API key) | Env var (base URL) | Model prefix / alias |
+|----------|------------------|---------------------|---------------------|
+| **Anthropic** | `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` | `ANTHROPIC_BASE_URL` | `claude-*`, aliases: `opus`, `sonnet`, `haiku` |
+| **OpenAI** | `OPENAI_API_KEY` | `OPENAI_BASE_URL` | `openai/*`, `gpt-*` |
+| **xAI (Grok)** | `XAI_API_KEY` | `XAI_BASE_URL` | `grok-*`, aliases: `grok`, `grok-mini`, `grok-2` |
+| **DeepSeek** | `DEEPSEEK_API_KEY` | `DEEPSEEK_BASE_URL` | `deepseek-chat`, `deepseek-reasoner`, alias: `deepseek-r1` |
+| **DashScope** (Alibaba) | `DASHSCOPE_API_KEY` | `DASHSCOPE_BASE_URL` | `qwen-*` (bare), `kimi-*`, `kimi` |
+| **Ollama** (local) | none | `OLLAMA_BASE_URL` | `ollama/*` |
+| **vLLM** (local) | none | `VLLM_BASE_URL` | `vllm/*` |
+| **Qwen** (external) | `QWEN_API_KEY` | `QWEN_BASE_URL` | `qwen/*` |
+
+**Provider auto-detection order:** when the model name doesn't match a built-in prefix, the system checks environment variables in this order: model prefix → custom models.json → Anthropic auth → OpenAI auth → xAI auth → DeepSeek auth → Qwen auth → `OLLAMA_BASE_URL` → `VLLM_BASE_URL` → `OPENAI_BASE_URL` → Anthropic fallback.
+
+**Examples:**
+
+```bash
+# Anthropic
+claw --model sonnet prompt "hello"
+
+# DeepSeek
+export DEEPSEEK_API_KEY="sk-..."
+claw --model deepseek-chat prompt "hello"
+
+# Ollama (local)
+claw --model ollama/llama3.1:8b prompt "hello"
+
+# vLLM (local)
+export VLLM_BASE_URL="http://localhost:8000/v1"
+claw --model vllm/meta-llama/Llama-3.1-8B prompt "hello"
+```
+
 ### Custom Providers
 
-Add any OpenAI-compatible or Anthropic-compatible provider via `models.json` — Ollama, vLLM, LM Studio, OpenRouter, local servers, anything. No recompile needed.
+Add any OpenAI-compatible or Anthropic-compatible provider via `models.json` — Ollama, vLLM, LM Studio, OpenRouter, local servers, anything. No recompile needed. The `api` field accepts: `openai-completions`, `anthropic-messages`, `deepseek`, `ollama`, `qwen`, `vllm`.
 
 ## Repository Layout
 

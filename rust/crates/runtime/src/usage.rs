@@ -77,6 +77,24 @@ pub fn pricing_for_model(model: &str) -> Option<ModelPricing> {
     if normalized.contains("sonnet") {
         return Some(ModelPricing::default_sonnet_tier());
     }
+    // DeepSeek models
+    // Source: https://api-docs.deepseek.com/quick_start/pricing
+    if normalized.contains("deepseek-reasoner") || normalized.contains("deepseek-r1") {
+        return Some(ModelPricing {
+            input_cost_per_million: 0.55,
+            output_cost_per_million: 2.19,
+            cache_creation_cost_per_million: 0.0,
+            cache_read_cost_per_million: 0.0,
+        });
+    }
+    if normalized.contains("deepseek") {
+        return Some(ModelPricing {
+            input_cost_per_million: 0.27,
+            output_cost_per_million: 1.10,
+            cache_creation_cost_per_million: 0.0,
+            cache_read_cost_per_million: 0.0,
+        });
+    }
     None
 }
 
@@ -276,6 +294,34 @@ mod tests {
         let opus_cost = usage.estimate_cost_usd_with_pricing(opus);
         assert_eq!(format_usd(haiku_cost.total_cost_usd()), "$3.5000");
         assert_eq!(format_usd(opus_cost.total_cost_usd()), "$52.5000");
+    }
+
+    #[test]
+    fn deepseek_models_have_correct_pricing() {
+        let usage = TokenUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        };
+
+        // deepseek-chat: $0.27/M input, $1.10/M output
+        let chat_pricing = pricing_for_model("deepseek-chat").expect("deepseek-chat pricing");
+        assert_eq!(chat_pricing.input_cost_per_million, 0.27);
+        assert_eq!(chat_pricing.output_cost_per_million, 1.10);
+        let chat_cost = usage.estimate_cost_usd_with_pricing(chat_pricing);
+        assert_eq!(format_usd(chat_cost.total_cost_usd()), "$1.3700");
+
+        // deepseek-reasoner: $0.55/M input, $2.19/M output
+        let r1_pricing = pricing_for_model("deepseek-reasoner").expect("deepseek-reasoner pricing");
+        assert_eq!(r1_pricing.input_cost_per_million, 0.55);
+        assert_eq!(r1_pricing.output_cost_per_million, 2.19);
+        let r1_cost = usage.estimate_cost_usd_with_pricing(r1_pricing);
+        assert_eq!(format_usd(r1_cost.total_cost_usd()), "$2.7400");
+
+        // deepseek-r1 alias should resolve to reasoner pricing
+        let r1_alias = pricing_for_model("deepseek-r1").expect("deepseek-r1 alias pricing");
+        assert_eq!(r1_alias.output_cost_per_million, 2.19);
     }
 
     #[test]

@@ -400,6 +400,12 @@ pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
             max_output_tokens: 64_000,
             context_window_tokens: 131_072,
         }),
+        // DeepSeek models
+        // Source: https://api-docs.deepseek.com/quick_start/pricing
+        "deepseek-chat" | "deepseek-reasoner" => Some(ModelTokenLimit {
+            max_output_tokens: 8_192,
+            context_window_tokens: 131_072,
+        }),
         // Kimi models via DashScope (Moonshot AI)
         // Source: https://platform.moonshot.cn/docs/intro
         "kimi-k2.5" | "kimi-k1.5" => Some(ModelTokenLimit {
@@ -1373,12 +1379,18 @@ NO_EQUALS_LINE
     }
 
     #[test]
-    fn deepseek_models_use_heuristic_max_tokens() {
-        // deepseek-chat and deepseek-reasoner don't have hardcoded limits yet;
-        // they fall through to the default heuristic in max_tokens_for_model().
-        let max_chat = max_tokens_for_model("deepseek-chat");
-        let max_reasoner = max_tokens_for_model("deepseek-reasoner");
-        assert!(max_chat > 0);
-        assert!(max_reasoner > 0);
+    fn deepseek_models_have_hardcoded_limits() {
+        let chat_limit =
+            model_token_limit("deepseek-chat").expect("deepseek-chat should have limits");
+        assert_eq!(chat_limit.max_output_tokens, 8_192);
+        assert_eq!(chat_limit.context_window_tokens, 131_072);
+
+        let reasoner_limit =
+            model_token_limit("deepseek-reasoner").expect("deepseek-reasoner should have limits");
+        assert_eq!(reasoner_limit.max_output_tokens, 8_192);
+        assert_eq!(reasoner_limit.context_window_tokens, 131_072);
+
+        // max_tokens_for_model should reflect the hardcoded value
+        assert_eq!(max_tokens_for_model("deepseek-chat"), 8_192);
     }
 }

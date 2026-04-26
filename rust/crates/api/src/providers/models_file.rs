@@ -122,6 +122,32 @@ fn custom_models() -> &'static RwLock<Option<ModelsFile>> {
 
 /// Load custom models from a `models.json` file and replace the global registry.
 ///
+/// Valid values for the `api` field in a custom provider entry.
+const VALID_API_VALUES: &[&str] = &[
+    "openai-completions",
+    "anthropic-messages",
+    "deepseek",
+    "ollama",
+    "qwen",
+    "vllm",
+];
+
+/// Validate that every provider in the models file uses a recognized `api` value.
+fn validate_providers(file: &ModelsFile, path: &Path) -> Result<(), String> {
+    for (provider_label, provider) in &file.providers {
+        if !VALID_API_VALUES.contains(&provider.api.as_str()) {
+            return Err(format!(
+                "invalid api value '{}' for provider '{}' in {}: must be one of {}",
+                provider.api,
+                provider_label,
+                path.display(),
+                VALID_API_VALUES.join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The file is parsed and stored in a global `RwLock`. Returns `None` when the
 /// file does not exist, or an error description on parse failure.
 pub fn load_custom_models(path: &Path) -> Result<Option<ModelsFile>, String> {
@@ -137,6 +163,8 @@ pub fn load_custom_models(path: &Path) -> Result<Option<ModelsFile>, String> {
 
     let parsed: ModelsFile = serde_json::from_str(&content)
         .map_err(|e| format!("parse error in {}: {e}", path.display()))?;
+
+    validate_providers(&parsed, path)?;
 
     let mut registry = custom_models().write().map_err(|e| e.to_string())?;
     *registry = Some(parsed.clone());
@@ -159,6 +187,8 @@ fn load_and_merge_custom_models(path: &Path) -> Result<Option<ModelsFile>, Strin
 
     let parsed: ModelsFile = serde_json::from_str(&content)
         .map_err(|e| format!("parse error in {}: {e}", path.display()))?;
+
+    validate_providers(&parsed, path)?;
 
     let mut registry = custom_models().write().map_err(|e| e.to_string())?;
     match registry.as_mut() {
@@ -549,5 +579,86 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn validates_api_field_rejects_unknown_value() {
+        let _lock = models_lock();
+        clear_custom_models();
+
+        let dir = std::env::temp_dir().join(format!(
+            "models-validate-api-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let models_path = dir.join("models.json");
+        std::fs::write(
+            &models_path,
+            r#"{"providers":{"bad":{"baseUrl":"http://localhost:11434/v1","api":"invalid-api-value","apiKey":"k","models":[{"id":"m"}]}}}"#,
+        )
+        .expect("write models.json");
+
+        let result = super::load_custom_models(&models_path);
+        match result {
+            Err(msg) => {
+                assert!(
+                    msg.contains("invalid api value"),
+                    "error should mention invalid api value, got: {msg}"
+                );
+                assert!(
+                    msg.contains("invalid-api-value"),
+                    "error should include the bad value, got: {msg}"
+                );
+                assert!(
+                    msg.contains("bad"),
+                    "error should name the provider, got: {msg}"
+                );
+            }
+            other => panic!("expected validation error, got {other:?}"),
+        }
+
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn validates_api_field_accepts_all_valid_values() {
+        let _lock = models_lock();
+        clear_custom_models();
+
+        for valid_api in &[
+            "openai-completions",
+            "anthropic-messages",
+            "deepseek",
+            "ollama",
+            "qwen",
+            "vllm",
+        ] {
+            let dir = std::env::temp_dir().join(format!(
+                "models-validate-ok-{valid_api}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).expect("create temp dir");
+            let models_path = dir.join("models.json");
+            let json = format!(
+                r#"{{"providers":{{"p":{{"baseUrl":"http://localhost:11434/v1","api":"{valid_api}","apiKey":"k","models":[{{"id":"m"}}]}}}}}}"#
+            );
+            std::fs::write(&models_path, &json).expect("write models.json");
+
+            let result = super::load_custom_models(&models_path);
+            assert!(
+                result.is_ok(),
+                "api='{valid_api}' should be accepted, got: {result:?}"
+            );
+
+            std::fs::remove_dir_all(&dir).expect("cleanup");
+        }
     }
 }
