@@ -36,7 +36,7 @@ Claw Code is the public Rust implementation of the `claw` CLI agent harness.
 The canonical implementation lives in [`rust/`](./rust), and the current source of truth for this repository is **ultraworkers/claw-code**.
 
 > [!IMPORTANT]
-> Start with [`USAGE.md`](./USAGE.md) for build, auth, CLI, session, and parity-harness workflows. Make `claw doctor` your first health check after building, use [`rust/README.md`](./rust/README.md) for crate-level details, read [`PARITY.md`](./PARITY.md) for the current Rust-port checkpoint, see [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) for a high-level crate/subsystem map, and see [`docs/container.md`](./docs/container.md) for the container-first workflow.
+> Start with [`USAGE.md`](./USAGE.md) for build, auth, CLI, session, and parity-harness workflows. Make `claw doctor` your first health check after building, use [`rust/README.md`](./rust/README.md) for crate-level details, read [`PARITY.md`](./PARITY.md) for the current Rust-port checkpoint, see [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) for a high-level crate/subsystem map, see [`docs/CONFIGURATION.md`](./docs/CONFIGURATION.md) for env vars and settings, and see [`docs/container.md`](./docs/container.md) for the container-first workflow.
 >
 > **ACP / Zed status:** `claw-code` does not ship an ACP/Zed daemon entrypoint yet. Run `claw acp` (or `claw --acp`) for the current status instead of guessing from source layout; `claw acp serve` is currently a discoverability alias only, and real ACP support remains tracked separately in `ROADMAP.md`.
 

@@ -212,6 +212,6 @@ Repo documentation suite shipped during extended dogfood audit. Status: present/
 |----------|--------|----------|-------|
 | CODE_OF_CONDUCT.md | ❌ Missing | Low | Standard for public repos |
 | .github/PULL_REQUEST_TEMPLATE.md | ❌ Missing | Medium | Would standardize PR descriptions |
-| docs/CONFIGURATION.md | ❌ Missing | High | env vars, settings.json, provider config — relates to #283, #285 |
+| docs/CONFIGURATION.md | ✅ Present | High | env vars, settings.json, provider config — relates to #283, #285 |
 | docs/API_REFERENCE.md | ❌ Missing | Medium | JSON envelope schema, output format contract |
 | .github/ISSUE_TEMPLATE/bug_report.md | ❌ Missing | Low | Standard bug template (pinpoint.md covers discovery) |
