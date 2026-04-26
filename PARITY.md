@@ -213,5 +213,5 @@ Repo documentation suite shipped during extended dogfood audit. Status: present/
 | CODE_OF_CONDUCT.md | ✅ Present | Low | Contributor Covenant v2.1 |
 | .github/PULL_REQUEST_TEMPLATE.md | ✅ Present | Medium | Standardizes PR descriptions |
 | docs/CONFIGURATION.md | ✅ Present | High | env vars, settings.json, provider config — relates to #283, #285 |
-| docs/API_REFERENCE.md | ❌ Missing | Medium | JSON envelope schema, output format contract |
+| docs/API_REFERENCE.md | ✅ Present | Medium | JSON envelope schema, output format contract — #288, #266, #168c |
 | .github/ISSUE_TEMPLATE/bug_report.md | ✅ Present | #431 | Standard bug template with repro steps, environment, context sections |
