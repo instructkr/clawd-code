@@ -46,9 +46,9 @@ use runtime::{
     load_system_prompt, pricing_for_model, resolve_expected_base, resolve_sandbox_status,
     ApiClient, ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource,
     ContentBlock, ConversationMessage, ConversationRuntime, McpServer, McpServerManager,
-    McpServerSpec, McpTool, MessageRole, ModelPricing, PermissionMode, PermissionPolicy,
-    ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError, Session, TokenUsage,
-    ToolError, ToolExecutor, UsageTracker,
+    McpServerSpec, McpTool, MessageRole, ModelPricing, PermissionContext, PermissionMode,
+    PermissionOutcome, PermissionPolicy, ProjectContext, PromptCacheEvent, ResolvedPermissionMode,
+    RuntimeError, Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -2038,7 +2038,23 @@ fn run_worker_state(output_format: CliOutputFormat) -> Result<(), Box<dyn std::e
 }
 
 /// the same surface the in-process agent loop uses.
+///
+/// Tool calls are gated through `PermissionPolicy::authorize_with_context`
+/// using the active permission mode resolved from env/config (defaulting to
+/// `ReadOnly` when nothing is set) plus the user's deny/ask/allow rules from
+/// `.claw.json` / `.claude.json`. The prompter is `None` because there is no
+/// human in the loop on an MCP server, so any rule that would `Ask` resolves
+/// to `Deny` — fail-closed is the correct default for unattended tool access.
 fn run_mcp_serve() -> Result<(), Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let loader = ConfigLoader::default_for(&cwd);
+    let runtime_config = loader.load()?;
+    let feature_config = runtime_config.feature_config().clone();
+    let tool_registry = GlobalToolRegistry::builtin();
+    let permission_mode = default_permission_mode();
+    let policy = permission_policy(permission_mode, &feature_config, &tool_registry)
+        .map_err(std::io::Error::other)?;
+
     let tools = mvp_tool_specs()
         .into_iter()
         .map(|spec| McpTool {
@@ -2054,7 +2070,18 @@ fn run_mcp_serve() -> Result<(), Box<dyn std::error::Error>> {
         server_name: "claw".to_string(),
         server_version: VERSION.to_string(),
         tools,
-        tool_handler: Box::new(execute_tool),
+        tool_handler: Box::new(move |name, input| {
+            let input_str = input.to_string();
+            match policy.authorize_with_context(
+                name,
+                &input_str,
+                &PermissionContext::default(),
+                None,
+            ) {
+                PermissionOutcome::Allow => execute_tool(name, input),
+                PermissionOutcome::Deny { reason } => Err(reason),
+            }
+        }),
     };
 
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -9044,7 +9071,8 @@ mod tests {
     };
     use runtime::{
         load_oauth_credentials, save_oauth_credentials, AssistantEvent, ConfigLoader, ContentBlock,
-        ConversationMessage, MessageRole, OAuthConfig, PermissionMode, Session, ToolExecutor,
+        ConversationMessage, MessageRole, OAuthConfig, PermissionContext, PermissionMode,
+        PermissionOutcome, Session, ToolExecutor,
     };
     use serde_json::json;
     use std::fs;
@@ -9411,6 +9439,59 @@ mod tests {
         std::fs::remove_dir_all(root).expect("temp config root should clean up");
 
         assert_eq!(resolved, PermissionMode::ReadOnly);
+    }
+
+    /// MCP-serve mode runs unattended (no human at the prompt). Pin the
+    /// invariant that an empty-config build of the policy that
+    /// `run_mcp_serve` uses denies a `bash` invocation: default mode is
+    /// ReadOnly, bash requires WorkspaceWrite, no allow rule, prompter is
+    /// None so any `Ask` resolves to Deny. If this regresses to Allow,
+    /// `claw mcp serve` is back to the unguarded behavior PR was fixing.
+    #[test]
+    fn mcp_serve_policy_denies_bash_under_empty_config() {
+        let _guard = env_lock();
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let config_home = root.join("config-home");
+        std::fs::create_dir_all(&cwd).expect("project dir should exist");
+        std::fs::create_dir_all(&config_home).expect("config home should exist");
+
+        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_permission_mode = std::env::var("RUSTY_CLAUDE_PERMISSION_MODE").ok();
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+
+        let outcome = with_current_dir(&cwd, || {
+            let loader = runtime::ConfigLoader::default_for(&cwd);
+            let runtime_config = loader.load().expect("empty config should load");
+            let feature_config = runtime_config.feature_config().clone();
+            let tool_registry = tools::GlobalToolRegistry::builtin();
+            let permission_mode = super::default_permission_mode();
+            let policy =
+                super::permission_policy(permission_mode, &feature_config, &tool_registry)
+                    .expect("policy should build");
+            policy.authorize_with_context(
+                "bash",
+                r#"{"command":"ls"}"#,
+                &PermissionContext::default(),
+                None,
+            )
+        });
+
+        match original_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        match original_permission_mode {
+            Some(value) => std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", value),
+            None => std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE"),
+        }
+        std::fs::remove_dir_all(root).expect("temp config root should clean up");
+
+        assert!(
+            matches!(outcome, PermissionOutcome::Deny { .. }),
+            "MCP-serve gate must deny bash under empty config, got {outcome:?}",
+        );
     }
 
     #[test]
