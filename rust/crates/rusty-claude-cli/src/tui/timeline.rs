@@ -1,4 +1,5 @@
 use std::fmt::Write as _;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::tui::theme::Theme;
@@ -16,10 +17,32 @@ pub struct ToolCallEvent {
 }
 
 /// Accumulator for building a tool call timeline during a turn.
+///
+/// Wrapped in `Arc<Mutex<>>` so it can be shared between the streaming
+/// client (which records `start_tool`) and the tool executor (which
+/// records `complete_tool`).
+#[derive(Debug, Default, Clone)]
+pub struct SharedToolCallTimeline(pub Arc<Mutex<ToolCallTimeline>>);
+
+/// Accumulator for building a tool call timeline during a turn.
 #[derive(Debug, Default)]
 pub struct ToolCallTimeline {
     events: Vec<ToolCallEvent>,
     start: Option<Instant>,
+}
+
+impl SharedToolCallTimeline {
+    /// Lock the inner timeline and call a function on it.
+    pub fn with<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut ToolCallTimeline) -> R,
+    {
+        let mut guard = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        f(&mut guard)
+    }
 }
 
 impl ToolCallTimeline {

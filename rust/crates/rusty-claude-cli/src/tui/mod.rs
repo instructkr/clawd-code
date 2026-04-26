@@ -19,5 +19,5 @@ pub use status_bar::StatusBar;
 pub use terminal::TerminalSize;
 pub use theme::Theme;
 pub use thinking::{format_thinking_completed, render_thinking_inline, ThinkingFrames};
-pub use timeline::ToolCallTimeline;
+pub use timeline::{SharedToolCallTimeline, ToolCallTimeline};
 pub use tool_panel::{collapse_tool_output, CollapsedToolOutput, ToolDisplayConfig};

@@ -6032,6 +6032,7 @@ UU conflicted.rs",
             false,
             state.tool_registry.clone(),
             state.mcp_state.clone(),
+            None,
         );
 
         let tool_output = executor
@@ -6130,6 +6131,7 @@ UU conflicted.rs",
             false,
             state.tool_registry.clone(),
             state.mcp_state.clone(),
+            None,
         );
 
         let search_output = executor

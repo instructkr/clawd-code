@@ -54,7 +54,7 @@ use crate::tui::permission::{
 use crate::tui::status_bar::{StatusBar, StatusBarState};
 use crate::tui::terminal::TerminalSize;
 use crate::tui::theme::Theme;
-use crate::tui::timeline::ToolCallTimeline;
+use crate::tui::timeline::{SharedToolCallTimeline, ToolCallTimeline};
 use crate::{
     AllowedToolSet, RuntimePluginStateBuildOutput, DEFAULT_DATE,
     INTERNAL_PROGRESS_HEARTBEAT_INTERVAL, POST_TOOL_STALL_TIMEOUT,
@@ -1784,6 +1784,7 @@ pub(crate) fn build_runtime_with_plugin_state(
             emit_output,
             tool_registry.clone(),
             mcp_state.clone(),
+            None,
         ),
         policy,
         system_prompt,
@@ -2328,6 +2329,7 @@ pub(crate) struct CliToolExecutor {
     allowed_tools: Option<AllowedToolSet>,
     tool_registry: GlobalToolRegistry,
     mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
+    tool_timeline: Option<SharedToolCallTimeline>,
 }
 
 impl CliToolExecutor {
@@ -2336,6 +2338,7 @@ impl CliToolExecutor {
         emit_output: bool,
         tool_registry: GlobalToolRegistry,
         mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
+        tool_timeline: Option<SharedToolCallTimeline>,
     ) -> Self {
         Self {
             renderer: TerminalRenderer::new(),
@@ -2343,7 +2346,13 @@ impl CliToolExecutor {
             allowed_tools,
             tool_registry,
             mcp_state,
+            tool_timeline,
         }
+    }
+
+    /// Attach a shared timeline so tool execution duration is recorded.
+    pub(crate) fn set_timeline(&mut self, timeline: SharedToolCallTimeline) {
+        self.tool_timeline = Some(timeline);
     }
 
     fn execute_search_tool(&self, value: serde_json::Value) -> Result<String, ToolError> {
@@ -2431,6 +2440,10 @@ impl ToolExecutor for CliToolExecutor {
         };
         match result {
             Ok(output) => {
+                if let Some(ref timeline) = self.tool_timeline {
+                    let lines = output.lines().count();
+                    timeline.with(|t| t.complete_tool(false, lines > 100, lines));
+                }
                 if self.emit_output {
                     let markdown = format_tool_result(tool_name, &output, false);
                     self.renderer
@@ -2440,6 +2453,9 @@ impl ToolExecutor for CliToolExecutor {
                 Ok(output)
             }
             Err(error) => {
+                if let Some(ref timeline) = self.tool_timeline {
+                    timeline.with(|t| t.complete_tool(true, false, 0));
+                }
                 if self.emit_output {
                     let markdown = format_tool_result(tool_name, &error.to_string(), true);
                     self.renderer
