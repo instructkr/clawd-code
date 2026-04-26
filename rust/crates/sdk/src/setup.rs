@@ -36,17 +36,6 @@ impl DetectedProvider {
             key_url: key_url.to_string(),
         }
     }
-
-    /// Check if a provider API key is set.
-    fn check_env(name: String, env_var: &str, key_url: String) -> Self {
-        let present = std::env::var(env_var).ok().map_or(false, |v| !v.is_empty());
-        Self {
-            name,
-            key_present: present,
-            env_var: env_var.to_string(),
-            key_url,
-        }
-    }
 }
 
 impl fmt::Display for DetectedProvider {
