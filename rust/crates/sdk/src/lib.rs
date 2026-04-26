@@ -45,7 +45,10 @@ pub use resource_loader::{DefaultResourceLoader, ResourceLoader};
 pub use session::{AgentSession, AgentSessionBuilder, BoxedApiClient, DummyApiClient};
 pub use session_manager::{SessionManager, SessionManagerConfig};
 pub use session_tree::{SessionTree, SessionTreeNode};
-pub use tool_registry::{create_builtin_tools, SdkToolExecutor, ToolRegistry};
+pub use tool_registry::{
+    create_builtin_tools, define_tool, FnToolHandler, SchemaValidationError, SchemaValidator,
+    SdkToolExecutor, ToolDefinition, ToolDefinitionBuilder, ToolHandler, ToolRegistry,
+};
 
 #[cfg(feature = "rpc")]
 pub use rpc::run_rpc_server;
