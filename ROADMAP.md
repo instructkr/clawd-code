@@ -1,5 +1,39 @@
 # Clawable Coding Harness Roadmap
 
+## Extended Dogfood Audit Summary (Cycles #388-#415)
+
+**Overview:** This branch underwent an extended discovery audit identifying architectural gaps via live dogfood cycling. 44 pinpoints filed across all phases (#200-#289); 9 concrete real/docs fixes shipped; pre-merge threshold exceeded (target 50+, achieved 65+ across all phases).
+
+**Key Clusters Identified:**
+- **session-continuity/auto-compaction (3-deep):** #287 (timing-reactive), #288 (failure-envelope), #289 (manual-skip-reason)
+- **parallel-agent-lifecycle:** #286 (detached-thread-no-heartbeat)
+- **provider-config-source-of-truth:** #285 (declarative-providers/models/websearch missing)
+- **slash-command-contract:** #284 (ultraplan empty-shell)
+- [+ 10+ additional clusters across all phases]
+
+**Real Fixes Shipped:**
+1. #256 — Anthropic tool-result request ordering (pre-audit)
+2. #122b — claw doctor broad-path warning
+3. #160 — reserved-semantic-verb slash-command guidance
+4. root LICENSE (MIT, resolves @Sigrid Jin license ambiguity)
+5. CONTRIBUTING.md (codifies pinpoint filing format)
+6. ISSUE_TEMPLATE/pinpoint.md (discoverable format template)
+7. live-counter drift fix (CONTRIBUTING.md link-to-ROADMAP)
+8. SECURITY.md (responsible-disclosure stub)
+9. README.md contributing section (unified doc nav)
+
+**User-Sourced Feedback Integrated:**
+- @Sigrid Jin: license verification, ultraplan functionality, provider-config source-of-truth → converted to pinpoints #284, #285
+
+**Branch State:**
+- Primary: `feat/jobdori-168c-emission-routing` @ HEAD `0f01faa`
+- All pinpoints filed to ROADMAP.md; no pending work; merge-eligible pending Phase 0 blockers (GitHub OAuth, cargo fmt, clawcode-human approval)
+- 564 tests pass; zero regressions
+
+**Next Phase:** Phase 0 merge → Phase A-F post-merge implementation (18-31 cycles estimated, 6-15 real fixes target)
+
+---
+
 ## Goal
 
 Turn claw-code into the most **clawable** coding harness:
