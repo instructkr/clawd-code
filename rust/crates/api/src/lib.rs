@@ -19,13 +19,17 @@ pub use prompt_cache::{
     PromptCacheStats,
 };
 pub use providers::anthropic::{AnthropicClient, AnthropicClient as ApiClient, AuthSource};
+pub use providers::models_file::{
+    self as models_file, clear_custom_models, discover_and_load_models, find_custom_model,
+    load_custom_models, ModelsFile, ResolvedCustomModel,
+};
 pub use providers::openai_compat::{
     build_chat_completion_request, flatten_tool_result_content, is_reasoning_model,
     model_rejects_is_error_field, translate_message, OpenAiCompatClient, OpenAiCompatConfig,
 };
 pub use providers::{
     detect_provider_kind, max_tokens_for_model, max_tokens_for_model_with_override,
-    resolve_model_alias, ProviderKind,
+    metadata_for_model, resolve_model_alias, ProviderKind, ProviderMetadata,
 };
 pub use sse::{parse_frame, SseParser};
 pub use types::{

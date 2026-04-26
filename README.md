@@ -1,210 +1,243 @@
 # Claw Code
 
-<p align="center">
-  <a href="https://github.com/ultraworkers/claw-code">ultraworkers/claw-code</a>
-  ·
-  <a href="./USAGE.md">Usage</a>
-  ·
-  <a href="./rust/README.md">Rust workspace</a>
-  ·
-  <a href="./PARITY.md">Parity</a>
-  ·
-  <a href="./ROADMAP.md">Roadmap</a>
-  ·
-  <a href="https://discord.gg/5TUQKqFWd">UltraWorkers Discord</a>
-</p>
+**Agent-first autonomous coding harness.** A Rust SDK and CLI for building, orchestrating, and reviewing AI-driven coding workflows — designed primarily for machine consumers, with a human escape hatch.
 
 <p align="center">
-  <a href="https://star-history.com/#ultraworkers/claw-code&Date">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=ultraworkers/claw-code&type=Date&theme=dark" />
-      <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=ultraworkers/claw-code&type=Date" />
-      <img alt="Star history for ultraworkers/claw-code" src="https://api.star-history.com/svg?repos=ultraworkers/claw-code&type=Date" width="600" />
-    </picture>
-  </a>
+  <a href="./docs/ROADMAP.md">Roadmap</a>
+  ·
+  <a href="./docs/AGENT-INTEGRATION.md">Agent Integration</a>
+  ·
+  <a href="./docs/HUMAN-DX.md">Human Experience</a>
+  ·
+  <a href="./docs/PI-MONO-PARITY-DESIGN.md">Architecture</a>
 </p>
 
-<p align="center">
-  <img src="assets/claw-hero.jpeg" alt="Claw Code" width="300" />
-</p>
+---
 
-Claw Code is the public Rust implementation of the `claw` CLI agent harness.
-The canonical implementation lives in [`rust/`](./rust), and the current source of truth for this repository is **ultraworkers/claw-code**.
+## What is Claw Code?
 
-> [!IMPORTANT]
-> Start with [`USAGE.md`](./USAGE.md) for build, auth, CLI, session, and parity-harness workflows. Make `claw doctor` your first health check after building, use [`rust/README.md`](./rust/README.md) for crate-level details, read [`PARITY.md`](./PARITY.md) for the current Rust-port checkpoint, and see [`docs/container.md`](./docs/container.md) for the container-first workflow.
->
-> **ACP / Zed status:** `claw-code` does not ship an ACP/Zed daemon entrypoint yet. Run `claw acp` (or `claw --acp`) for the current status instead of guessing from source layout; `claw acp serve` is currently a discoverability alias only, and real ACP support remains tracked separately in `ROADMAP.md`.
+Claw Code is an **autonomous coding harness** — a system where AI agents execute coding tasks, manage sessions, branch conversations, coordinate with each other, and surface results for human review. It is:
 
-## Current repository shape
+- **Agent-first:** The primary API consumer is an AI agent, not a human at a keyboard. The SDK, CLI, and event bus are designed for programmatic orchestration.
+- **Human-aware:** Humans get a "rip cord" — the ability to step in, review outputs, approve/reject changes, and orchestrate plans through an agent orchestrator interface.
+- **Security-first:** Permission modes, sandboxed execution, audit logging, and credential isolation are built in, not bolted on.
+- **Review-friendly:** Outputs are structured for easy human consumption — summaries, diffs, deployment previews, and notification routing to email, chat, or mobile.
 
-- **`rust/`** — canonical Rust workspace and the `claw` CLI binary
-- **`USAGE.md`** — task-oriented usage guide for the current product surface
-- **`PARITY.md`** — Rust-port parity status and migration notes
-- **`ROADMAP.md`** — active roadmap and cleanup backlog
-- **`PHILOSOPHY.md`** — project intent and system-design framing
-- **`src/` + `tests/`** — companion Python/reference workspace and audit helpers; not the primary runtime surface
+## Architecture
 
-## Quick start
+```
+┌─────────────────────────────────────────────────────────┐
+│                    Agent Orchestrator                     │
+│         (plans, delegates, reviews, approves)            │
+├──────────┬──────────┬──────────┬────────────────────────┤
+│  Agent A │  Agent B │  Agent C │  ...                   │
+│  (code)  │  (test)  │  (review)│                        │
+├──────────┴──────────┴──────────┴────────────────────────┤
+│                     Claw SDK (Rust)                       │
+│  AgentSession · EventBus · SessionTree · AgentContext    │
+│  ToolRegistry · Extension · TaskRegistry                 │
+├─────────────────────────────────────────────────────────┤
+│                     Claw CLI (`claw`)                     │
+│  prompt · session · doctor · status · mcp · tools        │
+├─────────────────────────────────────────────────────────┤
+│              Provider Layer (models.json)                 │
+│  Anthropic · OpenAI · xAI · DeepSeek · DashScope · custom │
+│  Ollama · vLLM · Qwen (external) · models.json           │
+└─────────────────────────────────────────────────────────┘
+```
 
-> [!NOTE]
-> [!WARNING]
-> **`cargo install claw-code` installs the wrong thing.** The `claw-code` crate on crates.io is a deprecated stub that places `claw-code-deprecated.exe` — not `claw`. Running it only prints `"claw-code has been renamed to agent-code"`. **Do not use `cargo install claw-code`.** Either build from source (this repo) or install the upstream binary:
-> ```bash
-> cargo install agent-code   # upstream binary — installs 'agent.exe' (Windows) / 'agent' (Unix), NOT 'agent-code'
-> ```
-> This repo (`ultraworkers/claw-code`) is **build-from-source only** — follow the steps below.
+## Quick Start
+
+### Build from source
 
 ```bash
-# 1. Clone and build
-git clone https://github.com/ultraworkers/claw-code
+git clone https://github.com/deep-thinking-llc/claw-code
 cd claw-code/rust
 cargo build --workspace
+```
 
-# 2. Set your API key (Anthropic API key — not a Claude subscription)
+### Configure a provider
+
+Create `~/.claw/models.json` for any OpenAI-compatible or Anthropic-compatible provider:
+
+```json
+{
+  "providers": {
+    "ollama": {
+      "baseUrl": "http://localhost:11434/v1",
+      "api": "openai-completions",
+      "apiKey": "ollama",
+      "models": [{ "id": "llama3.1:8b" }]
+    }
+  }
+}
+```
+
+Or set an API key directly:
+
+```bash
 export ANTHROPIC_API_KEY="sk-ant-..."
+# or
+export OPENAI_API_KEY="sk-..."
+```
 
-# 3. Verify everything is wired correctly
+### Run
+
+```bash
+# One-shot prompt
+./target/debug/claw prompt "explain this codebase"
+
+# Interactive REPL
+./target/debug/claw
+
+# Health check
 ./target/debug/claw doctor
 
-# 4. Run a prompt
-./target/debug/claw prompt "say hello"
+# Structured JSON output (for agents)
+./target/debug/claw --output-format json status
 ```
 
-> [!NOTE]
-> **Windows (PowerShell):** the binary is `claw.exe`, not `claw`. Use `.\target\debug\claw.exe` or run `cargo run -- prompt "say hello"` to skip the path lookup.
+### Use the SDK from Rust
 
-### Windows setup
+Add to your `Cargo.toml`:
 
-**PowerShell is a supported Windows path.** Use whichever shell works for you. The common onboarding issues on Windows are:
+```toml
+[dependencies]
+sdk = { path = "../claw-code/rust/crates/sdk" }
+runtime = { path = "../claw-code/rust/crates/runtime" }
+```
 
-1. **Install Rust first** — download from <https://rustup.rs/> and run the installer. Close and reopen your terminal when it finishes.
-2. **Verify Rust is on PATH:**
-   ```powershell
-   cargo --version
-   ```
-   If this fails, reopen your terminal or run the PATH setup from the Rust installer output, then retry.
-3. **Clone and build** (works in PowerShell, Git Bash, or WSL):
-   ```powershell
-   git clone https://github.com/ultraworkers/claw-code
-   cd claw-code/rust
-   cargo build --workspace
-   ```
-4. **Run** (PowerShell — note `.exe` and backslash):
-   ```powershell
-   $env:ANTHROPIC_API_KEY = "sk-ant-..."
-   .\target\debug\claw.exe prompt "say hello"
-   ```
+```rust
+use sdk::{AgentSession, ToolRegistry, EventBus};
+use runtime::PermissionMode;
 
-**Git Bash / WSL** are optional alternatives, not requirements. If you prefer bash-style paths (`/c/Users/you/...` instead of `C:\Users\you\...`), Git Bash (ships with Git for Windows) works well. In Git Bash, the `MINGW64` prompt is expected and normal — not a broken install.
+let (mut session, event_bus) = AgentSession::new(
+    "claude-sonnet-4-6",
+    vec!["You are a helpful coding assistant.".into()],
+    ToolRegistry::new(),
+    PermissionMode::DangerFullAccess,
+)?;
 
-## Post-build: locate the binary and verify
+// Subscribe to events
+let sub = event_bus.subscribe();
 
-After running `cargo build --workspace`, the `claw` binary is built but **not** automatically installed to your system. Here's where to find it and how to verify the build succeeded.
+// Run a turn
+let result = session.run_turn("Read the main.rs and summarize it");
+```
 
-### Binary location
+## Key Concepts
 
-After `cargo build --workspace` in `claw-code/rust/`:
+### Sessions
 
-**Debug build (default, faster compile):**
-- **macOS/Linux:** `rust/target/debug/claw`
-- **Windows:** `rust/target/debug/claw.exe`
-
-**Release build (optimized, slower compile):**
-- **macOS/Linux:** `rust/target/release/claw`
-- **Windows:** `rust/target/release/claw.exe`
-
-If you ran `cargo build` without `--release`, the binary is in the `debug/` folder.
-
-### Verify the build succeeded
-
-Test the binary directly using its path:
+Sessions persist conversation state across turns. They can be created, resumed, forked, and listed:
 
 ```bash
-# macOS/Linux (debug build)
-./rust/target/debug/claw --help
-./rust/target/debug/claw doctor
-
-# Windows PowerShell (debug build)
-.\rust\target\debug\claw.exe --help
-.\rust\target\debug\claw.exe doctor
+claw                        # start interactive session
+claw prompt "do a thing"    # one-shot, auto-creates session
+claw --resume latest        # resume last session
 ```
 
-If these commands succeed, the build is working. `claw doctor` is your first health check — it validates your API key, model access, and tool configuration.
+### Session Trees
 
-### Optional: Add to PATH
+Conversations can branch — like git for chat history. Fork at any point, navigate between branches, and explore alternative approaches without losing context.
 
-If you want to run `claw` from any directory without the full path, choose one of these approaches:
+### Agent Context
 
-**Option 1: Symlink (macOS/Linux)**
+Multiple agents share a thread-safe key-value store (`AgentContext`) for coordination. Tasks are tracked through a `TaskRegistry` with completion/failure lifecycle.
+
+### Event Bus
+
+Subscribe to typed events — turn started/completed, tool execution, session lifecycle, errors — for real-time monitoring and orchestration.
+
+### Extensions
+
+Register custom tools and lifecycle hooks via the `Extension` trait. Extensions receive turn start/complete/error notifications and can add tools to the registry.
+
+### Built-in Providers
+
+Claw Code ships with native routing for these providers. Prefix your model name to select a provider, or let the credential sniffer auto-detect from your environment.
+
+| Provider | Env var (API key) | Env var (base URL) | Model prefix / alias |
+|----------|------------------|---------------------|---------------------|
+| **Anthropic** | `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` | `ANTHROPIC_BASE_URL` | `claude-*`, aliases: `opus`, `sonnet`, `haiku` |
+| **OpenAI** | `OPENAI_API_KEY` | `OPENAI_BASE_URL` | `openai/*`, `gpt-*` |
+| **xAI (Grok)** | `XAI_API_KEY` | `XAI_BASE_URL` | `grok-*`, aliases: `grok`, `grok-mini`, `grok-2` |
+| **DeepSeek** | `DEEPSEEK_API_KEY` | `DEEPSEEK_BASE_URL` | `deepseek-chat`, `deepseek-reasoner`, alias: `deepseek-r1` |
+| **DashScope** (Alibaba) | `DASHSCOPE_API_KEY` | `DASHSCOPE_BASE_URL` | `qwen-*` (bare), `kimi-*`, `kimi` |
+| **Ollama** (local) | none | `OLLAMA_BASE_URL` | `ollama/*` |
+| **vLLM** (local) | none | `VLLM_BASE_URL` | `vllm/*` |
+| **Qwen** (external) | `QWEN_API_KEY` | `QWEN_BASE_URL` | `qwen/*` |
+
+**Provider auto-detection order:** when the model name doesn't match a built-in prefix, the system checks environment variables in this order: model prefix → custom models.json → Anthropic auth → OpenAI auth → xAI auth → DeepSeek auth → Qwen auth → `OLLAMA_BASE_URL` → `VLLM_BASE_URL` → `OPENAI_BASE_URL` → Anthropic fallback.
+
+**Examples:**
+
 ```bash
-ln -s $(pwd)/rust/target/debug/claw /usr/local/bin/claw
-```
-Then reload your shell and test:
-```bash
-claw --help
-```
+# Anthropic
+claw --model sonnet prompt "hello"
 
-**Option 2: Use `cargo install` (all platforms)**
+# DeepSeek
+export DEEPSEEK_API_KEY="sk-..."
+claw --model deepseek-chat prompt "hello"
 
-Build and install to Cargo's default location (`~/.cargo/bin/`, which is usually on PATH):
-```bash
-# From the claw-code/rust/ directory
-cargo install --path . --force
+# Ollama (local)
+claw --model ollama/llama3.1:8b prompt "hello"
 
-# Then from anywhere
-claw --help
+# vLLM (local)
+export VLLM_BASE_URL="http://localhost:8000/v1"
+claw --model vllm/meta-llama/Llama-3.1-8B prompt "hello"
 ```
 
-**Option 3: Update shell profile (bash/zsh)**
+### Custom Providers
 
-Add this line to `~/.bashrc` or `~/.zshrc`:
-```bash
-export PATH="$(pwd)/rust/target/debug:$PATH"
+Add any OpenAI-compatible or Anthropic-compatible provider via `models.json` — Ollama, vLLM, LM Studio, OpenRouter, local servers, anything. No recompile needed. The `api` field accepts: `openai-completions`, `anthropic-messages`, `deepseek`, `ollama`, `qwen`, `vllm`.
+
+## Repository Layout
+
+```
+claw-code/
+├── rust/                        # Rust workspace
+│   ├── crates/
+│   │   ├── sdk/                 # Agent SDK crate (public API)
+│   │   ├── api/                 # Provider layer (Anthropic, OpenAI, custom)
+│   │   ├── runtime/             # Session engine, permissions, plugins
+│   │   ├── tools/               # Built-in tool implementations
+│   │   ├── plugins/             # Plugin system
+│   │   └── rusty-claude-cli/    # CLI binary (`claw`)
+│   └── Cargo.toml               # Workspace root
+├── docs/                        # Documentation
+│   ├── ROADMAP.md               # Project roadmap
+│   ├── AGENT-INTEGRATION.md     # Agent integration guide
+│   ├── HUMAN-DX.md              # Human experience design
+│   └── PI-MONO-PARITY-DESIGN.md # Architecture comparison
+└── CLAUDE.md                    # AI coding assistant guidance
 ```
 
-Reload your shell:
-```bash
-source ~/.bashrc  # or source ~/.zshrc
-claw --help
-```
+## Documentation
 
-### Troubleshooting
+| Document | Purpose |
+|----------|---------|
+| [docs/ROADMAP.md](docs/ROADMAP.md) | Project direction and planned work |
+| [docs/AGENT-INTEGRATION.md](docs/AGENT-INTEGRATION.md) | How to integrate agents via SDK, CLI, and RPC |
+| [docs/HUMAN-DX.md](docs/HUMAN-DX.md) | Human review workflows, notifications, deployment previews |
+| [docs/PI-MONO-PARITY-DESIGN.md](docs/PI-MONO-PARITY-DESIGN.md) | Architecture comparison with pi-mono reference |
 
-- **"command not found: claw"** — The binary is in `rust/target/debug/claw`, but it's not on your PATH. Use the full path `./rust/target/debug/claw` or symlink/install as above.
-- **"permission denied"** — On macOS/Linux, you may need `chmod +x rust/target/debug/claw` if the executable bit isn't set (rare).
-- **Debug vs. release** — If the build is slow, you're in debug mode (default). Add `--release` to `cargo build` for faster runtime, but the build itself will take 5–10 minutes.
-
-> [!NOTE]
-> **Auth:** claw requires an **API key** (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, etc.) — Claude subscription login is not a supported auth path.
-
-Run the workspace test suite after verifying the binary works:
+## Development
 
 ```bash
 cd rust
+
+# Build
+cargo build --workspace
+
+# Test
 cargo test --workspace
+
+# Lint
+cargo fmt
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-## Documentation map
+## License
 
-- [`USAGE.md`](./USAGE.md) — quick commands, auth, sessions, config, parity harness
-- [`rust/README.md`](./rust/README.md) — crate map, CLI surface, features, workspace layout
-- [`PARITY.md`](./PARITY.md) — parity status for the Rust port
-- [`rust/MOCK_PARITY_HARNESS.md`](./rust/MOCK_PARITY_HARNESS.md) — deterministic mock-service harness details
-- [`ROADMAP.md`](./ROADMAP.md) — active roadmap and open cleanup work
-- [`PHILOSOPHY.md`](./PHILOSOPHY.md) — why the project exists and how it is operated
-
-## Ecosystem
-
-Claw Code is built in the open alongside the broader UltraWorkers toolchain:
-
-- [clawhip](https://github.com/Yeachan-Heo/clawhip)
-- [oh-my-openagent](https://github.com/code-yeongyu/oh-my-openagent)
-- [oh-my-claudecode](https://github.com/Yeachan-Heo/oh-my-claudecode)
-- [oh-my-codex](https://github.com/Yeachan-Heo/oh-my-codex)
-- [UltraWorkers Discord](https://discord.gg/5TUQKqFWd)
-
-## Ownership / affiliation disclaimer
-
-- This repository does **not** claim ownership of the original Claude Code source material.
-- This repository is **not affiliated with, endorsed by, or maintained by Anthropic**.
+This project is a fork of [claw-code](https://github.com/ultraworkers/claw-code) by UltraWorkers. See the upstream repository for original authorship and license details.

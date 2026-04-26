@@ -122,7 +122,7 @@ fn detect_and_emit_ship_prepared(command: &str) {
             actor: get_git_actor().unwrap_or_else(|| "unknown".to_string()),
             pr_number: None,
         };
-        let _event = LaneEvent::ship_prepared(format!("{}", now), &provenance);
+        let _event = LaneEvent::ship_prepared(format!("{now}"), &provenance);
         // Log to stderr as interim routing before event stream integration
         eprintln!(
             "[ship.prepared] branch={} -> main, commits={}, actor={}",
@@ -172,7 +172,7 @@ async fn execute_bash_async(
 ) -> io::Result<BashCommandOutput> {
     // Detect and emit ship provenance for git push operations
     detect_and_emit_ship_prepared(&input.command);
-    
+
     let mut command = prepare_tokio_command(&input.command, &cwd, &sandbox_status, true);
 
     let output_result = if let Some(timeout_ms) = input.timeout {

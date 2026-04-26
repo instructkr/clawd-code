@@ -235,6 +235,186 @@ async fn stream_message_normalizes_text_and_multiple_tool_calls() {
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
+async fn stream_message_emits_thinking_blocks_for_reasoning_content() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let sse = concat!(
+        "data: {\"id\":\"chatcmpl_reasoning\",\"choices\":[{\"delta\":{\"reasoning_content\":\"Let me think\"}}]}\n\n",
+        "data: {\"id\":\"chatcmpl_reasoning\",\"choices\":[{\"delta\":{\"reasoning_content\":\" about this...\"}}]}\n\n",
+        "data: {\"id\":\"chatcmpl_reasoning\",\"choices\":[{\"delta\":{\"content\":\"Hello!\"}}]}\n\n",
+        "data: {\"id\":\"chatcmpl_reasoning\",\"choices\":[{\"delta\":{\"content\":\" The answer is 42.\"}}]}\n\n",
+        "data: {\"id\":\"chatcmpl_reasoning\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let server = spawn_server(
+        state.clone(),
+        vec![http_response("200 OK", "text/event-stream", sse)],
+    )
+    .await;
+
+    let client = OpenAiCompatClient::new("ds-test-key", OpenAiCompatConfig::deepseek())
+        .with_base_url(server.base_url());
+    let mut stream = client
+        .stream_message(&sample_request(false))
+        .await
+        .expect("stream should start");
+
+    let mut events = Vec::new();
+    while let Some(event) = stream.next_event().await.expect("event should parse") {
+        events.push(event);
+    }
+
+    // Expected event sequence: MessageStart, ThinkingStart, ThinkingDelta x2,
+    // ThinkingStop, TextStart, TextDelta x2, TextStop, MessageDelta, MessageStop
+    assert!(matches!(events[0], StreamEvent::MessageStart(_)));
+
+    // Thinking block at index 0
+    assert!(matches!(
+        events[1],
+        StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+            index: 0,
+            content_block: OutputContentBlock::Thinking { .. },
+        })
+    ));
+    assert!(matches!(
+        events[2],
+        StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+            index: 0,
+            delta: ContentBlockDelta::ThinkingDelta { .. },
+        })
+    ));
+    assert!(matches!(
+        events[3],
+        StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+            index: 0,
+            delta: ContentBlockDelta::ThinkingDelta { .. },
+        })
+    ));
+    // Thinking block closes before text starts
+    assert!(matches!(
+        events[4],
+        StreamEvent::ContentBlockStop(ContentBlockStopEvent { index: 0 })
+    ));
+
+    // Text block at index 1 (shifted because thinking was present)
+    assert!(matches!(
+        events[5],
+        StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+            index: 1,
+            content_block: OutputContentBlock::Text { .. },
+        })
+    ));
+    assert!(matches!(
+        events[6],
+        StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+            index: 1,
+            delta: ContentBlockDelta::TextDelta { .. },
+        })
+    ));
+    assert!(matches!(
+        events[7],
+        StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+            index: 1,
+            delta: ContentBlockDelta::TextDelta { .. },
+        })
+    ));
+    assert!(matches!(
+        events[8],
+        StreamEvent::ContentBlockStop(ContentBlockStopEvent { index: 1 })
+    ));
+
+    assert!(matches!(events[9], StreamEvent::MessageDelta(_)));
+    assert!(matches!(events[10], StreamEvent::MessageStop(_)));
+
+    assert_eq!(events.len(), 11);
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn stream_message_emits_thinking_then_tools_without_text() {
+    // Reasoning-only stream: reasoning_content → tool_calls → finish, no text.
+    // Thinking block should be index 0, tools should start at index 2
+    // (1+thinking_offset).
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let sse = concat!(
+        "data: {\"id\":\"chatcmpl_reasoning_tool\",\"choices\":[{\"delta\":{\"reasoning_content\":\"I need to use a tool.\"}}]}\n\n",
+        "data: {\"id\":\"chatcmpl_reasoning_tool\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"weather\",\"arguments\":\"{\\\"city\\\":\\\"Paris\\\"}\"}}]}}]}\n\n",
+        "data: {\"id\":\"chatcmpl_reasoning_tool\",\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let server = spawn_server(
+        state.clone(),
+        vec![http_response("200 OK", "text/event-stream", sse)],
+    )
+    .await;
+
+    let client = OpenAiCompatClient::new("ds-test-key", OpenAiCompatConfig::deepseek())
+        .with_base_url(server.base_url());
+    let mut stream = client
+        .stream_message(&sample_request(false))
+        .await
+        .expect("stream should start");
+
+    let mut events = Vec::new();
+    while let Some(event) = stream.next_event().await.expect("event should parse") {
+        events.push(event);
+    }
+
+    // Thinking block stays open through tool calls; closes in finish().
+    // Expected: MessageStart, ThinkingStart(idx 0), ThinkingDelta,
+    // ToolStart(idx 2), ToolDelta, ToolStop(idx 2),
+    // ThinkingStop(idx 0) [from finish], MessageDelta, MessageStop
+    assert!(matches!(events[0], StreamEvent::MessageStart(_)));
+
+    // Thinking block at index 0
+    assert!(matches!(
+        events[1],
+        StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+            index: 0,
+            content_block: OutputContentBlock::Thinking { .. },
+        })
+    ));
+    assert!(matches!(
+        events[2],
+        StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+            index: 0,
+            delta: ContentBlockDelta::ThinkingDelta { .. },
+        })
+    ));
+
+    // Tool call at index 2 (shifted: thinking_offset=1, so 0 + 1 + 1 = 2)
+    assert!(matches!(
+        events[3],
+        StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+            index: 2,
+            content_block: OutputContentBlock::ToolUse { .. },
+        })
+    ));
+    assert!(matches!(
+        events[4],
+        StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+            index: 2,
+            delta: ContentBlockDelta::InputJsonDelta { .. },
+        })
+    ));
+    assert!(matches!(
+        events[5],
+        StreamEvent::ContentBlockStop(ContentBlockStopEvent { index: 2 })
+    ));
+
+    // Thinking block closes in finish(), after tool calls
+    assert!(matches!(
+        events[6],
+        StreamEvent::ContentBlockStop(ContentBlockStopEvent { index: 0 })
+    ));
+
+    assert!(matches!(events[7], StreamEvent::MessageDelta(_)));
+    assert!(matches!(events[8], StreamEvent::MessageStop(_)));
+
+    assert_eq!(events.len(), 9);
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
 async fn openai_streaming_requests_opt_into_usage_chunks() {
     let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
     let sse = concat!(

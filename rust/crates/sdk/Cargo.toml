@@ -1,0 +1,19 @@
+[package]
+name = "sdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+runtime = { path = "../runtime" }
+tokio = { version = "1", features = ["sync", "macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json.workspace = true
+
+[features]
+default = ["rpc"]
+rpc = []
+
+[lints]
+workspace = true

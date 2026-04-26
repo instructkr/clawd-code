@@ -624,8 +624,10 @@ fn assert_bash_stdout_roundtrip(_: &HarnessWorkspace, run: &ScenarioRun) {
 }
 
 fn assert_bash_permission_prompt_approved(_: &HarnessWorkspace, run: &ScenarioRun) {
-    assert!(run.stdout.contains("Permission approval required"));
-    assert!(run.stdout.contains("Approve this tool call? [y/N]:"));
+    assert!(run.stdout.contains("Permission Required"));
+    assert!(run
+        .stdout
+        .contains("[y]es | [n]o | [a]llow all | [v]iew input"));
     assert_eq!(run.response["iterations"], Value::from(2));
     assert_eq!(
         run.response["tool_results"][0]["is_error"],
@@ -646,8 +648,10 @@ fn assert_bash_permission_prompt_approved(_: &HarnessWorkspace, run: &ScenarioRu
 }
 
 fn assert_bash_permission_prompt_denied(_: &HarnessWorkspace, run: &ScenarioRun) {
-    assert!(run.stdout.contains("Permission approval required"));
-    assert!(run.stdout.contains("Approve this tool call? [y/N]:"));
+    assert!(run.stdout.contains("Permission Required"));
+    assert!(run
+        .stdout
+        .contains("[y]es | [n]o | [a]llow all | [v]iew input"));
     assert_eq!(run.response["iterations"], Value::from(2));
     let tool_output = run.response["tool_results"][0]["output"]
         .as_str()
