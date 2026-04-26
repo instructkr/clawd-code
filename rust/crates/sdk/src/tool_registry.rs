@@ -60,12 +60,15 @@ impl SchemaValidator {
 
         // Check type
         if let Some(schema_type) = obj.get("type").and_then(|t| t.as_str()) {
-            let actual_type = json_type_of(value);
-            if actual_type != schema_type {
+            let type_matches = match schema_type {
+                "integer" => value.as_i64().is_some(),
+                _ => json_type_of(value) == schema_type,
+            };
+            if !type_matches {
                 return Err(SchemaValidationError {
                     path: String::new(),
                     expected: schema_type.to_string(),
-                    actual: actual_type.to_string(),
+                    actual: json_type_of(value).to_string(),
                 });
             }
         }
@@ -462,12 +465,23 @@ impl ToolExecutor for SdkToolExecutor {
         // Try custom handler first
         if let Some(def) = self.definitions.get(tool_name) {
             // Validate input against schema
-            if let Ok(parsed) = serde_json::from_str::<Value>(input) {
-                if let Err(e) = def.input_schema.validate(&parsed) {
-                    return Err(ToolError::new(format!(
-                        "input validation failed for '{tool_name}': {e}"
-                    )));
+            let parsed: Value = match serde_json::from_str(input) {
+                Ok(v) => v,
+                Err(_) => {
+                    // If the tool has a non-trivial input schema, reject malformed JSON
+                    if def.input_schema.schema() != &Value::Object(serde_json::Map::new()) {
+                        return Err(ToolError::new(format!(
+                            "input validation failed for '{tool_name}': input is not valid JSON"
+                        )));
+                    }
+                    // No schema constraints — let the handler deal with raw input
+                    Value::Null
                 }
+            };
+            if let Err(e) = def.input_schema.validate(&parsed) {
+                return Err(ToolError::new(format!(
+                    "input validation failed for '{tool_name}': {e}"
+                )));
             }
 
             // Dispatch to handler
@@ -780,5 +794,272 @@ mod tests {
             err.contains("output validation failed"),
             "should mention output validation: {err}"
         );
+    }
+
+    // --- Additional coverage: SchemaValidator edge cases ---
+
+    #[test]
+    fn validates_integer_type() {
+        let validator = SchemaValidator::new(json!({"type": "integer"}));
+        assert!(validator.validate(&json!(42)).is_ok());
+        assert!(validator.validate(&json!(0)).is_ok());
+        assert!(validator.validate(&json!(-1)).is_ok());
+        assert!(validator.validate(&json!(3.14)).is_err(), "float should fail integer check");
+        assert!(validator.validate(&json!("42")).is_err(), "string should fail integer check");
+    }
+
+    #[test]
+    fn validates_null_type() {
+        let validator = SchemaValidator::new(json!({"type": "null"}));
+        assert!(validator.validate(&json!(null)).is_ok());
+        assert!(validator.validate(&json!(0)).is_err());
+    }
+
+    #[test]
+    fn validates_array_type() {
+        let validator = SchemaValidator::new(json!({"type": "array"}));
+        assert!(validator.validate(&json!([1, 2, 3])).is_ok());
+        assert!(validator.validate(&json!("not array")).is_err());
+    }
+
+    #[test]
+    fn validates_boolean_type() {
+        let validator = SchemaValidator::new(json!({"type": "boolean"}));
+        assert!(validator.validate(&json!(true)).is_ok());
+        assert!(validator.validate(&json!(false)).is_ok());
+        assert!(validator.validate(&json!(1)).is_err());
+    }
+
+    #[test]
+    fn validates_number_type() {
+        let validator = SchemaValidator::new(json!({"type": "number"}));
+        assert!(validator.validate(&json!(42)).is_ok());
+        assert!(validator.validate(&json!(3.14)).is_ok());
+        assert!(validator.validate(&json!("42")).is_err());
+    }
+
+    #[test]
+    fn empty_schema_object_passes_everything() {
+        let validator = SchemaValidator::new(json!({}));
+        assert!(validator.validate(&json!(null)).is_ok());
+        assert!(validator.validate(&json!(42)).is_ok());
+        assert!(validator.validate(&json!("str")).is_ok());
+        assert!(validator.validate(&json!([1, 2])).is_ok());
+        assert!(validator.validate(&json!({"a": 1})).is_ok());
+    }
+
+    #[test]
+    fn non_object_schema_passes_everything() {
+        // A schema that is not an object (e.g. a string) has no constraints
+        let validator = SchemaValidator::new(json!("not an object"));
+        assert!(validator.validate(&json!(42)).is_ok());
+    }
+
+    #[test]
+    fn validates_deeply_nested_properties() {
+        let validator = SchemaValidator::new(json!({
+            "type": "object",
+            "properties": {
+                "level1": {
+                    "type": "object",
+                    "properties": {
+                        "level2": {
+                            "type": "object",
+                            "properties": {
+                                "level3": {"type": "string"}
+                            }
+                        }
+                    }
+                }
+            }
+        }));
+
+        assert!(validator.validate(&json!({"level1": {"level2": {"level3": "ok"}}})).is_ok());
+        let err = validator.validate(&json!({"level1": {"level2": {"level3": 42}}}));
+        assert!(err.is_err());
+        let err = err.unwrap_err();
+        assert!(
+            err.path.contains("level3"),
+            "path should contain level3: got '{}'",
+            err.path
+        );
+    }
+
+    // --- Additional coverage: Executor edge cases ---
+
+    #[test]
+    fn executor_rejects_malformed_json_with_schema() {
+        let mut registry = ToolRegistry::new();
+
+        let tool = define_tool("needs_schema")
+            .input_schema(json!({"type": "object", "required": ["x"]}))
+            .handler(FnToolHandler::new(|_| Ok("ok".to_string())))
+            .build()
+            .expect("should build");
+
+        registry.register(tool).expect("should register");
+        let mut exec = SdkToolExecutor::new(&registry);
+
+        let result = exec.execute("needs_schema", "{invalid json");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("not valid JSON"),
+            "should mention invalid JSON: {err}"
+        );
+    }
+
+    #[test]
+    fn executor_handler_error_propagates() {
+        let mut registry = ToolRegistry::new();
+
+        let tool = define_tool("failing")
+            .handler(FnToolHandler::new(|_| {
+                Err(ToolError::new("handler exploded"))
+            }))
+            .build()
+            .expect("should build");
+
+        registry.register(tool).expect("should register");
+        let mut exec = SdkToolExecutor::new(&registry);
+
+        let result = exec.execute("failing", "{}");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("handler exploded"));
+    }
+
+    #[test]
+    fn executor_empty_tool_name_returns_unknown() {
+        let registry = ToolRegistry::new();
+        let mut exec = SdkToolExecutor::new(&registry);
+
+        let result = exec.execute("", "{}");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unknown tool"));
+    }
+
+    #[test]
+    fn executor_custom_tool_without_handler_returns_stub() {
+        let mut registry = ToolRegistry::new();
+
+        let tool = define_tool("no_handler").build().expect("should build");
+        registry.register(tool).expect("should register");
+
+        let mut exec = SdkToolExecutor::new(&registry);
+        let result = exec.execute("no_handler", "{}");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("SDK stub"));
+    }
+
+    // --- Additional coverage: Registry edge cases ---
+
+    #[test]
+    fn register_builtin_is_idempotent() {
+        let mut registry = ToolRegistry::new();
+        registry.register_builtin("bash");
+        registry.register_builtin("bash");
+        assert_eq!(registry.tool_names().len(), 1);
+    }
+
+    #[test]
+    fn register_builtin_after_custom_same_name_does_not_duplicate() {
+        let mut registry = ToolRegistry::new();
+
+        let tool = define_tool("bash")
+            .description("Custom bash")
+            .build()
+            .expect("should build");
+        registry.register(tool).expect("should register");
+
+        // register_builtin does not check definitions map, but has_tool checks tool_names
+        // Since the name is already in tool_names, it won't add a duplicate
+        registry.register_builtin("bash");
+        assert_eq!(registry.tool_names().len(), 1);
+        assert_eq!(registry.description("bash"), Some("Custom bash"));
+    }
+
+    #[test]
+    fn validate_input_for_unregistered_tool_passes() {
+        let registry = ToolRegistry::new();
+        // Unregistered tool has no schema, so validation is a no-op
+        assert!(registry.validate_input("nonexistent", &json!({"x": 1})).is_ok());
+    }
+
+    #[test]
+    fn get_definition_returns_none_for_builtin() {
+        let mut registry = ToolRegistry::new();
+        registry.register_builtin("bash");
+        assert!(registry.get_definition("bash").is_none());
+    }
+
+    #[test]
+    fn minimal_tool_definition_builds() {
+        let tool = define_tool("minimal").build().expect("should build");
+        assert_eq!(tool.name, "minimal");
+        assert_eq!(tool.description, "");
+        assert!(tool.input_schema.validate(&json!({})).is_ok());
+    }
+
+    // --- End-to-end integration ---
+
+    #[test]
+    fn full_pipeline_define_register_execute_with_validation() {
+        let mut registry = ToolRegistry::new();
+
+        let tool = define_tool("transform")
+            .description("Transforms input")
+            .input_schema(json!({
+                "type": "object",
+                "required": ["value"],
+                "properties": {
+                    "value": {"type": "integer"}
+                }
+            }))
+            .output_schema(json!({
+                "type": "object",
+                "required": ["doubled"],
+                "properties": {
+                    "doubled": {"type": "number"}
+                }
+            }))
+            .handler(FnToolHandler::new(|input| {
+                let parsed: Value = serde_json::from_str(input).unwrap();
+                let val = parsed["value"].as_i64().unwrap();
+                Ok(json!({"doubled": val * 2}).to_string())
+            }))
+            .build()
+            .expect("should build");
+
+        registry.register(tool).expect("should register");
+
+        // Validate input directly via registry
+        assert!(registry.validate_input("transform", &json!({"value": 5})).is_ok());
+        assert!(registry.validate_input("transform", &json!({"value": "not int"})).is_err());
+
+        // Execute via executor
+        let mut exec = SdkToolExecutor::new(&registry);
+        let result = exec.execute("transform", r#"{"value": 7}"#);
+        assert!(result.is_ok());
+        let output: Value = serde_json::from_str(&result.unwrap()).unwrap();
+        assert_eq!(output["doubled"], 14);
+    }
+
+    #[test]
+    fn schema_validation_error_display_both_branches() {
+        let with_path = SchemaValidationError {
+            path: "field".to_string(),
+            expected: "string".to_string(),
+            actual: "number".to_string(),
+        };
+        let msg = with_path.to_string();
+        assert!(msg.contains("at 'field'"), "should contain path: {msg}");
+
+        let without_path = SchemaValidationError {
+            path: String::new(),
+            expected: "string".to_string(),
+            actual: "number".to_string(),
+        };
+        let msg = without_path.to_string();
+        assert!(!msg.contains("at ''"), "should not contain empty path: {msg}");
     }
 }
