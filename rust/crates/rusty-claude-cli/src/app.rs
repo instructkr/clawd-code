@@ -54,7 +54,7 @@ use crate::tui::permission::{
 use crate::tui::status_bar::{StatusBar, StatusBarState};
 use crate::tui::terminal::TerminalSize;
 use crate::tui::theme::Theme;
-use crate::tui::timeline::{SharedToolCallTimeline, ToolCallTimeline};
+use crate::tui::timeline::SharedToolCallTimeline;
 use crate::{
     AllowedToolSet, RuntimePluginStateBuildOutput, DEFAULT_DATE,
     INTERNAL_PROGRESS_HEARTBEAT_INTERVAL, POST_TOOL_STALL_TIMEOUT,
@@ -1768,6 +1768,7 @@ pub(crate) fn build_runtime_with_plugin_state(
     plugin_registry.initialize()?;
     let policy = permission_policy(permission_mode, &feature_config, &tool_registry)
         .map_err(std::io::Error::other)?;
+    let tool_timeline = Some(SharedToolCallTimeline::default());
     let mut runtime = ConversationRuntime::new_with_features(
         session,
         AnthropicRuntimeClient::new(
@@ -1778,13 +1779,14 @@ pub(crate) fn build_runtime_with_plugin_state(
             allowed_tools.clone(),
             tool_registry.clone(),
             progress_reporter,
+            tool_timeline.clone(),
         )?,
         CliToolExecutor::new(
             allowed_tools.clone(),
             emit_output,
             tool_registry.clone(),
             mcp_state.clone(),
-            None,
+            tool_timeline,
         ),
         policy,
         system_prompt,
@@ -2008,6 +2010,7 @@ pub(crate) struct AnthropicRuntimeClient {
     pub(crate) tool_registry: GlobalToolRegistry,
     pub(crate) progress_reporter: Option<InternalPromptProgressReporter>,
     pub(crate) reasoning_effort: Option<String>,
+    pub(crate) tool_timeline: Option<SharedToolCallTimeline>,
 }
 
 impl AnthropicRuntimeClient {
@@ -2019,6 +2022,7 @@ impl AnthropicRuntimeClient {
         allowed_tools: Option<AllowedToolSet>,
         tool_registry: GlobalToolRegistry,
         progress_reporter: Option<InternalPromptProgressReporter>,
+        tool_timeline: Option<SharedToolCallTimeline>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let resolved_model = api::resolve_model_alias(&model);
         let client = match detect_provider_kind(&resolved_model) {
@@ -2049,6 +2053,7 @@ impl AnthropicRuntimeClient {
             tool_registry,
             progress_reporter,
             reasoning_effort: None,
+            tool_timeline,
         })
     }
 
@@ -2147,7 +2152,6 @@ impl AnthropicRuntimeClient {
         let mut cumulative_output_tokens: u64 = 0;
         let turn_start = std::time::Instant::now();
         let terminal_size = TerminalSize::new();
-        let mut tool_timeline = ToolCallTimeline::new();
 
         loop {
             let next = if apply_stall_timeout && !received_any_event {
@@ -2233,7 +2237,9 @@ impl AnthropicRuntimeClient {
                         if let Some(progress_reporter) = &self.progress_reporter {
                             progress_reporter.mark_tool_phase(&name, &input);
                         }
-                        tool_timeline.start_tool(&name);
+                        if let Some(ref tl) = self.tool_timeline {
+                            tl.with(|t| t.start_tool(&name));
+                        }
                         writeln!(out, "\n{}", format_tool_call_start(&name, &input))
                             .and_then(|()| out.flush())
                             .map_err(|error| RuntimeError::new(error.to_string()))?;
@@ -2294,11 +2300,17 @@ impl AnthropicRuntimeClient {
             .any(|event| matches!(event, AssistantEvent::MessageStop))
         {
             // Render tool timeline if any tools were called
-            if !tool_timeline.events().is_empty() {
-                let timeline_render = tool_timeline.render();
-                write!(out, "{timeline_render}")
-                    .and_then(|()| out.flush())
-                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+            if let Some(ref tl) = self.tool_timeline {
+                let guard =
+                    tl.0.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if !guard.events().is_empty() {
+                    let timeline_render = guard.render();
+                    drop(guard);
+                    write!(out, "{timeline_render}")
+                        .and_then(|()| out.flush())
+                        .map_err(|error| RuntimeError::new(error.to_string()))?;
+                }
             }
             return Ok(events);
         }
@@ -2348,11 +2360,6 @@ impl CliToolExecutor {
             mcp_state,
             tool_timeline,
         }
-    }
-
-    /// Attach a shared timeline so tool execution duration is recorded.
-    pub(crate) fn set_timeline(&mut self, timeline: SharedToolCallTimeline) {
-        self.tool_timeline = Some(timeline);
     }
 
     fn execute_search_tool(&self, value: serde_json::Value) -> Result<String, ToolError> {
