@@ -210,7 +210,7 @@ Repo documentation suite shipped during extended dogfood audit. Status: present/
 
 | Document | Status | Priority | Notes |
 |----------|--------|----------|-------|
-| CODE_OF_CONDUCT.md | ❌ Missing | Low | Standard for public repos |
+| CODE_OF_CONDUCT.md | ✅ Present | Low | Contributor Covenant v2.1 |
 | .github/PULL_REQUEST_TEMPLATE.md | ✅ Present | Medium | Standardizes PR descriptions |
 | docs/CONFIGURATION.md | ✅ Present | High | env vars, settings.json, provider config — relates to #283, #285 |
 | docs/API_REFERENCE.md | ❌ Missing | Medium | JSON envelope schema, output format contract |
