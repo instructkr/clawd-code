@@ -2547,6 +2547,7 @@ pub fn resolve_skill_path(cwd: &Path, skill: &str) -> std::io::Result<PathBuf> {
     ))
 }
 
+#[allow(clippy::unnecessary_wraps)]
 fn render_mcp_report_for(
     loader: &ConfigLoader,
     cwd: &Path,
@@ -2610,6 +2611,7 @@ fn render_mcp_report_for(
     }
 }
 
+#[allow(clippy::unnecessary_wraps)]
 fn render_mcp_report_json_for(
     loader: &ConfigLoader,
     cwd: &Path,
@@ -4179,7 +4181,7 @@ pub fn handle_slash_command(
         | SlashCommand::OutputStyle { .. }
         | SlashCommand::AddDir { .. }
         | SlashCommand::History { .. }
-        | SlashCommand::Setup => None,
+        | SlashCommand::Setup
         | SlashCommand::Unknown(_) => None,
     }
 }

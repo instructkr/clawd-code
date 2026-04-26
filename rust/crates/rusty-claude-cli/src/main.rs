@@ -2,6 +2,13 @@
     dead_code,
     unused_imports,
     unused_variables,
+    clippy::doc_markdown,
+    clippy::len_zero,
+    clippy::manual_string_new,
+    clippy::match_same_arms,
+    clippy::result_large_err,
+    clippy::too_many_lines,
+    clippy::uninlined_format_args,
     clippy::unneeded_struct_pattern,
     clippy::unnecessary_wraps,
     clippy::unused_self
@@ -3623,6 +3630,16 @@ fn run_repl(
                 editor.push_history(input);
                 cli.record_prompt_history(&trimmed);
                 cli.run_turn(&trimmed)?;
+            }
+            input::ReadOutcome::ProviderSwap => {
+                // Ctrl+P triggered — launch setup wizard and hot-swap model
+                setup_wizard::run_setup_wizard()?;
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let config = runtime::ConfigLoader::default_for(&cwd).load().ok();
+                if let Some(new_model) = config.as_ref().and_then(|c| c.provider().model().map(str::to_string)) {
+                    cli.set_model(Some(new_model))?;
+                }
+                println!("{}", format_connected_line(&cli.model));
             }
             input::ReadOutcome::Cancel => {}
             input::ReadOutcome::Exit => {

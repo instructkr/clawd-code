@@ -18,12 +18,12 @@ pub enum ReadOutcome {
     Submit(String),
     Cancel,
     Exit,
+    ProviderSwap,
 }
 
 struct SlashCommandHelper {
     completions: Vec<String>,
     current_line: RefCell<String>,
-    ctrl_p_pending: RefCell<bool>,
 }
 
 impl SlashCommandHelper {
@@ -31,7 +31,6 @@ impl SlashCommandHelper {
         Self {
             completions: normalize_completions(completions),
             current_line: RefCell::new(String::new()),
-            ctrl_p_pending: RefCell::new(false),
         }
     }
 
@@ -88,19 +87,19 @@ impl Hinter for SlashCommandHelper {
 impl Highlighter for SlashCommandHelper {
     fn highlight<'l>(&self, line: &'l str, _pos: usize) -> Cow<'l, str> {
         self.set_current_line(line);
-        Cow::Borrowed(line)
+        // When sentinel is present, show visible prompt instead of invisible char
+        if line.contains('\x01') {
+            let display = line.replace('\x01', "\x1b[36m[Provider Swap]\x1b[0m ");
+            Cow::Owned(display)
+        } else {
+            Cow::Borrowed(line)
+        }
     }
 
     fn highlight_char(&self, line: &str, _pos: usize, _kind: CmdKind) -> bool {
-        // Detect Ctrl+P: when previous line was empty and the new line is
-        // just "P", that's Ctrl+P on an empty buffer (AcceptLine inserts
-        // the character then submits). Set flag so read_line can intercept.
-        let prev = self.current_line();
-        if prev.is_empty() && line == "P" {
-            *self.ctrl_p_pending.borrow_mut() = true;
-        }
         self.set_current_line(line);
-        false
+        // Re-highlight when sentinel is present to show the prompt
+        line.contains('\x01')
     }
 }
 
@@ -124,10 +123,12 @@ impl LineEditor {
         editor.set_helper(Some(SlashCommandHelper::new(completions)));
         editor.bind_sequence(KeyEvent(KeyCode::Char('J'), Modifiers::CTRL), Cmd::Newline);
         editor.bind_sequence(KeyEvent(KeyCode::Enter, Modifiers::SHIFT), Cmd::Newline);
-        // Ctrl+P: accept line to trigger provider wizard in the REPL loop
+        // Ctrl+P inserts a sentinel character that triggers provider swap.
+        // The sentinel is invisible but the highlighter shows "[Provider Swap]" prompt.
+        // User must press Enter to confirm (rustyline cannot chain commands).
         editor.bind_sequence(
             KeyEvent(KeyCode::Char('P'), Modifiers::CTRL),
-            Cmd::AcceptLine,
+            Cmd::SelfInsert(1, '\x01'),
         );
 
         Self {
@@ -162,16 +163,10 @@ impl LineEditor {
 
         match self.editor.readline(&self.prompt) {
             Ok(line) => {
-                // Check if Ctrl+P was detected by the highlighter.
-                // The highlighter sets a flag when it sees the previous
-                // empty line change to uppercase "P", which is what
-                // Ctrl+P + AcceptLine produces on an empty buffer.
-                let is_ctrl_p = self
-                    .editor
-                    .helper()
-                    .is_some_and(|h| h.ctrl_p_pending.replace(false));
-                if is_ctrl_p {
-                    return Ok(ReadOutcome::Submit("/setup".to_string()));
+                // Ctrl+P inserts \x01 sentinel — triggers provider swap wizard.
+                // The sentinel is stripped and we return ProviderSwap to the REPL loop.
+                if line.contains('\x01') {
+                    return Ok(ReadOutcome::ProviderSwap);
                 }
                 Ok(ReadOutcome::Submit(line))
             }

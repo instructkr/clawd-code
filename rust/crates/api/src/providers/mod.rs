@@ -264,14 +264,14 @@ pub fn provider_config_value(key: &str) -> Option<String> {
     let provider = config.provider();
     let kind = provider.kind()?;
     match (key, kind) {
-        ("ANTHROPIC_API_KEY" | "ANTHROPIC_AUTH_TOKEN", "anthropic") => provider.api_key().map(ToOwned::to_owned),
-        ("ANTHROPIC_BASE_URL", "anthropic") => provider.base_url().map(ToOwned::to_owned),
-        ("XAI_API_KEY", "xai") => provider.api_key().map(ToOwned::to_owned),
-        ("XAI_BASE_URL", "xai") => provider.base_url().map(ToOwned::to_owned),
-        ("OPENAI_API_KEY", "openai") => provider.api_key().map(ToOwned::to_owned),
-        ("OPENAI_BASE_URL", "openai") => provider.base_url().map(ToOwned::to_owned),
-        ("DASHSCOPE_API_KEY", "dashscope") => provider.api_key().map(ToOwned::to_owned),
-        ("DASHSCOPE_BASE_URL", "dashscope") => provider.base_url().map(ToOwned::to_owned),
+        ("ANTHROPIC_API_KEY" | "ANTHROPIC_AUTH_TOKEN", "anthropic")
+        | ("XAI_API_KEY", "xai")
+        | ("OPENAI_API_KEY", "openai")
+        | ("DASHSCOPE_API_KEY", "dashscope") => provider.api_key().map(ToOwned::to_owned),
+        ("ANTHROPIC_BASE_URL", "anthropic")
+        | ("XAI_BASE_URL", "xai")
+        | ("OPENAI_BASE_URL", "openai")
+        | ("DASHSCOPE_BASE_URL", "dashscope") => provider.base_url().map(ToOwned::to_owned),
         _ => None,
     }
 }
@@ -293,7 +293,7 @@ pub fn read_env_or_config(key: &str) -> Result<Option<String>, ApiError> {
     Ok(None)
 }
 
-/// Return the stored ProviderKind from config, if set.
+/// Return the stored `ProviderKind` from config, if set.
 fn stored_provider_kind() -> Option<ProviderKind> {
     let cwd = std::env::current_dir().ok()?;
     let config = runtime::ConfigLoader::default_for(&cwd).load().ok()?;

@@ -81,8 +81,7 @@ fn prompt_provider(current: &RuntimeProviderConfig) -> Result<String, Box<dyn st
     let default = PROVIDERS
         .iter()
         .position(|(_, _, k)| *k == current_kind)
-        .map(|i| (i + 1).to_string())
-        .unwrap_or_else(|| "1".to_string());
+        .map_or_else(|| "1".to_string(), |i| (i + 1).to_string());
 
     let input = read_line(&format!("  Select provider [{default}]: "))?;
     let choice = if input.trim().is_empty() {
@@ -107,8 +106,7 @@ fn prompt_api_key(
     let env_var = API_KEY_ENV_VARS
         .iter()
         .find(|(k, _)| *k == kind)
-        .map(|(_, v)| *v)
-        .unwrap_or("API_KEY");
+        .map_or("API_KEY", |(_, v)| *v);
 
     let current_key = current.api_key();
     let hint = match current_key {
@@ -152,8 +150,7 @@ fn prompt_base_url(
     let default_url = DEFAULT_BASE_URLS
         .iter()
         .find(|(k, _)| *k == kind)
-        .map(|(_, v)| *v)
-        .unwrap_or("");
+        .map_or("", |(_, v)| *v);
 
     let current_url = current.base_url().unwrap_or(default_url);
     let display = if current_url.is_empty() {
@@ -193,11 +190,11 @@ fn prompt_model(
     kind: &str,
     current: &RuntimeProviderConfig,
 ) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let empty: &[&str] = &[];
     let aliases = PROVIDER_MODELS
         .iter()
         .find(|(k, _)| *k == kind)
-        .map(|(_, models)| *models)
-        .unwrap_or(&[]);
+        .map_or(empty, |(_, models)| *models);
 
     let current_model = current.model().unwrap_or(aliases.first().copied().unwrap_or(""));
 
