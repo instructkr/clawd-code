@@ -2338,20 +2338,22 @@ pub fn handle_agents_slash_command_json(args: Option<&str>, cwd: &Path) -> std::
     }
 }
 
+#[allow(clippy::unnecessary_wraps)]
 pub fn handle_mcp_slash_command(
     args: Option<&str>,
     cwd: &Path,
 ) -> Result<String, runtime::ConfigError> {
     let loader = ConfigLoader::default_for(cwd);
-    render_mcp_report_for(&loader, cwd, args)
+    Ok(render_mcp_report_for(&loader, cwd, args))
 }
 
+#[allow(clippy::unnecessary_wraps)]
 pub fn handle_mcp_slash_command_json(
     args: Option<&str>,
     cwd: &Path,
 ) -> Result<Value, runtime::ConfigError> {
     let loader = ConfigLoader::default_for(cwd);
-    render_mcp_report_json_for(&loader, cwd, args)
+    Ok(render_mcp_report_json_for(&loader, cwd, args))
 }
 
 pub fn handle_skills_slash_command(args: Option<&str>, cwd: &Path) -> std::io::Result<String> {
@@ -2537,18 +2539,14 @@ pub fn resolve_skill_path(cwd: &Path, skill: &str) -> std::io::Result<PathBuf> {
     ))
 }
 
-fn render_mcp_report_for(
-    loader: &ConfigLoader,
-    cwd: &Path,
-    args: Option<&str>,
-) -> Result<String, runtime::ConfigError> {
+fn render_mcp_report_for(loader: &ConfigLoader, cwd: &Path, args: Option<&str>) -> String {
     if let Some(args) = normalize_optional_args(args) {
         if let Some(help_path) = help_path_from_args(args) {
-            return Ok(match help_path.as_slice() {
+            return match help_path.as_slice() {
                 [] => render_mcp_usage(None),
                 ["show", ..] => render_mcp_usage(Some("show")),
                 _ => render_mcp_usage(Some(&help_path.join(" "))),
-            });
+            };
         }
     }
 
@@ -2558,60 +2556,55 @@ fn render_mcp_report_for(
             // as #143 for `status`). Text mode prepends a "Config load error"
             // block before the MCP list; the list falls back to empty.
             match loader.load() {
-                Ok(runtime_config) => Ok(render_mcp_summary_report(
-                    cwd,
-                    runtime_config.mcp().servers(),
-                )),
+                Ok(runtime_config) => {
+                    render_mcp_summary_report(cwd, runtime_config.mcp().servers())
+                }
                 Err(err) => {
                     let empty = std::collections::BTreeMap::new();
-                    Ok(format!(
+                    format!(
                         "Config load error\n  Status           fail\n  Summary          runtime config failed to load; reporting partial MCP view\n  Details          {err}\n  Hint             `claw doctor` classifies config parse errors; fix the listed field and rerun\n\n{}",
                         render_mcp_summary_report(cwd, &empty)
-                    ))
+                    )
                 }
             }
         }
-        Some(args) if is_help_arg(args) => Ok(render_mcp_usage(None)),
-        Some("show") => Ok(render_mcp_usage(Some("show"))),
+        Some(args) if is_help_arg(args) => render_mcp_usage(None),
+        Some("show") => render_mcp_usage(Some("show")),
         Some(args) if args.split_whitespace().next() == Some("show") => {
             let mut parts = args.split_whitespace();
             let _ = parts.next();
             let Some(server_name) = parts.next() else {
-                return Ok(render_mcp_usage(Some("show")));
+                return render_mcp_usage(Some("show"));
             };
             if parts.next().is_some() {
-                return Ok(render_mcp_usage(Some(args)));
+                return render_mcp_usage(Some(args));
             }
             // #144: same degradation for `mcp show`; if config won't parse,
             // the specific server lookup can't succeed, so report the parse
             // error with context.
             match loader.load() {
-                Ok(runtime_config) => Ok(render_mcp_server_report(
+                Ok(runtime_config) => render_mcp_server_report(
                     cwd,
                     server_name,
                     runtime_config.mcp().get(server_name),
-                )),
-                Err(err) => Ok(format!(
+                ),
+                Err(err) => format!(
                     "Config load error\n  Status           fail\n  Summary          runtime config failed to load; cannot resolve `{server_name}`\n  Details          {err}\n  Hint             `claw doctor` classifies config parse errors; fix the listed field and rerun"
-                )),
+                ),
             }
         }
-        Some(args) => Ok(render_mcp_usage(Some(args))),
+        Some(args) => render_mcp_usage(Some(args)),
     }
 }
 
-fn render_mcp_report_json_for(
-    loader: &ConfigLoader,
-    cwd: &Path,
-    args: Option<&str>,
-) -> Result<Value, runtime::ConfigError> {
+fn render_mcp_report_json_for(loader: &ConfigLoader, cwd: &Path, args: Option<&str>) -> Value {
     if let Some(args) = normalize_optional_args(args) {
         if let Some(help_path) = help_path_from_args(args) {
-            return Ok(match help_path.as_slice() {
+            return match help_path.as_slice() {
                 [] => render_mcp_usage_json(None),
                 ["show", ..] => render_mcp_usage_json(Some("show")),
                 _ => render_mcp_usage_json(Some(&help_path.join(" "))),
-            });
+            };
         }
     }
 
@@ -2623,15 +2616,13 @@ fn render_mcp_report_json_for(
             // runs, the existing serializer adds `status: "ok"` below.
             match loader.load() {
                 Ok(runtime_config) => {
-                    let mut value = render_mcp_summary_report_json(
-                        cwd,
-                        runtime_config.mcp().servers(),
-                    );
+                    let mut value =
+                        render_mcp_summary_report_json(cwd, runtime_config.mcp().servers());
                     if let Some(map) = value.as_object_mut() {
                         map.insert("status".to_string(), Value::String("ok".to_string()));
                         map.insert("config_load_error".to_string(), Value::Null);
                     }
-                    Ok(value)
+                    value
                 }
                 Err(err) => {
                     let empty = std::collections::BTreeMap::new();
@@ -2643,20 +2634,20 @@ fn render_mcp_report_json_for(
                             Value::String(err.to_string()),
                         );
                     }
-                    Ok(value)
+                    value
                 }
             }
         }
-        Some(args) if is_help_arg(args) => Ok(render_mcp_usage_json(None)),
-        Some("show") => Ok(render_mcp_usage_json(Some("show"))),
+        Some(args) if is_help_arg(args) => render_mcp_usage_json(None),
+        Some("show") => render_mcp_usage_json(Some("show")),
         Some(args) if args.split_whitespace().next() == Some("show") => {
             let mut parts = args.split_whitespace();
             let _ = parts.next();
             let Some(server_name) = parts.next() else {
-                return Ok(render_mcp_usage_json(Some("show")));
+                return render_mcp_usage_json(Some("show"));
             };
             if parts.next().is_some() {
-                return Ok(render_mcp_usage_json(Some(args)));
+                return render_mcp_usage_json(Some(args));
             }
             // #144: same degradation pattern for show action.
             match loader.load() {
@@ -2670,19 +2661,19 @@ fn render_mcp_report_json_for(
                         map.insert("status".to_string(), Value::String("ok".to_string()));
                         map.insert("config_load_error".to_string(), Value::Null);
                     }
-                    Ok(value)
+                    value
                 }
-                Err(err) => Ok(serde_json::json!({
+                Err(err) => serde_json::json!({
                     "kind": "mcp",
                     "action": "show",
                     "server": server_name,
                     "status": "degraded",
                     "config_load_error": err.to_string(),
                     "working_directory": cwd.display().to_string(),
-                })),
+                }),
             }
         }
-        Some(args) => Ok(render_mcp_usage_json(Some(args))),
+        Some(args) => render_mcp_usage_json(Some(args)),
     }
 }
 
@@ -5423,8 +5414,7 @@ mod tests {
         .expect("write local settings");
 
         let loader = ConfigLoader::new(&workspace, &config_home);
-        let list = super::render_mcp_report_for(&loader, &workspace, None)
-            .expect("mcp list report should render");
+        let list = super::render_mcp_report_for(&loader, &workspace, None);
         assert!(list.contains("Configured servers 2"));
         assert!(list.contains("alpha"));
         assert!(list.contains("stdio"));
@@ -5435,21 +5425,18 @@ mod tests {
         assert!(list.contains("local"));
         assert!(list.contains("wss://remote.example/mcp"));
 
-        let show = super::render_mcp_report_for(&loader, &workspace, Some("show alpha"))
-            .expect("mcp show report should render");
+        let show = super::render_mcp_report_for(&loader, &workspace, Some("show alpha"));
         assert!(show.contains("Name              alpha"));
         assert!(show.contains("Command           uvx"));
         assert!(show.contains("Args              alpha-server"));
         assert!(show.contains("Env keys          ALPHA_TOKEN"));
         assert!(show.contains("Tool timeout      1200 ms"));
 
-        let remote = super::render_mcp_report_for(&loader, &workspace, Some("show remote"))
-            .expect("mcp show remote report should render");
+        let remote = super::render_mcp_report_for(&loader, &workspace, Some("show remote"));
         assert!(remote.contains("Transport         ws"));
         assert!(remote.contains("URL               wss://remote.example/mcp"));
 
-        let missing = super::render_mcp_report_for(&loader, &workspace, Some("show missing"))
-            .expect("missing report should render");
+        let missing = super::render_mcp_report_for(&loader, &workspace, Some("show missing"));
         assert!(missing.contains("server `missing` is not configured"));
 
         let _ = fs::remove_dir_all(workspace);
@@ -5500,8 +5487,7 @@ mod tests {
         .expect("write local settings");
 
         let loader = ConfigLoader::new(&workspace, &config_home);
-        let list =
-            render_mcp_report_json_for(&loader, &workspace, None).expect("mcp list json render");
+        let list = render_mcp_report_json_for(&loader, &workspace, None);
         assert_eq!(list["kind"], "mcp");
         assert_eq!(list["action"], "list");
         assert_eq!(list["configured_servers"], 2);
@@ -5516,21 +5502,18 @@ mod tests {
             "wss://remote.example/mcp"
         );
 
-        let show = render_mcp_report_json_for(&loader, &workspace, Some("show alpha"))
-            .expect("mcp show json render");
+        let show = render_mcp_report_json_for(&loader, &workspace, Some("show alpha"));
         assert_eq!(show["action"], "show");
         assert_eq!(show["found"], true);
         assert_eq!(show["server"]["name"], "alpha");
         assert_eq!(show["server"]["details"]["env_keys"][0], "ALPHA_TOKEN");
         assert_eq!(show["server"]["details"]["tool_call_timeout_ms"], 1200);
 
-        let missing = render_mcp_report_json_for(&loader, &workspace, Some("show missing"))
-            .expect("mcp missing json render");
+        let missing = render_mcp_report_json_for(&loader, &workspace, Some("show missing"));
         assert_eq!(missing["found"], false);
         assert_eq!(missing["server_name"], "missing");
 
-        let help =
-            render_mcp_report_json_for(&loader, &workspace, Some("help")).expect("mcp help json");
+        let help = render_mcp_report_json_for(&loader, &workspace, Some("help"));
         assert_eq!(help["action"], "help");
         assert_eq!(help["usage"]["sources"][0], ".claw/settings.json");
 
@@ -5565,8 +5548,7 @@ mod tests {
 
         let loader = ConfigLoader::new(&workspace, &config_home);
         // list action: must return Ok (not Err) with degraded envelope.
-        let list = render_mcp_report_json_for(&loader, &workspace, None)
-            .expect("mcp list should not hard-fail on config parse errors (#144)");
+        let list = render_mcp_report_json_for(&loader, &workspace, None);
         assert_eq!(list["kind"], "mcp");
         assert_eq!(list["action"], "list");
         assert_eq!(
@@ -5585,8 +5567,7 @@ mod tests {
         assert!(list["servers"].as_array().unwrap().is_empty());
 
         // show action: should also degrade (not hard-fail).
-        let show = render_mcp_report_json_for(&loader, &workspace, Some("show everything"))
-            .expect("mcp show should not hard-fail on config parse errors (#144)");
+        let show = render_mcp_report_json_for(&loader, &workspace, Some("show everything"));
         assert_eq!(show["kind"], "mcp");
         assert_eq!(show["action"], "show");
         assert_eq!(
@@ -5600,8 +5581,7 @@ mod tests {
         let clean_ws = temp_dir("mcp-degrades-144-clean");
         fs::create_dir_all(&clean_ws).expect("clean ws");
         let clean_loader = ConfigLoader::new(&clean_ws, &config_home);
-        let clean_list = render_mcp_report_json_for(&clean_loader, &clean_ws, None)
-            .expect("clean mcp list should succeed");
+        let clean_list = render_mcp_report_json_for(&clean_loader, &clean_ws, None);
         assert_eq!(
             clean_list["status"].as_str(),
             Some("ok"),

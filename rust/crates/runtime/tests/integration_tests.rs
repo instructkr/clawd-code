@@ -22,7 +22,7 @@ fn stale_branch_detection_flows_into_policy_engine() {
     let stale_context = LaneContext::new(
         "stale-lane",
         0,
-        Duration::from_secs(2 * 60 * 60), // 2 hours stale
+        Duration::from_hours(2), // 2 hours stale
         LaneBlocker::None,
         ReviewStatus::Pending,
         DiffScope::Full,
@@ -49,7 +49,7 @@ fn fresh_branch_does_not_trigger_stale_policy() {
     let fresh_context = LaneContext::new(
         "fresh-lane",
         0,
-        Duration::from_secs(30 * 60), // 30 min stale — under 1 hour threshold
+        Duration::from_mins(30), // 30 min stale — under 1 hour threshold
         LaneBlocker::None,
         ReviewStatus::Pending,
         DiffScope::Full,
@@ -213,7 +213,7 @@ fn end_to_end_stale_lane_gets_merge_forward_action() {
     let context = LaneContext::new(
         "lane-9411",
         3,                                // Workspace green
-        Duration::from_secs(5 * 60 * 60), // 5 hours stale, definitely over threshold
+        Duration::from_hours(5), // 5 hours stale, definitely over threshold
         LaneBlocker::None,
         ReviewStatus::Approved,
         DiffScope::Scoped,
@@ -262,7 +262,7 @@ fn fresh_approved_lane_gets_merge_action() {
     let context = LaneContext::new(
         "fresh-approved-lane",
         3,                            // Workspace green
-        Duration::from_secs(30 * 60), // 30 min — under 1 hour threshold = fresh
+        Duration::from_mins(30), // 30 min — under 1 hour threshold = fresh
         LaneBlocker::None,
         ReviewStatus::Approved,
         DiffScope::Scoped,
@@ -347,7 +347,7 @@ fn worker_provider_failure_flows_through_recovery_to_policy() {
     // (Simulating the policy check that would happen after successful recovery)
     let recovery_success = matches!(result, RecoveryResult::Recovered { .. });
     let green_level = 3; // Workspace green
-    let not_stale = Duration::from_secs(30 * 60); // 30 min — fresh
+    let not_stale = Duration::from_mins(30); // 30 min — fresh
 
     let post_recovery_context = LaneContext::new(
         "recovered-lane",
