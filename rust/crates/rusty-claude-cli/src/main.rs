@@ -3152,12 +3152,13 @@ fn run_resume_command(
             json: Some(serde_json::json!({ "kind": "help", "text": render_repl_help() })),
         }),
         SlashCommand::Compact => {
-            let result = runtime::compact_session(
+            let result = runtime::trident::trident_compact_session(
                 session,
                 CompactionConfig {
                     max_estimated_tokens: 0,
                     ..CompactionConfig::default()
                 },
+                &runtime::trident::TridentConfig::default(),
             );
             let removed = result.removed_message_count;
             let kept = result.compacted_session.messages.len();
@@ -4385,13 +4386,15 @@ impl LiveCli {
                     println!("  Auto-compacting session and retrying...");
                     
                     // Step 1: Compact the session to free up context space
-                    // We set max_estimated_tokens to 0 to compact as aggressively as needed
-                    let result = runtime::compact_session(
+                    // Run the Trident compaction pipeline (supersede + collapse + cluster)
+                    // then apply summary-based compaction for maximum context reduction
+                    let result = runtime::trident::trident_compact_session(
                         runtime.session(),
                         CompactionConfig {
                             max_estimated_tokens: 0,
                             ..CompactionConfig::default()
                         },
+                        &runtime::trident::TridentConfig::default(),
                     );
                     let removed = result.removed_message_count;
                     
