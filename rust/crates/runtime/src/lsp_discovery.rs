@@ -100,13 +100,16 @@ pub fn known_lsp_servers() -> Vec<LspServerDescriptor> {
 /// Check whether a command exists on the user's PATH by attempting to run it
 /// with `--version`. Returns `true` if the command could be spawned
 /// successfully, `false` otherwise.
+///
+/// Some LSP servers (like rust-analyzer via rustup) exit non-zero on --version
+/// but are still functional. We treat "spawned successfully" as found, regardless
+/// of the exit code. Only a failure to spawn (command not found) returns false.
 #[must_use]
 pub fn command_exists_on_path(command: &str) -> bool {
     Command::new(command)
         .arg("--version")
         .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
+        .map_or(false, |_| true)
 }
 
 /// Discover LSP servers that are actually installed on the current system.
