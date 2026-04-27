@@ -9315,7 +9315,8 @@ mod tests {
             body: String::new(),
             retryable: true,
             suggested_action: None,
-        };
+            retry_after: None,
+};
 
         let rendered = format_user_visible_api_error("session-issue-22", &error);
         assert!(rendered.contains("provider_internal"));
@@ -9338,7 +9339,8 @@ mod tests {
                 body: String::new(),
                 retryable: true,
                 suggested_action: None,
-            }),
+                retry_after: None,
+}),
         };
 
         let rendered = format_user_visible_api_error("session-issue-22", &error);
@@ -9402,7 +9404,8 @@ mod tests {
             body: String::new(),
             retryable: false,
             suggested_action: None,
-        };
+            retry_after: None,
+};
 
         let rendered = format_user_visible_api_error("session-issue-32", &error);
         assert!(rendered.contains("context_window_blocked"), "{rendered}");
@@ -9434,7 +9437,8 @@ mod tests {
                 body: String::new(),
                 retryable: false,
                 suggested_action: None,
-            }),
+                retry_after: None,
+}),
         };
 
         let rendered = format_user_visible_api_error("session-issue-32", &error);

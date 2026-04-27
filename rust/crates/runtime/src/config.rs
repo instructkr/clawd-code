@@ -57,6 +57,25 @@ pub struct LspServerConfig {
     pub command: String,
     pub args: Vec<String>,
     pub enabled: bool,
+/// API timeout and retry configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiTimeoutConfig {
+    /// Connect timeout in seconds. Defaults to 30.
+    pub connect_timeout_secs: u64,
+    /// Request timeout in seconds. Defaults to 300 (5 minutes).
+    pub request_timeout_secs: u64,
+    /// Maximum retry attempts on transient failures. Defaults to 8.
+    pub max_retries: u32,
+}
+
+impl Default for ApiTimeoutConfig {
+    fn default() -> Self {
+        Self {
+            connect_timeout_secs: 30,
+            request_timeout_secs: 300,
+            max_retries: 8,
+        }
+    }
 }
 
 /// Structured feature configuration consumed by runtime subsystems.
@@ -128,6 +147,7 @@ impl RuntimeProviderConfig {
     pub fn model(&self) -> Option<&str> {
         self.model.as_deref()
     }
+    api_timeout: ApiTimeoutConfig,
 }
 
 /// Ordered chain of fallback model identifiers used when the primary
@@ -385,6 +405,7 @@ impl ConfigLoader {
                 .and_then(|o| o.get("lspAutoStart"))
                 .and_then(JsonValue::as_bool)
                 .unwrap_or(true),
+            api_timeout: parse_optional_api_timeout_config(&merged_value)?,
         };
 
         Ok(RuntimeConfig {
@@ -1088,6 +1109,28 @@ fn parse_optional_provider_fallbacks(
     let fallbacks = optional_string_array(entry, "fallbacks", "merged settings.providerFallbacks")?
         .unwrap_or_default();
     Ok(ProviderFallbackConfig { primary, fallbacks })
+}
+
+fn parse_optional_api_timeout_config(root: &JsonValue) -> Result<ApiTimeoutConfig, ConfigError> {
+    let Some(timeout_value) = root.as_object().and_then(|obj| obj.get("apiTimeout")) else {
+        return Ok(ApiTimeoutConfig::default());
+    };
+    let Some(obj) = timeout_value.as_object() else {
+        return Ok(ApiTimeoutConfig::default());
+    };
+    let context = "merged settings.apiTimeout";
+    let connect_timeout_secs = optional_u64(obj, "connectTimeout", context)?
+        .unwrap_or(30);
+    let request_timeout_secs = optional_u64(obj, "requestTimeout", context)?
+        .unwrap_or(300);
+    let max_retries = optional_u64(obj, "maxRetries", context)?
+        .map(|v| v as u32)
+        .unwrap_or(8);
+    Ok(ApiTimeoutConfig {
+        connect_timeout_secs,
+        request_timeout_secs,
+        max_retries,
+    })
 }
 
 fn parse_optional_trusted_roots(root: &JsonValue) -> Result<Vec<String>, ConfigError> {

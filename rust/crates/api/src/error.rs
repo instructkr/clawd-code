@@ -55,6 +55,9 @@ pub enum ApiError {
         retryable: bool,
         /// Suggested user action based on error type (e.g., "Reduce prompt size" for 413)
         suggested_action: Option<String>,
+        /// Parsed Retry-After header value (seconds) for 429 responses.
+        /// When present, overrides the exponential backoff delay.
+        retry_after: Option<Duration>,
     },
     RetriesExhausted {
         attempts: u32,
@@ -123,6 +126,18 @@ impl ApiError {
     }
 
     #[must_use]
+    /// Return the `Retry-After` delay if this error came from a 429 response
+    /// that included a `retry-after` header. Callers should prefer this value
+    /// over the computed backoff delay when it exists.
+    #[must_use]
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::Api { retry_after, .. } => *retry_after,
+            Self::RetriesExhausted { last_error, .. } => last_error.retry_after(),
+            _ => None,
+        }
+    }
+
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::Http(error) => error.is_connect() || error.is_timeout() || error.is_request(),
@@ -491,6 +506,7 @@ mod tests {
             body: String::new(),
             retryable: true,
             suggested_action: None,
+        retry_after: None,
         };
 
         assert!(error.is_generic_fatal_wrapper());
@@ -514,6 +530,7 @@ mod tests {
                 body: String::new(),
                 retryable: true,
                 suggested_action: None,
+            retry_after: None,
             }),
         };
 
@@ -535,6 +552,7 @@ mod tests {
             body: String::new(),
             retryable: false,
             suggested_action: None,
+        retry_after: None,
         };
 
         assert!(error.is_context_window_failure());
