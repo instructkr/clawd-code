@@ -158,10 +158,18 @@ impl SessionStore {
     }
 
     pub fn latest_session(&self) -> Result<ManagedSessionSummary, SessionControlError> {
-        self.list_sessions()?
-            .into_iter()
-            .next()
-            .ok_or_else(|| SessionControlError::Format(format_no_managed_sessions(&self.sessions_root)))
+        // First: look in the current workspace's session namespace
+        if let Some(latest) = self.list_sessions()?.into_iter().next() {
+            return Ok(latest);
+        }
+        // Fallback: scan all workspace namespaces under ~/.claw/sessions/
+        // so that /resume latest can find sessions from other workspaces
+        if let Some(latest) = self.scan_global_sessions()?.into_iter().next() {
+            return Ok(latest);
+        }
+        Err(SessionControlError::Format(format_no_managed_sessions(
+            &self.sessions_root,
+        )))
     }
 
     pub fn load_session(
@@ -178,6 +186,38 @@ impl SessionStore {
             },
             session,
         })
+    }
+
+    /// Load a session by reference, allowing cross-workspace resume for aliases.
+    /// When the reference is an alias ("latest", "last", "recent"), workspace
+    /// mismatch validation is skipped so `/resume latest` works across workspaces.
+    /// For explicit session references, workspace validation is still enforced.
+    pub fn load_session_loose(
+        &self,
+        reference: &str,
+    ) -> Result<LoadedManagedSession, SessionControlError> {
+        match self.load_session(reference) {
+            Ok(loaded) => Ok(loaded),
+            Err(SessionControlError::WorkspaceMismatch { expected, actual })
+                if is_session_reference_alias(reference) =>
+            {
+                let handle = self.resolve_reference(reference)?;
+                let session = Session::load_from_path(&handle.path)?;
+                eprintln!(
+                    "  Note: resuming session from a different workspace (origin: {})",
+                    actual.display()
+                );
+                let _ = expected; // suppress unused warning
+                Ok(LoadedManagedSession {
+                    handle: SessionHandle {
+                        id: session.session_id.clone(),
+                        path: handle.path,
+                    },
+                    session,
+                })
+            }
+            Err(other) => Err(other),
+        }
     }
 
     pub fn fork_session(
@@ -209,6 +249,47 @@ impl SessionStore {
             .parent()
             .filter(|parent| parent.file_name().is_some_and(|name| name == "sessions"))
             .map(Path::to_path_buf)
+    }
+
+    /// Scan all known session storage locations for sessions from any workspace.
+    /// Checks both the global root (~/.claw/sessions/) and the project-local
+    /// .claw/sessions/ parent directory. Used as a fallback when the current
+    /// workspace has no sessions.
+    #[allow(clippy::unnecessary_wraps)]
+    fn scan_global_sessions(&self) -> Result<Vec<ManagedSessionSummary>, SessionControlError> {
+        let mut sessions = Vec::new();
+
+        // Scan global root: ~/.claw/sessions/<fingerprint>/
+        let global_root = global_sessions_root();
+        if let Ok(entries) = fs::read_dir(&global_root) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    let _ = Self::collect_sessions_from_dir_unvalidated(&path, &mut sessions);
+                }
+            }
+        }
+
+        // Scan project-local parent: <cwd>/.claw/sessions/<fingerprint>/
+        // Sessions are stored here by from_cwd(), so we must check all
+        // fingerprint subdirs, not just the current workspace's.
+        if let Some(local_parent) = self.legacy_sessions_root() {
+            if let Ok(entries) = fs::read_dir(&local_parent) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() && path != self.sessions_root {
+                        let _ = Self::collect_sessions_from_dir_unvalidated(&path, &mut sessions);
+                    } else if path == self.sessions_root {
+                        // Already searched in list_sessions(), but include here
+                        // in case this is called standalone
+                        let _ = Self::collect_sessions_from_dir_unvalidated(&path, &mut sessions);
+                    }
+                }
+            }
+        }
+
+        sort_managed_sessions(&mut sessions);
+        Ok(sessions)
     }
 
     fn validate_loaded_session(
@@ -295,6 +376,65 @@ impl SessionStore {
         }
         Ok(())
     }
+
+    /// Like `collect_sessions_from_dir` but skips workspace validation.
+    /// Used by the global scan fallback to discover sessions from any workspace.
+    fn collect_sessions_from_dir_unvalidated(
+        directory: &Path,
+        sessions: &mut Vec<ManagedSessionSummary>,
+    ) -> Result<(), SessionControlError> {
+        let entries = match fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(err.into()),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if !is_managed_session_file(&path) {
+                continue;
+            }
+            let metadata = entry.metadata()?;
+            let modified_epoch_millis = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_millis())
+                .unwrap_or_default();
+            let summary = match Session::load_from_path(&path) {
+                Ok(session) => ManagedSessionSummary {
+                    id: session.session_id,
+                    path,
+                    updated_at_ms: session.updated_at_ms,
+                    modified_epoch_millis,
+                    message_count: session.messages.len(),
+                    parent_session_id: session
+                        .fork
+                        .as_ref()
+                        .map(|fork| fork.parent_session_id.clone()),
+                    branch_name: session
+                        .fork
+                        .as_ref()
+                        .and_then(|fork| fork.branch_name.clone()),
+                },
+                Err(_) => ManagedSessionSummary {
+                    id: path
+                        .file_stem()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or("unknown")
+                        .to_string(),
+                    path,
+                    updated_at_ms: 0,
+                    modified_epoch_millis,
+                    message_count: 0,
+                    parent_session_id: None,
+                    branch_name: None,
+                },
+            };
+            sessions.push(summary);
+        }
+        Ok(())
+    }
 }
 
 /// Stable hex fingerprint of a workspace path.
@@ -310,6 +450,13 @@ pub fn workspace_fingerprint(workspace_root: &Path) -> String {
         hash = hash.wrapping_mul(0x0100_0000_01b3);
     }
     format!("{hash:016x}")
+}
+
+/// The global sessions directory shared across all workspaces.
+/// Points to `~/.claw/sessions/` (or `$CLAW_CONFIG_HOME/sessions/`).
+#[must_use]
+pub fn global_sessions_root() -> PathBuf {
+    crate::config::default_config_home().join("sessions")
 }
 
 pub const PRIMARY_SESSION_EXTENSION: &str = "jsonl";
@@ -540,7 +687,7 @@ fn format_no_managed_sessions(sessions_root: &Path) -> String {
         .and_then(|f| f.to_str())
         .unwrap_or("<unknown>");
     format!(
-        "no managed sessions found in .claw/sessions/{fingerprint_dir}/\nStart `claw` to create a session, then rerun with `--resume {LATEST_SESSION_REFERENCE}`.\nNote: claw partitions sessions per workspace fingerprint; sessions from other CWDs are invisible."
+        "no managed sessions found in .claw/sessions/{fingerprint_dir}/\nStart `claw` to create a session, then rerun with `--resume {LATEST_SESSION_REFERENCE}`.\nNote: /resume {LATEST_SESSION_REFERENCE} searches all workspaces."
     )
 }
 

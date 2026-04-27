@@ -5396,9 +5396,16 @@ fn latest_managed_session() -> Result<ManagedSessionSummary, Box<dyn std::error:
 fn load_session_reference(
     reference: &str,
 ) -> Result<(SessionHandle, Session), Box<dyn std::error::Error>> {
-    let loaded = current_session_store()?
-        .load_session(reference)
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+    let store = current_session_store()?;
+    // For alias references ("latest", "last", "recent"), allow cross-workspace
+    // resume so /resume latest finds the most recent session globally.
+    // For explicit references, workspace validation is enforced.
+    let result = if runtime::session_control::is_session_reference_alias(reference) {
+        store.load_session_loose(reference)
+    } else {
+        store.load_session(reference)
+    };
+    let loaded = result.map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
     Ok((
         SessionHandle {
             id: loaded.handle.id,
