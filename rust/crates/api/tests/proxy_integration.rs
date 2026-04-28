@@ -36,6 +36,7 @@ impl Drop for EnvVarGuard {
 }
 
 #[test]
+#[cfg(not(windows))]
 fn proxy_config_from_env_reads_uppercase_proxy_vars() {
     // given
     let _lock = env_lock();
@@ -50,6 +51,28 @@ fn proxy_config_from_env_reads_uppercase_proxy_vars() {
     let config = ProxyConfig::from_env();
 
     // then
+    assert_eq!(config.http_proxy.as_deref(), Some("http://proxy.corp:3128"));
+    assert_eq!(
+        config.https_proxy.as_deref(),
+        Some("http://secure.corp:3129")
+    );
+    assert_eq!(config.no_proxy.as_deref(), Some("localhost,127.0.0.1"));
+    assert!(config.proxy_url.is_none());
+    assert!(!config.is_empty());
+}
+
+#[test]
+#[cfg(windows)]
+fn proxy_config_from_env_reads_proxy_vars_on_windows() {
+    // Windows treats environment variables as case-insensitive, so we only
+    // assert that setting the proxy variables is reflected in the config.
+    let _lock = env_lock();
+    let _http = EnvVarGuard::set("HTTP_PROXY", Some("http://proxy.corp:3128"));
+    let _https = EnvVarGuard::set("HTTPS_PROXY", Some("http://secure.corp:3129"));
+    let _no = EnvVarGuard::set("NO_PROXY", Some("localhost,127.0.0.1"));
+
+    let config = ProxyConfig::from_env();
+
     assert_eq!(config.http_proxy.as_deref(), Some("http://proxy.corp:3128"));
     assert_eq!(
         config.https_proxy.as_deref(),
@@ -155,6 +178,7 @@ fn build_client_with_proxy_url_config_succeeds() {
 }
 
 #[test]
+#[cfg(not(windows))]
 fn proxy_config_from_env_prefers_uppercase_over_lowercase() {
     // given
     let _lock = env_lock();

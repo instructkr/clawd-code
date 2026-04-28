@@ -8,6 +8,7 @@ publish.workspace = true
 [dependencies]
 sha2 = "0.10"
 glob = "0.3"
+globset = "0.4"
 plugins = { path = "../plugins" }
 regex = "1"
 serde = { version = "1", features = ["derive"] }
@@ -15,6 +16,8 @@ serde_json.workspace = true
 telemetry = { path = "../telemetry" }
 tokio = { version = "1", features = ["io-std", "io-util", "macros", "process", "rt", "rt-multi-thread", "time"] }
 walkdir = "2"
+getrandom = "0.2"
+ignore = "0.4"
 
 [lints]
 workspace = true

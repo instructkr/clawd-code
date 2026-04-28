@@ -14,6 +14,7 @@ pub mod config_validate;
 mod conversation;
 mod file_ops;
 mod git_context;
+mod git_tools;
 pub mod green_contract;
 mod hooks;
 mod json;
@@ -57,7 +58,7 @@ pub use compact::{
     get_compact_continuation_message, should_compact, CompactionConfig, CompactionResult,
 };
 pub use config::{
-    ConfigEntry, ConfigError, ConfigLoader, ConfigSource, McpConfigCollection,
+    AutoTddConfig, ConfigEntry, ConfigError, ConfigLoader, ConfigSource, McpConfigCollection,
     McpManagedProxyServerConfig, McpOAuthConfig, McpRemoteServerConfig, McpSdkServerConfig,
     McpServerConfig, McpStdioServerConfig, McpTransport, McpWebSocketServerConfig, OAuthConfig,
     ProviderFallbackConfig, ResolvedPermissionMode, RuntimeConfig, RuntimeFeatureConfig,
@@ -79,6 +80,9 @@ pub use file_ops::{
     WriteFileOutput,
 };
 pub use git_context::{GitCommitEntry, GitContext};
+pub use git_tools::{
+    git_diff_in_workspace, git_log_in_workspace, GitDiffOptions, GitLogOptions, GitTextOutput,
+};
 pub use hooks::{
     HookAbortSignal, HookEvent, HookProgressEvent, HookProgressReporter, HookRunResult, HookRunner,
 };

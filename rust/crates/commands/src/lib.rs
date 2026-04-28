@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::fmt;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -1891,7 +1892,7 @@ fn slash_command_category(name: &str) -> &'static str {
         | "desktop" | "upgrade" => "Config",
         "debug-tool-call" | "doctor" | "sandbox" | "diagnostics" | "tool-details" | "changelog"
         | "metrics" => "Debug",
-        _ => "Tools",
+        _ => "Other",
     }
 }
 

@@ -98,3 +98,19 @@ jobs:
           workspaces: rust -> target
       - name: Run workspace clippy
         run: cargo clippy --workspace
+
+  claw-analog:
+    name: claw-analog (test + clippy -p)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust -> target
+      - name: cargo test -p claw-analog
+        run: cargo test -p claw-analog
+      - name: cargo clippy -p claw-analog --no-deps
+        run: cargo clippy -p claw-analog --no-deps

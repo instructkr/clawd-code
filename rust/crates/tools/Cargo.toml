@@ -15,6 +15,7 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread"] }
+walkdir = "2"
 
 [lints]
 workspace = true

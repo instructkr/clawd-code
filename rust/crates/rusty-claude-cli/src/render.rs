@@ -795,8 +795,8 @@ fn normalize_nested_fences(markdown: &str) -> String {
     let mut out = String::with_capacity(markdown.len() + rewrites.len() * 4);
     for (i, line) in lines.iter().enumerate() {
         if let Some(rw) = rewrites.get(&i) {
-            let fence_str: String = std::iter::repeat(rw.char).take(rw.new_len).collect();
-            let indent_str: String = std::iter::repeat(' ').take(rw.indent).collect();
+            let fence_str: String = std::iter::repeat_n(rw.char, rw.new_len).collect();
+            let indent_str = " ".repeat(rw.indent);
             // Recover the original info string (if any) and trailing newline.
             let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
             let fi = fence_info[i].as_ref().unwrap();

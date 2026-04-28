@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
-use std::fs::{self, File};
-use std::io::{self, Read};
+use std::fs;
+use std::io;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -326,7 +326,16 @@ pub fn parse_oauth_callback_query(query: &str) -> Result<OAuthCallbackParams, St
 
 fn generate_random_token(bytes: usize) -> io::Result<String> {
     let mut buffer = vec![0_u8; bytes];
-    File::open("/dev/urandom")?.read_exact(&mut buffer)?;
+    #[cfg(not(windows))]
+    {
+        use std::fs::File;
+        use std::io::Read;
+        File::open("/dev/urandom")?.read_exact(&mut buffer)?;
+    }
+    #[cfg(windows)]
+    {
+        getrandom::getrandom(&mut buffer).map_err(|error| io::Error::other(error.to_string()))?;
+    }
     Ok(base64url_encode(&buffer))
 }
 
@@ -336,6 +345,13 @@ fn credentials_home_dir() -> io::Result<PathBuf> {
     }
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
+        .or_else(|| {
+            let drive = std::env::var_os("HOMEDRIVE")?;
+            let path = std::env::var_os("HOMEPATH")?;
+            let mut joined = drive;
+            joined.push(path);
+            Some(joined)
+        })
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,

@@ -2006,23 +2006,30 @@ fn run_worker_state(output_format: CliOutputFormat) -> Result<(), Box<dyn std::e
     let cwd = env::current_dir()?;
     let state_path = cwd.join(".claw").join("worker-state.json");
     if !state_path.exists() {
-        // #139: this error used to say "run a worker first" without telling
-        // callers how to run one. "worker" is an internal concept (there is
-        // no `claw worker` subcommand), so claws/CI had no discoverable path
-        // from the error to a fix. Emit an actionable, structured error that
-        // names the two concrete commands that produce worker state.
-        //
-        // Format in both text and JSON modes is stable so scripts can match:
-        //   error: no worker state file found at <path>
-        //     Hint: worker state is written by the interactive REPL or a non-interactive prompt.
-        //     Run:   claw               # start the REPL (writes state on first turn)
-        //     Or:    claw prompt <text> # run one non-interactive turn
-        //     Then rerun: claw state [--output-format json]
-        return Err(format!(
-            "no worker state file found at {path}\n  Hint: worker state is written by the interactive REPL or a non-interactive prompt.\n  Run:   claw               # start the REPL (writes state on first turn)\n  Or:    claw prompt <text> # run one non-interactive turn\n  Then rerun: claw state [--output-format json]",
-            path = state_path.display()
-        )
-        .into());
+        let hint = format!(
+            "worker state is written by the interactive REPL or a non-interactive prompt.\n\
+             Run:   claw               # start the REPL (writes state on first turn)\n\
+             Or:    claw prompt <text> # run one non-interactive turn\n\
+             Then rerun: claw state [--output-format json]"
+        );
+        match output_format {
+            CliOutputFormat::Text => {
+                println!(
+                    "No worker state file found at {}\nHint: {hint}",
+                    state_path.display()
+                );
+            }
+            CliOutputFormat::Json => println!(
+                "{}",
+                serde_json::json!({
+                    "type": "error",
+                    "error": "no_state_file",
+                    "path": state_path.display().to_string(),
+                    "hint": hint,
+                })
+            ),
+        }
+        return Ok(());
     }
     let raw = std::fs::read_to_string(&state_path)?;
     match output_format {
@@ -6473,15 +6480,19 @@ fn civil_from_days(days: i64) -> (i32, u32, u32) {
     } else {
         (z - 146_096) / 146_097
     };
-    let doe = (z - era * 146_097) as u64; // [0, 146_096]
+    let doe = u64::try_from(z - era * 146_097).unwrap_or(0); // [0, 146_096]
     let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
-    let y = yoe as i64 + era * 400;
+    let y = i64::try_from(yoe).unwrap_or(0) + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
     let mp = (5 * doy + 2) / 153; // [0, 11]
     let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
     let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
     let y = y + i64::from(m <= 2);
-    (y as i32, m as u32, d as u32)
+    (
+        i32::try_from(y).unwrap_or(0),
+        u32::try_from(m).unwrap_or(0),
+        u32::try_from(d).unwrap_or(0),
+    )
 }
 
 fn render_prompt_history_report(entries: &[PromptHistoryEntry], limit: usize) -> String {
@@ -9271,6 +9282,32 @@ mod tests {
         );
     }
 
+    fn cleanup_dir(root: &Path) {
+        #[cfg(windows)]
+        {
+            // Windows sometimes keeps file handles alive briefly (antivirus/indexer/process spawn).
+            // Retry a few times to avoid flaky tests.
+            for _ in 0..30 {
+                match fs::remove_dir_all(root) {
+                    Ok(()) => return,
+                    Err(e) => {
+                        if e.raw_os_error() == Some(32) {
+                            thread::sleep(Duration::from_millis(50));
+                            continue;
+                        }
+                        panic!("cleanup temp dir: {e}");
+                    }
+                }
+            }
+            panic!("cleanup temp dir: timed out waiting for Windows file locks");
+        }
+
+        #[cfg(not(windows))]
+        {
+            fs::remove_dir_all(root).expect("cleanup temp dir");
+        }
+    }
+
     fn env_lock() -> MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
@@ -9306,33 +9343,73 @@ mod tests {
         fs::create_dir_all(root.join(".claude-plugin")).expect("manifest dir");
         if include_hooks {
             fs::create_dir_all(root.join("hooks")).expect("hooks dir");
-            fs::write(
-                root.join("hooks").join("pre.sh"),
-                "#!/bin/sh\nprintf 'plugin pre hook'\n",
-            )
+            #[cfg(not(windows))]
+            let hook_name = "pre.sh";
+            #[cfg(windows)]
+            let hook_name = "pre.cmd";
+            fs::write(root.join("hooks").join(hook_name), {
+                #[cfg(not(windows))]
+                {
+                    "#!/bin/sh\nprintf 'plugin pre hook'\n"
+                }
+                #[cfg(windows)]
+                {
+                    "@echo off\necho plugin pre hook\n"
+                }
+            })
             .expect("write hook");
         }
         if include_lifecycle {
             fs::create_dir_all(root.join("lifecycle")).expect("lifecycle dir");
-            fs::write(
-                root.join("lifecycle").join("init.sh"),
-                "#!/bin/sh\nprintf 'init\\n' >> lifecycle.log\n",
-            )
+            #[cfg(not(windows))]
+            let (init_name, shutdown_name) = ("init.sh", "shutdown.sh");
+            #[cfg(windows)]
+            let (init_name, shutdown_name) = ("init.cmd", "shutdown.cmd");
+            fs::write(root.join("lifecycle").join(init_name), {
+                #[cfg(not(windows))]
+                {
+                    "#!/bin/sh\nprintf 'init\\n' >> lifecycle.log\n"
+                }
+                #[cfg(windows)]
+                {
+                    "@echo off\necho init>> lifecycle.log\n"
+                }
+            })
             .expect("write init lifecycle");
-            fs::write(
-                root.join("lifecycle").join("shutdown.sh"),
-                "#!/bin/sh\nprintf 'shutdown\\n' >> lifecycle.log\n",
-            )
+            fs::write(root.join("lifecycle").join(shutdown_name), {
+                #[cfg(not(windows))]
+                {
+                    "#!/bin/sh\nprintf 'shutdown\\n' >> lifecycle.log\n"
+                }
+                #[cfg(windows)]
+                {
+                    "@echo off\necho shutdown>> lifecycle.log\n"
+                }
+            })
             .expect("write shutdown lifecycle");
         }
 
         let hooks = if include_hooks {
-            ",\n  \"hooks\": {\n    \"PreToolUse\": [\"./hooks/pre.sh\"]\n  }"
+            #[cfg(not(windows))]
+            {
+                ",\n  \"hooks\": {\n    \"PreToolUse\": [\"./hooks/pre.sh\"]\n  }"
+            }
+            #[cfg(windows)]
+            {
+                ",\n  \"hooks\": {\n    \"PreToolUse\": [\"./hooks/pre.cmd\"]\n  }"
+            }
         } else {
             ""
         };
         let lifecycle = if include_lifecycle {
-            ",\n  \"lifecycle\": {\n    \"Init\": [\"./lifecycle/init.sh\"],\n    \"Shutdown\": [\"./lifecycle/shutdown.sh\"]\n  }"
+            #[cfg(not(windows))]
+            {
+                ",\n  \"lifecycle\": {\n    \"Init\": [\"./lifecycle/init.sh\"],\n    \"Shutdown\": [\"./lifecycle/shutdown.sh\"]\n  }"
+            }
+            #[cfg(windows)]
+            {
+                ",\n  \"lifecycle\": {\n    \"Init\": [\"./lifecycle/init.cmd\"],\n    \"Shutdown\": [\"./lifecycle/shutdown.cmd\"]\n  }"
+            }
         } else {
             ""
         };
@@ -9794,13 +9871,19 @@ mod tests {
     fn parses_allowed_tools_flags_with_aliases_and_lists() {
         let _guard = env_lock();
         std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        let config_home = temp_dir();
+        fs::create_dir_all(&config_home).expect("config home");
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
         let args = vec![
             "--allowedTools".to_string(),
             "read,glob".to_string(),
             "--allowed-tools=write_file".to_string(),
         ];
+        let parsed = parse_args(&args).expect("args should parse");
+        std::env::remove_var("CLAW_CONFIG_HOME");
+        let _ = fs::remove_dir_all(config_home);
         assert_eq!(
-            parse_args(&args).expect("args should parse"),
+            parsed,
             CliAction::Repl {
                 model: DEFAULT_MODEL.to_string(),
                 allowed_tools: Some(
@@ -11897,7 +11980,7 @@ UU conflicted.rs",
         assert!(message.contains("Unstaged changes:"));
         assert!(message.contains("tracked.txt"));
 
-        fs::remove_dir_all(root).expect("cleanup temp dir");
+        cleanup_dir(&root);
     }
 
     #[test]
@@ -12710,8 +12793,14 @@ UU conflicted.rs",
             .expect("plugin state should load");
         let pre_hooks = state.feature_config.hooks().pre_tool_use();
         assert_eq!(pre_hooks.len(), 1);
+        #[cfg(not(windows))]
         assert!(
             pre_hooks[0].ends_with("hooks/pre.sh"),
+            "expected installed plugin hook path, got {pre_hooks:?}"
+        );
+        #[cfg(windows)]
+        assert!(
+            pre_hooks[0].ends_with("hooks\\pre.cmd") || pre_hooks[0].ends_with("hooks/pre.cmd"),
             "expected installed plugin hook path, got {pre_hooks:?}"
         );
 
@@ -12729,23 +12818,21 @@ UU conflicted.rs",
         fs::create_dir_all(&workspace).expect("workspace");
         let script_path = workspace.join("fixture-mcp.py");
         write_mcp_server_fixture(&script_path);
+        let settings = serde_json::json!({
+            "mcpServers": {
+                "alpha": {
+                    "command": "python3",
+                    "args": [script_path.to_string_lossy()]
+                },
+                "broken": {
+                    "command": "python3",
+                    "args": ["-c", "import sys; sys.exit(0)"]
+                }
+            }
+        });
         fs::write(
             config_home.join("settings.json"),
-            format!(
-                r#"{{
-                  "mcpServers": {{
-                    "alpha": {{
-                      "command": "python3",
-                      "args": ["{}"]
-                    }},
-                    "broken": {{
-                      "command": "python3",
-                      "args": ["-c", "import sys; sys.exit(0)"]
-                    }}
-                  }}
-                }}"#,
-                script_path.to_string_lossy()
-            ),
+            serde_json::to_string_pretty(&settings).expect("serialize mcp settings"),
         )
         .expect("write mcp settings");
 
@@ -12931,7 +13018,9 @@ UU conflicted.rs",
         .expect("runtime should build");
 
         assert_eq!(
-            fs::read_to_string(&log_path).expect("init log should exist"),
+            fs::read_to_string(&log_path)
+                .expect("init log should exist")
+                .replace("\r\n", "\n"),
             "init\n"
         );
 
@@ -12940,7 +13029,9 @@ UU conflicted.rs",
             .expect("plugin shutdown should succeed");
 
         assert_eq!(
-            fs::read_to_string(&log_path).expect("shutdown log should exist"),
+            fs::read_to_string(&log_path)
+                .expect("shutdown log should exist")
+                .replace("\r\n", "\n"),
             "init\nshutdown\n"
         );
 

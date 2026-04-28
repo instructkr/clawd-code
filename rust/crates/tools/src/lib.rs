@@ -31,6 +31,8 @@ use runtime::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+mod disk;
+
 /// Global task registry shared across tool invocations within a session.
 fn global_lsp_registry() -> &'static LspRegistry {
     use std::sync::OnceLock;
@@ -498,6 +500,35 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
+            name: "git_diff",
+            description: "Read-only `git diff` from the current workspace repo (no color).",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "cached": { "type": "boolean", "description": "Use --cached (staged diff)" },
+                    "rev_range": { "type": "string", "description": "Revision range like `main...HEAD` or `HEAD~3..HEAD`" },
+                    "context_lines": { "type": "integer", "minimum": 0, "maximum": 100, "description": "Unified diff context lines (-U<n>)" },
+                    "paths": { "type": "array", "items": { "type": "string" }, "description": "Path filters (relative to repo)" }
+                },
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "git_log",
+            description: "Read-only `git log` from the current workspace repo (no color).",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "max_count": { "type": "integer", "minimum": 1, "maximum": 50, "description": "Max commits (default 20)" },
+                    "rev_range": { "type": "string", "description": "Revision range like `HEAD~20..HEAD`" },
+                    "paths": { "type": "array", "items": { "type": "string" }, "description": "Path filters (relative to repo)" }
+                },
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
             name: "WebFetch",
             description:
                 "Fetch a URL, convert it into readable text, and answer a prompt about it.",
@@ -732,6 +763,22 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "DiskUsage",
+            description: "Read-only disk usage report + cleanup suggestions for a directory (no deletion).",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Directory to scan (default: current working directory)." },
+                    "max_entries": { "type": "integer", "minimum": 1, "maximum": 200, "description": "Max number of top entries in the report." },
+                    "max_files": { "type": "integer", "minimum": 1, "maximum": 2_000_000, "description": "Stop after scanning this many files." },
+                    "max_seconds": { "type": "integer", "minimum": 1, "maximum": 120, "description": "Best-effort time limit for scanning." },
+                    "min_file_mb": { "type": "integer", "minimum": 1, "maximum": 10240, "description": "Include files >= this size (MB) in the 'big files' list." }
+                },
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
             name: "AskUserQuestion",
@@ -1230,6 +1277,14 @@ fn execute_tool_with_enforcer(
             maybe_enforce_permission_check(enforcer, name, input)?;
             from_value::<GrepSearchInput>(input).and_then(run_grep_search)
         }
+        "git_diff" => {
+            maybe_enforce_permission_check(enforcer, name, input)?;
+            from_value::<GitDiffInput>(input).and_then(run_git_diff)
+        }
+        "git_log" => {
+            maybe_enforce_permission_check(enforcer, name, input)?;
+            from_value::<GitLogInput>(input).and_then(run_git_log)
+        }
         "WebFetch" => from_value::<WebFetchInput>(input).and_then(run_web_fetch),
         "WebSearch" => from_value::<WebSearchInput>(input).and_then(run_web_search),
         "TodoWrite" => from_value::<TodoWriteInput>(input).and_then(run_todo_write),
@@ -1252,6 +1307,10 @@ fn execute_tool_with_enforcer(
             let classified_mode = classify_powershell_permission(&ps_input.command);
             maybe_enforce_permission_check_with_mode(enforcer, name, input, classified_mode)?;
             run_powershell(ps_input)
+        }
+        "DiskUsage" => {
+            maybe_enforce_permission_check(enforcer, name, input)?;
+            from_value::<disk::DiskUsageInput>(input).and_then(|v| run_disk_usage(&v))
         }
         "AskUserQuestion" => {
             from_value::<AskUserQuestionInput>(input).and_then(run_ask_user_question)
@@ -2100,6 +2159,39 @@ fn run_grep_search(input: GrepSearchInput) -> Result<String, String> {
 }
 
 #[allow(clippy::needless_pass_by_value)]
+fn run_git_diff(input: GitDiffInput) -> Result<String, String> {
+    let cwd = std::env::current_dir().map_err(io_to_string)?;
+    let out = runtime::git_diff_in_workspace(
+        &cwd,
+        runtime::GitDiffOptions {
+            cached: input.cached.unwrap_or(false),
+            rev_range: input.rev_range,
+            context_lines: input.context_lines,
+            paths: input.paths,
+        },
+        256 * 1024,
+    )
+    .map_err(io_to_string)?;
+    to_pretty_json(out)
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_git_log(input: GitLogInput) -> Result<String, String> {
+    let cwd = std::env::current_dir().map_err(io_to_string)?;
+    let out = runtime::git_log_in_workspace(
+        &cwd,
+        runtime::GitLogOptions {
+            max_count: input.max_count,
+            rev_range: input.rev_range,
+            paths: input.paths,
+        },
+        256 * 1024,
+    )
+    .map_err(io_to_string)?;
+    to_pretty_json(out)
+}
+
+#[allow(clippy::needless_pass_by_value)]
 fn run_web_fetch(input: WebFetchInput) -> Result<String, String> {
     to_pretty_json(execute_web_fetch(&input)?)
 }
@@ -2233,6 +2325,12 @@ fn run_powershell(input: PowerShellInput) -> Result<String, String> {
     to_pretty_json(execute_powershell(input).map_err(|error| error.to_string())?)
 }
 
+fn run_disk_usage(input: &disk::DiskUsageInput) -> Result<String, String> {
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    let report = disk::disk_usage_report(&cwd, input)?;
+    to_pretty_json(report)
+}
+
 fn to_pretty_json<T: serde::Serialize>(value: T) -> Result<String, String> {
     serde_json::to_string_pretty(&value).map_err(|error| error.to_string())
 }
@@ -2267,6 +2365,21 @@ struct EditFileInput {
 struct GlobSearchInputValue {
     pattern: String,
     path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitDiffInput {
+    cached: Option<bool>,
+    rev_range: Option<String>,
+    context_lines: Option<i64>,
+    paths: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitLogInput {
+    max_count: Option<u64>,
+    rev_range: Option<String>,
+    paths: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5746,8 +5859,14 @@ fn config_home_dir() -> Result<PathBuf, String> {
         return Ok(PathBuf::from(path));
     }
     let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .map_err(|_| {
+        .ok()
+        .or_else(|| std::env::var("USERPROFILE").ok())
+        .or_else(|| {
+            let drive = std::env::var("HOMEDRIVE").ok()?;
+            let path = std::env::var("HOMEPATH").ok()?;
+            Some(format!("{drive}{path}"))
+        })
+        .ok_or_else(|| {
             String::from(
                 "HOME is not set (on Windows, set USERPROFILE or HOME, \
                  or use CLAW_CONFIG_HOME to point directly at the config directory)",
@@ -6203,6 +6322,7 @@ mod tests {
         run_git(path, &["commit", "-m", "initial commit", "--quiet"]);
     }
 
+    #[allow(dead_code)]
     fn commit_file(path: &Path, file: &str, contents: &str, message: &str) {
         std::fs::write(path.join(file), contents).expect("write file");
         run_git(path, &["add", file]);
@@ -6225,6 +6345,8 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(names.contains(&"bash"));
         assert!(names.contains(&"read_file"));
+        assert!(names.contains(&"git_diff"));
+        assert!(names.contains(&"git_log"));
         assert!(names.contains(&"WebFetch"));
         assert!(names.contains(&"WebSearch"));
         assert!(names.contains(&"TodoWrite"));
@@ -6250,6 +6372,36 @@ mod tests {
     fn rejects_unknown_tool_names() {
         let error = execute_tool("nope", &json!({})).expect_err("tool should be rejected");
         assert!(error.contains("unsupported tool"));
+    }
+
+    #[test]
+    fn git_diff_and_log_execute_in_repo() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = temp_path("git-tools");
+        init_git_repo(&root);
+
+        // Ensure tool executor runs in the repo.
+        let old = std::env::current_dir().ok();
+        std::env::set_current_dir(&root).expect("set cwd");
+
+        // dirty working tree diff
+        std::fs::write(root.join("README.md"), "changed\n").expect("modify");
+
+        let log = execute_tool("git_log", &json!({"max_count": 5})).expect("git_log");
+        assert!(log.contains("initial commit"), "log={log}");
+
+        let diff = execute_tool("git_diff", &json!({})).expect("git_diff");
+        assert!(
+            diff.contains("diff --git") || diff.contains("@@"),
+            "diff={diff}"
+        );
+
+        if let Some(old) = old {
+            let _ = std::env::set_current_dir(old);
+        }
+        std::fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
@@ -6345,8 +6497,12 @@ mod tests {
         fs::create_dir_all(&claw_dir).expect("create .claw dir");
         // Use the actual OS temp dir so the worktree path matches the allowlist
         let tmp_root = std::env::temp_dir().to_str().expect("utf-8").to_string();
-        let settings = format!("{{\"trustedRoots\": [\"{tmp_root}\"]}}");
-        fs::write(claw_dir.join("settings.json"), settings).expect("write settings");
+        let settings = serde_json::json!({ "trustedRoots": [tmp_root] });
+        fs::write(
+            claw_dir.join("settings.json"),
+            serde_json::to_string(&settings).expect("serialize settings"),
+        )
+        .expect("write settings");
 
         // WorkerCreate with no per-call trusted_roots — config should supply them
         let cwd = worktree.to_str().expect("valid utf-8").to_string();
@@ -7307,7 +7463,9 @@ mod tests {
 
     #[test]
     fn skill_loads_local_skill_prompt() {
-        let _guard = env_guard();
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = temp_path("skills-home");
         let skill_dir = home.join(".agents").join("skills").join("help");
         fs::create_dir_all(&skill_dir).expect("skill dir should exist");
@@ -7330,10 +7488,8 @@ mod tests {
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
         assert_eq!(output["skill"], "help");
-        assert!(output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with("/help/SKILL.md"));
+        let path = output["path"].as_str().expect("path").replace('\\', "/");
+        assert!(path.ends_with("/help/SKILL.md"));
         assert!(output["prompt"]
             .as_str()
             .expect("prompt")
@@ -7349,10 +7505,11 @@ mod tests {
         let dollar_output: serde_json::Value =
             serde_json::from_str(&dollar_result).expect("valid json");
         assert_eq!(dollar_output["skill"], "$help");
-        assert!(dollar_output["path"]
+        let path = dollar_output["path"]
             .as_str()
             .expect("path")
-            .ends_with("/help/SKILL.md"));
+            .replace('\\', "/");
+        assert!(path.ends_with("/help/SKILL.md"));
 
         if let Some(home) = original_home {
             std::env::set_var("HOME", home);
@@ -7364,7 +7521,9 @@ mod tests {
 
     #[test]
     fn skill_resolves_project_local_skills_and_legacy_commands() {
-        let _guard = env_guard();
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = temp_path("project-skills");
         let skill_dir = root.join(".claw").join("skills").join("plan");
         let command_dir = root.join(".claw").join("commands");
@@ -7388,19 +7547,21 @@ mod tests {
             .expect("project-local skill should resolve");
         let skill_output: serde_json::Value =
             serde_json::from_str(&skill_result).expect("valid json");
-        assert!(skill_output["path"]
+        let path = skill_output["path"]
             .as_str()
             .expect("path")
-            .ends_with(".claw/skills/plan/SKILL.md"));
+            .replace('\\', "/");
+        assert!(path.ends_with(".claw/skills/plan/SKILL.md"));
 
         let command_result = execute_tool("Skill", &json!({ "skill": "/handoff" }))
             .expect("legacy command should resolve");
         let command_output: serde_json::Value =
             serde_json::from_str(&command_result).expect("valid json");
-        assert!(command_output["path"]
+        let path = command_output["path"]
             .as_str()
             .expect("path")
-            .ends_with(".claw/commands/handoff.md"));
+            .replace('\\', "/");
+        assert!(path.ends_with(".claw/commands/handoff.md"));
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
         fs::remove_dir_all(root).expect("temp project should clean up");
@@ -7408,7 +7569,9 @@ mod tests {
 
     #[test]
     fn skill_loads_project_local_claude_skill_prompt() {
-        let _guard = env_guard();
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = temp_path("project-skills");
         let home = root.join("home");
         let workspace = root.join("workspace");
@@ -7435,10 +7598,8 @@ mod tests {
             .expect("project-local skill should resolve");
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
-        assert!(output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with(".claude/skills/trace/SKILL.md"));
+        let path = output["path"].as_str().expect("path").replace('\\', "/");
+        assert!(path.ends_with(".claude/skills/trace/SKILL.md"));
         assert_eq!(output["description"], "Project-local trace helper");
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
@@ -7459,7 +7620,9 @@ mod tests {
 
     #[test]
     fn skill_loads_project_local_omc_and_agents_skill_prompts() {
-        let _guard = env_guard();
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = temp_path("project-omc-skills");
         let home = root.join("home");
         let workspace = root.join("workspace");
@@ -7497,15 +7660,17 @@ mod tests {
         let omc_output: serde_json::Value = serde_json::from_str(&omc_result).expect("valid json");
         let agents_output: serde_json::Value =
             serde_json::from_str(&agents_result).expect("valid json");
-        assert!(omc_output["path"]
+        let omc_path = omc_output["path"]
             .as_str()
             .expect("path")
-            .ends_with(".omc/skills/hud/SKILL.md"));
+            .replace('\\', "/");
+        assert!(omc_path.ends_with(".omc/skills/hud/SKILL.md"));
         assert_eq!(omc_output["description"], "Project-local OMC HUD helper");
-        assert!(agents_output["path"]
+        let agents_path = agents_output["path"]
             .as_str()
             .expect("path")
-            .ends_with(".agents/skills/trace/SKILL.md"));
+            .replace('\\', "/");
+        assert!(agents_path.ends_with(".agents/skills/trace/SKILL.md"));
         assert_eq!(
             agents_output["description"],
             "Project-local agents compatibility helper"
@@ -7529,7 +7694,9 @@ mod tests {
 
     #[test]
     fn skill_loads_learned_skill_from_claude_config_dir() {
-        let _guard = env_guard();
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = temp_path("claude-config-learned-skill");
         let home = root.join("home");
         let claude_config_dir = root.join("claude-config");
@@ -7557,10 +7724,8 @@ mod tests {
             .expect("learned skill should resolve");
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
-        assert!(output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with("skills/omc-learned/learned/SKILL.md"));
+        let path = output["path"].as_str().expect("path").replace('\\', "/");
+        assert!(path.ends_with("skills/omc-learned/learned/SKILL.md"));
         assert_eq!(output["description"], "Learned OMC skill");
 
         match original_home {
@@ -7584,7 +7749,9 @@ mod tests {
 
     #[test]
     fn skill_loads_direct_skill_and_legacy_command_from_claude_config_dir() {
-        let _guard = env_guard();
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = temp_path("claude-config-direct-skill");
         let home = root.join("home");
         let claude_config_dir = root.join("claude-config");
@@ -7616,20 +7783,22 @@ mod tests {
             execute_tool("Skill", &json!({ "skill": "statusline" })).expect("direct skill");
         let direct_skill_output: serde_json::Value =
             serde_json::from_str(&direct_skill).expect("valid skill json");
-        assert!(direct_skill_output["path"]
+        let path = direct_skill_output["path"]
             .as_str()
             .expect("path")
-            .ends_with("skills/statusline/SKILL.md"));
+            .replace('\\', "/");
+        assert!(path.ends_with("skills/statusline/SKILL.md"));
         assert_eq!(direct_skill_output["description"], "Claude config skill");
 
         let legacy_command =
             execute_tool("Skill", &json!({ "skill": "doctor-check" })).expect("direct command");
         let legacy_command_output: serde_json::Value =
             serde_json::from_str(&legacy_command).expect("valid command json");
-        assert!(legacy_command_output["path"]
+        let path = legacy_command_output["path"]
             .as_str()
             .expect("path")
-            .ends_with("commands/doctor-check.md"));
+            .replace('\\', "/");
+        assert!(path.ends_with("commands/doctor-check.md"));
         assert_eq!(
             legacy_command_output["description"],
             "Claude config command"
@@ -7656,7 +7825,9 @@ mod tests {
 
     #[test]
     fn skill_loads_project_local_legacy_command_markdown() {
-        let _guard = env_guard();
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = temp_path("project-legacy-command");
         let home = root.join("home");
         let workspace = root.join("workspace");
@@ -7683,10 +7854,8 @@ mod tests {
             .expect("legacy command markdown should resolve");
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
-        assert!(output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with(".claude/commands/team.md"));
+        let path = output["path"].as_str().expect("path").replace('\\', "/");
+        assert!(path.ends_with(".claude/commands/team.md"));
         assert_eq!(output["description"], "Legacy team workflow");
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
@@ -8631,6 +8800,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn bash_tool_reports_success_exit_failure_timeout_and_background() {
         let success = execute_tool("bash", &json!({ "command": "printf 'hello'" }))
             .expect("bash should succeed");
@@ -8668,6 +8838,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn bash_workspace_tests_are_blocked_when_branch_is_behind_main() {
         let _guard = env_lock()
             .lock()
@@ -8718,6 +8889,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn bash_targeted_tests_skip_branch_preflight() {
         let _guard = env_lock()
             .lock()
@@ -8883,10 +9055,11 @@ mod tests {
             .expect("glob should succeed");
         let globbed_output: serde_json::Value = serde_json::from_str(&globbed).expect("json");
         assert_eq!(globbed_output["numFiles"], 1);
-        assert!(globbed_output["filenames"][0]
-            .as_str()
-            .expect("filename")
-            .ends_with("nested/lib.rs"));
+        let filename = globbed_output["filenames"][0].as_str().expect("filename");
+        assert!(
+            filename.ends_with("nested/lib.rs") || filename.ends_with("nested\\lib.rs"),
+            "filename={filename:?}"
+        );
 
         let glob_error = execute_tool("glob_search", &json!({ "pattern": "[" }))
             .expect_err("invalid glob should fail");
@@ -9210,6 +9383,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn repl_executes_python_code() {
         let result = execute_tool(
             "REPL",
@@ -9239,6 +9413,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn given_timeout_ms_when_repl_blocks_then_returns_timeout_error() {
         let result = execute_tool(
             "REPL",
@@ -9254,6 +9429,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn powershell_runs_via_stub_shell() {
         let _guard = env_lock()
             .lock()
@@ -9418,6 +9594,7 @@ printf 'pwsh:%s' "$1"
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn given_no_enforcer_when_bash_then_executes_normally() {
         let _guard = env_lock()
             .lock()
