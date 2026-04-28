@@ -419,7 +419,72 @@ impl LspTransport {
 
         Ok(payload)
     }
+
+    /// Connect to an LSP server over TCP (e.g. Godot on localhost:6008).
+    /// The command should be a `tcp://host:port` URI.
+    /// Uses `socat` or `nc` as a stdio↔TCP bridge so that the same
+    /// Content-Length framing logic works unchanged.
+    pub fn connect_tcp(address: &str) -> io::Result<Self> {
+        Self::connect_tcp_with_timeout(address, DEFAULT_REQUEST_TIMEOUT)
+    }
+
+    pub fn connect_tcp_with_timeout(
+        address: &str,
+        request_timeout: Duration,
+    ) -> io::Result<Self> {
+        let addr = address.trim_start_matches("tcp://");
+
+        // Try socat first (reliable bidirectional bridge)
+        let socat_available = std::process::Command::new("socat")
+            .arg("-V")
+            .output()
+            .is_ok();
+
+        let mut cmd = if socat_available {
+            let mut c = Command::new("socat");
+            c.args([
+                "-", // stdin/stdout
+                &format!("TCP:{addr}"),
+            ]);
+            c
+        } else {
+            // Fall back to nc (netcat)
+            let mut c = Command::new("nc");
+            // Parse host:port
+            let mut parts = addr.split(':');
+            let host = parts.next().unwrap_or("localhost");
+            let port = parts.next().unwrap_or("6008");
+            c.args([host, port]);
+            c
+        };
+
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+
+        let mut child = cmd.spawn()?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| io::Error::other("TCP bridge process missing stdin pipe"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other("TCP bridge process missing stdout pipe"))?;
+
+        Ok(Self {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+            next_id: 1,
+            request_timeout,
+            pending_notifications: Vec::new(),
+        })
+    }
 }
+
+
+
 
 #[cfg(test)]
 mod tests;

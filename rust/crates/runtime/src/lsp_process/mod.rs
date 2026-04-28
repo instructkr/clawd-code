@@ -43,8 +43,13 @@ impl LspProcess {
         args: &[String],
         root_path: &Path,
     ) -> Result<Self, LspProcessError> {
-        let transport = LspTransport::spawn(command, args)
-            .map_err(|e| LspProcessError::Transport(LspTransportError::Io(e)))?;
+        let transport = if command.starts_with("tcp://") {
+            LspTransport::connect_tcp(command)
+                .map_err(|e| LspProcessError::Transport(LspTransportError::Io(e)))?
+        } else {
+            LspTransport::spawn(command, args)
+                .map_err(|e| LspProcessError::Transport(LspTransportError::Io(e)))?
+        };
 
         let canonical = canonicalize_root(root_path)?;
         let root_uri = format!("file://{canonical}");

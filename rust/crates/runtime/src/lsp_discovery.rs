@@ -154,8 +154,8 @@ const KNOWN_LSP_SERVERS_TABLE: &[StaticLspServerDescriptor] = &[
     },
     StaticLspServerDescriptor {
         language: "gdscript",
-        command: "godot",
-        args: &["--headless", "--editor"],
+        command: "tcp://localhost:6008",
+        args: &[],
         extensions: &["gd"],
     },
 ];
