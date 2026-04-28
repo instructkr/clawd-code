@@ -9048,6 +9048,145 @@ impl ToolExecutor for CliToolExecutor {
             }
         }
     }
+
+    fn execute_batch(&mut self, calls: Vec<runtime::ToolCall>) -> Vec<runtime::ToolResult> {
+        if calls.len() <= 1 {
+            return calls
+                .into_iter()
+                .map(|call| {
+                    let result = self.execute(&call.tool_name, &call.input);
+                    runtime::ToolResult {
+                        tool_use_id: call.tool_use_id,
+                        tool_name: call.tool_name,
+                        result,
+                    }
+                })
+                .collect();
+        }
+
+        /// Tools that are safe to run in parallel because they only read
+        /// state and dispatch through the stateless tool registry.
+        const PARALLEL_SAFE_TOOLS: &[&str] = &[
+            "read_file",
+            "glob_search",
+            "grep_search",
+            "WebFetch",
+            "WebSearch",
+            "ToolSearch",
+            "Skill",
+            "LSP",
+            "GitStatus",
+            "GitDiff",
+            "GitLog",
+            "GitShow",
+            "GitBlame",
+        ];
+
+        let emit_output = self.emit_output;
+        let mut results: Vec<Option<runtime::ToolResult>> = vec![None; calls.len()];
+        let mut parallel_calls: Vec<(usize, String, String, String)> = Vec::new();
+        let mut sequential_indices: Vec<usize> = Vec::new();
+
+        // Classify calls as parallel-safe or sequential
+        for (i, call) in calls.iter().enumerate() {
+            if self
+                .allowed_tools
+                .as_ref()
+                .is_some_and(|allowed| !allowed.contains(&call.tool_name))
+            {
+                results[i] = Some(runtime::ToolResult {
+                    tool_use_id: call.tool_use_id.clone(),
+                    tool_name: call.tool_name.clone(),
+                    result: Err(ToolError::new(format!(
+                        "tool `{}` is not enabled by the current --allowedTools setting",
+                        call.tool_name
+                    ))),
+                });
+            } else if PARALLEL_SAFE_TOOLS.contains(&call.tool_name.as_str())
+                && !self.tool_registry.has_runtime_tool(&call.tool_name)
+            {
+                parallel_calls.push((
+                    i,
+                    call.tool_use_id.clone(),
+                    call.tool_name.clone(),
+                    call.input.clone(),
+                ));
+            } else {
+                sequential_indices.push(i);
+            }
+        }
+
+        // Execute parallel-safe tools concurrently
+        if !parallel_calls.is_empty() {
+            let registry = self.tool_registry.clone();
+            let parallel_results: Vec<(usize, String, String, Result<String, ToolError>)> =
+                std::thread::scope(|s| {
+                    let mut handles = Vec::new();
+                    for (idx, tool_use_id, tool_name, input) in &parallel_calls {
+                        let registry = &registry;
+                        let tool_use_id = tool_use_id.clone();
+                        let tool_name = tool_name.clone();
+                        let input = input.clone();
+                        let idx = *idx;
+                        handles.push(s.spawn(move || {
+                            let value = serde_json::from_str(&input)
+                                .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")));
+                            let result = match value {
+                                Ok(v) => registry
+                                    .execute(&tool_name, &v)
+                                    .map_err(ToolError::new),
+                                Err(e) => Err(e),
+                            };
+                            (idx, tool_use_id, tool_name, result)
+                        }));
+                    }
+                    handles
+                        .into_iter()
+                        .map(|h| h.join().unwrap_or_else(|_| {
+                            (
+                                0,
+                                String::new(),
+                                String::new(),
+                                Err(ToolError::new("parallel thread panicked")),
+                            )
+                        }))
+                        .collect()
+                });
+
+            for (idx, tool_use_id, tool_name, result) in parallel_results {
+                if emit_output {
+                    let output_str = match &result {
+                        Ok(o) => o.clone(),
+                        Err(e) => e.to_string(),
+                    };
+                    let is_error = result.is_err();
+                    let markdown = format_tool_result(&tool_name, &output_str, is_error);
+                    self.renderer
+                        .stream_markdown(&markdown, &mut io::stdout())
+                        .map_err(|error| ToolError::new(error.to_string()))
+                        .ok();
+                }
+                results[idx] = Some(runtime::ToolResult {
+                    tool_use_id,
+                    tool_name,
+                    result,
+                });
+            }
+        }
+
+        // Execute sequential tools one at a time
+        for idx in sequential_indices {
+            let call = &calls[idx];
+            let result = self.execute(&call.tool_name, &call.input);
+            results[idx] = Some(runtime::ToolResult {
+                tool_use_id: call.tool_use_id.clone(),
+                tool_name: call.tool_name.clone(),
+                result,
+            });
+        }
+
+        results.into_iter().map(|r| r.unwrap()).collect()
+    }
 }
 
 fn permission_policy(

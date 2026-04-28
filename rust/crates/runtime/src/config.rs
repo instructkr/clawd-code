@@ -96,7 +96,9 @@ pub struct RuntimeFeatureConfig {
     trusted_roots: Vec<String>,
     provider: RuntimeProviderConfig,
     lsp: BTreeMap<String, LspServerConfig>,
-    api_timeout: ApiTimeoutConfig,}
+    api_timeout: ApiTimeoutConfig,
+    subagent_model: Option<String>,
+}
 
 impl Default for RuntimeFeatureConfig {
     fn default() -> Self {
@@ -115,7 +117,9 @@ impl Default for RuntimeFeatureConfig {
             trusted_roots: Vec::new(),
             provider: RuntimeProviderConfig::default(),
             lsp: BTreeMap::new(),
-            api_timeout: ApiTimeoutConfig::default(),        }
+            api_timeout: ApiTimeoutConfig::default(),
+            subagent_model: None,
+        }
     }
 }
 
@@ -429,7 +433,10 @@ impl ConfigLoader {
                 .and_then(|o| o.get("lspAutoStart"))
                 .and_then(JsonValue::as_bool)
                 .unwrap_or(true),
-            api_timeout: parse_optional_api_timeout_config(&merged_value)?,        };
+            api_timeout: parse_optional_api_timeout_config(&merged_value)?,
+            subagent_model: parse_optional_subagent_model(&merged_value),
+        };
+
         Ok(RuntimeConfig {
             merged,
             loaded_entries,
@@ -1564,6 +1571,19 @@ fn push_unique(target: &mut Vec<String>, value: String) {
     if !target.iter().any(|existing| existing == &value) {
         target.push(value);
     }
+}
+
+fn parse_optional_subagent_model(value: &JsonValue) -> Option<String> {
+    value
+        .as_object()
+        .and_then(|object| {
+            object
+                .get("subagentModel")
+                .or_else(|| object.get("subagent_model"))
+        })
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim().to_string())
 }
 
 #[cfg(test)]

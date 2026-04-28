@@ -78,8 +78,8 @@ pub use lsp_discovery::{
 };
 pub use conversation::{
     auto_compaction_threshold_from_env, ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent,
-    ConversationRuntime, PromptCacheEvent, RuntimeError, StaticToolExecutor, ToolError,
-    ToolExecutor, TurnSummary,
+    ConversationRuntime, PromptCacheEvent, RuntimeError, StaticToolExecutor, ToolCall, ToolError,
+    ToolExecutor, ToolResult, TurnSummary,
 };
 pub use file_ops::{
     edit_file, glob_search, grep_search, read_file, write_file, EditFileOutput, GlobSearchOutput,
