@@ -207,7 +207,12 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
     },
     FieldSpec {
         name: "lspAutoStart",
-        expected: FieldType::Bool,    },
+        expected: FieldType::Bool,
+    },
+    FieldSpec {
+        name: "subagentModel",
+        expected: FieldType::String,
+    },
 ];
 
 const HOOKS_FIELDS: &[FieldSpec] = &[
