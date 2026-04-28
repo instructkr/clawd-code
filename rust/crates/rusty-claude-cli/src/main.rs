@@ -3604,11 +3604,7 @@ fn run_repl(
     // Discover and register LSP servers
     let lsp_servers = runtime::lsp_discovery::discover_available_servers();
     if !lsp_servers.is_empty() {
-        let names: Vec<String> = lsp_servers
-            .iter()
-            .map(|s| format!("{} ({})", s.language, s.command))
-            .collect();
-        eprintln!("LSP: {}", names.join(", "));
+        eprintln!("Loading LSP servers...");
         for server in &lsp_servers {
             tools::global_lsp_registry().register_with_descriptor(
                 &server.language,
@@ -3623,10 +3619,15 @@ fn run_repl(
             let registry = tools::global_lsp_registry();
             for server in &lsp_servers {
                 match registry.start_server(&server.language) {
-                    Ok(()) => eprintln!("  {} started", server.language),
-                    Err(e) => eprintln!("  {} failed to start: {e}", server.language),
+                    Ok(()) => eprintln!("  ✓ {} ({})", server.language, server.command),
+                    Err(e) => eprintln!("  ✗ {} — {e}", server.language),
                 }
             }
+            eprintln!("  Disable with: /lsp toggle or set lspAutoStart=false in settings.json");
+        } else {
+            let names: Vec<&str> = lsp_servers.iter().map(|s| s.language.as_str()).collect();
+            eprintln!("  Available but not started: {}", names.join(", "));
+            eprintln!("  Start with: /lsp start <language> or set lspAutoStart=true in settings.json");
         }
     }
 
