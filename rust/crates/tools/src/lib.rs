@@ -1002,24 +1002,36 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "TeamCreate",
-            description: "Create a team of agents that run in parallel. Each task becomes an independent Agent with its own context. Agents can communicate via AgentMessage. Poll agent .json files for completion status.",
+            description: "Create a team of agents that run in parallel. Each task becomes an independent Agent with its own context. Agents can communicate via AgentMessage. Poll agent .json files for completion status. Use 'mode' preset to auto-generate agent teams (e.g. '2x' = 2 Explore + 2 Plan + 2 Verification agents).",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "name": { "type": "string" },
+                    "mode": {
+                        "type": "string",
+                        "description": "Preset team size: '2x'=2 per role, '4x'=4 per role, '6x'=6 per role. Overrides 'tasks'.",
+                        "enum": ["2x", "4x", "6x"]
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": "Shared prompt for all agents when using 'mode' preset. Each agent gets this prompt with its role prepended."
+                    },
                     "tasks": {
                         "type": "array",
+                        "description": "Manual task list. Ignored when 'mode' is set.",
                         "items": {
                             "type": "object",
                             "properties": {
                                 "prompt": { "type": "string" },
-                                "description": { "type": "string" }
+                                "description": { "type": "string" },
+                                "subagent_type": { "type": "string", "enum": ["Explore", "Plan", "Verification", "general-purpose"] },
+                                "model": { "type": "string" }
                             },
                             "required": ["prompt"]
                         }
                     }
                 },
-                "required": ["name", "tasks"],
+                "required": ["name"],
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::DangerFullAccess,
@@ -1687,10 +1699,19 @@ fn run_team_create(input: TeamCreateInput) -> Result<String, String> {
     let team_dir = output_dir.join("teams");
     std::fs::create_dir_all(&team_dir).map_err(|e| e.to_string())?;
 
+    // Expand mode preset into tasks, or use manual tasks
+    let tasks = if let Some(mode) = &input.mode {
+        expand_team_mode(mode, input.prompt.as_deref().unwrap_or("Explore the codebase and report findings"))?
+    } else if input.tasks.is_empty() {
+        return Err("either 'mode' or 'tasks' must be provided".to_string());
+    } else {
+        input.tasks.clone()
+    };
+
     let mut agent_ids: Vec<String> = Vec::new();
     let mut agent_outputs: Vec<Value> = Vec::new();
 
-    for (i, task) in input.tasks.iter().enumerate() {
+    for (i, task) in tasks.iter().enumerate() {
         let prompt = task.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
         let description = task.get("description").and_then(|v| v.as_str()).unwrap_or(&input.name);
         let subagent_type = task.get("subagent_type").and_then(|v| v.as_str());
@@ -1897,6 +1918,29 @@ fn run_agent_message(input: AgentMessageInput) -> Result<String, String> {
         }
         other => Err(format!("unknown AgentMessage action: {other}")),
     }
+}
+
+fn expand_team_mode(mode: &str, base_prompt: &str) -> Result<Vec<Value>, String> {
+    let n = match mode {
+        "2x" => 2,
+        "4x" => 4,
+        "6x" => 6,
+        other => return Err(format!("unknown team mode '{other}'. Use '2x', '4x', or '6x'")),
+    };
+    let roles: &[&str] = &["Explore", "Plan", "Verification"];
+    let mut tasks = Vec::new();
+    for role in roles {
+        for i in 0..n {
+            let prompt = format!("[{role} agent {}/{}] {base_prompt}", i + 1, n);
+            let description = format!("{role} agent {}/{}", i + 1, n);
+            tasks.push(json!({
+                "prompt": prompt,
+                "description": description,
+                "subagent_type": role,
+            }));
+        }
+    }
+    Ok(tasks)
 }
 
 fn agent_mailbox_dir() -> std::path::PathBuf {
@@ -2978,6 +3022,11 @@ const fn default_auto_recover_prompt_misdelivery() -> bool {
 #[derive(Debug, Deserialize)]
 struct TeamCreateInput {
     name: String,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
     tasks: Vec<Value>,
 }
 
