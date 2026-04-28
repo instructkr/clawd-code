@@ -1,0 +1,197 @@
+From 0d1e0ec4559c8e5dbfd4efb67faececb4d01b3a7 Mon Sep 17 00:00:00 2001
+From: prcdslnc13 <prcdslnc13@gmail.com>
+Date: Tue, 28 Apr 2026 16:08:58 -0500
+Subject: [PATCH] Tighten tool-output truncation defaults; expose two new
+ config knobs
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The bash/grep/glob/generic tool result formatters truncate at 60 lines
+and 4000 chars by default. Long bash dumps still flood the viewport,
+which is the most-felt rough edge of the REPL today.
+
+Lower the defaults to 20 lines / 1500 chars and route both through
+the Config tool so they're tunable without recompiling:
+
+    /config set toolOutputMaxLines 40
+    /config set toolOutputMaxChars 3000
+
+Values are read once per process via OnceLock — config edits take
+effect on the next REPL launch.
+
+The read_file viewer keeps its old 80-line / 6000-char budget; file
+contents are intentionally allowed a larger preview because that's
+the user's primary signal that the right thing was read.
+
+Three pre-existing truncation tests asserted line numbers tied to
+the 60-line cap; updated to match the new default so they continue
+to verify the truncation contract rather than a particular cutoff
+value.
+
+Refs: TUI-ENHANCEMENT-PLAN.md task 3.1 (collapsible/truncated tool
+output) — minimum-sufficient cut. A follow-up `/tail` slash command
+can be added later if the user still wants better recall of
+truncated output beyond what the session JSONL preserves.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ rust/crates/rusty-claude-cli/src/main.rs | 61 +++++++++++++++++++-----
+ rust/crates/tools/src/lib.rs             | 13 +++++
+ 2 files changed, 61 insertions(+), 13 deletions(-)
+
+diff --git a/rust/crates/rusty-claude-cli/src/main.rs b/rust/crates/rusty-claude-cli/src/main.rs
+index aa192aa..dff598a 100644
+--- a/rust/crates/rusty-claude-cli/src/main.rs
++++ b/rust/crates/rusty-claude-cli/src/main.rs
+@@ -8305,8 +8305,41 @@ const DISPLAY_TRUNCATION_NOTICE: &str =
+     "\x1b[2m… output truncated for display; full result preserved in session.\x1b[0m";
+ const READ_DISPLAY_MAX_LINES: usize = 80;
+ const READ_DISPLAY_MAX_CHARS: usize = 6_000;
+-const TOOL_OUTPUT_DISPLAY_MAX_LINES: usize = 60;
+-const TOOL_OUTPUT_DISPLAY_MAX_CHARS: usize = 4_000;
++const TOOL_OUTPUT_DISPLAY_MAX_LINES_DEFAULT: usize = 20;
++const TOOL_OUTPUT_DISPLAY_MAX_CHARS_DEFAULT: usize = 1_500;
++
++fn tool_output_display_max_lines() -> usize {
++    static VALUE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
++    *VALUE.get_or_init(|| {
++        read_usize_setting("toolOutputMaxLines", TOOL_OUTPUT_DISPLAY_MAX_LINES_DEFAULT)
++    })
++}
++
++fn tool_output_display_max_chars() -> usize {
++    static VALUE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
++    *VALUE.get_or_init(|| {
++        read_usize_setting("toolOutputMaxChars", TOOL_OUTPUT_DISPLAY_MAX_CHARS_DEFAULT)
++    })
++}
++
++fn read_usize_setting(key: &str, default: usize) -> usize {
++    let Ok(cwd) = env::current_dir() else {
++        return default;
++    };
++    let Ok(config) = ConfigLoader::default_for(&cwd).load() else {
++        return default;
++    };
++    let Some(value) = config.get(key) else {
++        return default;
++    };
++    if let Some(n) = value.as_i64() {
++        return usize::try_from(n).unwrap_or(default);
++    }
++    if let Some(s) = value.as_str() {
++        return s.parse::<usize>().unwrap_or(default);
++    }
++    default
++}
+ 
+ fn extract_tool_path(parsed: &serde_json::Value) -> String {
+     parsed
+@@ -8383,8 +8416,8 @@ fn format_bash_result(icon: &str, parsed: &serde_json::Value) -> String {
+         if !stdout.trim().is_empty() {
+             lines.push(truncate_output_for_display(
+                 stdout,
+-                TOOL_OUTPUT_DISPLAY_MAX_LINES,
+-                TOOL_OUTPUT_DISPLAY_MAX_CHARS,
++                tool_output_display_max_lines(),
++                tool_output_display_max_chars(),
+             ));
+         }
+     }
+@@ -8394,8 +8427,8 @@ fn format_bash_result(icon: &str, parsed: &serde_json::Value) -> String {
+                 "\x1b[38;5;203m{}\x1b[0m",
+                 truncate_output_for_display(
+                     stderr,
+-                    TOOL_OUTPUT_DISPLAY_MAX_LINES,
+-                    TOOL_OUTPUT_DISPLAY_MAX_CHARS,
++                    tool_output_display_max_lines(),
++                    tool_output_display_max_chars(),
+                 )
+             ));
+         }
+@@ -8556,8 +8589,8 @@ fn format_grep_result(icon: &str, parsed: &serde_json::Value) -> String {
+             "{summary}\n{}",
+             truncate_output_for_display(
+                 content,
+-                TOOL_OUTPUT_DISPLAY_MAX_LINES,
+-                TOOL_OUTPUT_DISPLAY_MAX_CHARS,
++                tool_output_display_max_lines(),
++                tool_output_display_max_chars(),
+             )
+         )
+     } else if !filenames.is_empty() {
+@@ -8578,8 +8611,8 @@ fn format_generic_tool_result(icon: &str, name: &str, parsed: &serde_json::Value
+     };
+     let preview = truncate_output_for_display(
+         &rendered_output,
+-        TOOL_OUTPUT_DISPLAY_MAX_LINES,
+-        TOOL_OUTPUT_DISPLAY_MAX_CHARS,
++        tool_output_display_max_lines(),
++        tool_output_display_max_chars(),
+     );
+ 
+     if preview.is_empty() {
+@@ -12596,7 +12629,8 @@ UU conflicted.rs",
+         let rendered = format_tool_result("bash", &output, false);
+ 
+         assert!(rendered.contains("stdout 000"));
+-        assert!(rendered.contains("stdout 059"));
++        assert!(rendered.contains("stdout 015"));
++        assert!(!rendered.contains("stdout 060"));
+         assert!(!rendered.contains("stdout 119"));
+         assert!(rendered.contains("full result preserved in session"));
+         assert!(output.contains("stdout 119"));
+@@ -12617,7 +12651,7 @@ UU conflicted.rs",
+ 
+         assert!(rendered.contains("plugin_echo"));
+         assert!(rendered.contains("payload 000"));
+-        assert!(rendered.contains("payload 040"));
++        assert!(!rendered.contains("payload 040"));
+         assert!(!rendered.contains("payload 080"));
+         assert!(!rendered.contains("payload 119"));
+         assert!(rendered.contains("full result preserved in session"));
+@@ -12635,7 +12669,8 @@ UU conflicted.rs",
+ 
+         assert!(rendered.contains("plugin_echo"));
+         assert!(rendered.contains("raw 000"));
+-        assert!(rendered.contains("raw 059"));
++        assert!(rendered.contains("raw 015"));
++        assert!(!rendered.contains("raw 060"));
+         assert!(!rendered.contains("raw 119"));
+         assert!(rendered.contains("full result preserved in session"));
+         assert!(output.contains("raw 119"));
+diff --git a/rust/crates/tools/src/lib.rs b/rust/crates/tools/src/lib.rs
+index ff23543..7f09e58 100644
+--- a/rust/crates/tools/src/lib.rs
++++ b/rust/crates/tools/src/lib.rs
+@@ -5590,6 +5590,7 @@ enum ConfigKind {
+     String,
+ }
+ 
++#[allow(clippy::too_many_lines)]
+ fn supported_config_setting(setting: &str) -> Option<ConfigSettingSpec> {
+     Some(match setting {
+         "theme" => ConfigSettingSpec {
+@@ -5646,6 +5647,18 @@ fn supported_config_setting(setting: &str) -> Option<ConfigSettingSpec> {
+             path: &["showTurnDuration"],
+             options: None,
+         },
++        "toolOutputMaxLines" => ConfigSettingSpec {
++            scope: ConfigScope::Global,
++            kind: ConfigKind::String,
++            path: &["toolOutputMaxLines"],
++            options: None,
++        },
++        "toolOutputMaxChars" => ConfigSettingSpec {
++            scope: ConfigScope::Global,
++            kind: ConfigKind::String,
++            path: &["toolOutputMaxChars"],
++            options: None,
++        },
+         "terminalProgressBarEnabled" => ConfigSettingSpec {
+             scope: ConfigScope::Global,
+             kind: ConfigKind::Boolean,
+-- 
+2.43.0
+
