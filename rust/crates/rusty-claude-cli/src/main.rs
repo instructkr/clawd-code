@@ -3132,6 +3132,46 @@ fn parse_git_workspace_summary(status: Option<&str>) -> GitWorkspaceSummary {
     summary
 }
 
+fn read_show_turn_duration_setting() -> bool {
+    let Ok(cwd) = env::current_dir() else {
+        return true;
+    };
+    let Ok(config) = ConfigLoader::default_for(&cwd).load() else {
+        return true;
+    };
+    // runtime::json::JsonValue is crate-private, so we can't name it as
+    // `runtime::json::JsonValue::as_bool` here — the closure form is unavoidable.
+    #[allow(clippy::redundant_closure_for_method_calls)]
+    let value = config
+        .get("showTurnDuration")
+        .and_then(|value| value.as_bool());
+    value.unwrap_or(true)
+}
+
+fn format_turn_duration(duration: Duration) -> String {
+    let secs = duration.as_secs_f64();
+    if secs < 1.0 {
+        format!("{}ms", duration.as_millis())
+    } else if secs < 60.0 {
+        format!("{secs:.1}s")
+    } else {
+        let total_secs = duration.as_secs();
+        let mins = total_secs / 60;
+        let rem = total_secs % 60;
+        format!("{mins}m{rem}s")
+    }
+}
+
+fn write_turn_footer(
+    out: &mut impl Write,
+    duration: Duration,
+    git_branch: Option<&str>,
+) -> io::Result<()> {
+    let duration_str = format_turn_duration(duration);
+    let branch_part = git_branch.map_or(String::new(), |b| format!(" · branch {b}"));
+    writeln!(out, "\x1b[2m· {duration_str}{branch_part}\x1b[0m")
+}
+
 fn resolve_git_branch_for(cwd: &Path) -> Option<String> {
     let branch = run_git_capture_in(cwd, &["branch", "--show-current"])?;
     let branch = branch.trim();
@@ -3721,6 +3761,7 @@ struct LiveCli {
     runtime: BuiltRuntime,
     session: SessionHandle,
     prompt_history: Vec<PromptHistoryEntry>,
+    show_turn_duration: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -4229,6 +4270,7 @@ impl LiveCli {
             runtime,
             session,
             prompt_history: Vec::new(),
+            show_turn_duration: read_show_turn_duration_setting(),
         };
         cli.persist_session()?;
         Ok(cli)
@@ -4324,6 +4366,7 @@ impl LiveCli {
     }
 
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let started = Instant::now();
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
@@ -4351,6 +4394,13 @@ impl LiveCli {
                     );
                 }
                 self.persist_session()?;
+                if self.show_turn_duration {
+                    let branch = env::current_dir()
+                        .ok()
+                        .and_then(|cwd| resolve_git_branch_for(&cwd));
+                    let _ =
+                        write_turn_footer(&mut io::stdout(), started.elapsed(), branch.as_deref());
+                }
                 Ok(())
             }
             Err(error) => {
@@ -9086,8 +9136,9 @@ mod tests {
         format_ultraplan_report, format_unknown_slash_command,
         format_unknown_slash_command_message, format_user_visible_api_error,
         classify_error_kind, is_repl_recoverable_kind, try_recover_repl_turn_error,
-        merge_prompt_with_stdin, normalize_permission_mode, parse_args, parse_export_args,
-        parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
+        format_turn_duration, merge_prompt_with_stdin, normalize_permission_mode, parse_args,
+        parse_export_args, parse_git_status_branch, parse_git_status_metadata_for,
+        parse_git_workspace_summary, write_turn_footer,
         parse_history_count, permission_policy, print_help_to, push_output_block,
         render_config_report, render_diff_report, render_diff_report_for, render_memory_report,
         split_error_hint,
@@ -9145,6 +9196,49 @@ mod tests {
             None,
         )])
         .expect("plugin tool registry should build")
+    }
+
+    #[test]
+    fn turn_footer_subsecond_renders_milliseconds() {
+        let mut buf = Vec::new();
+        write_turn_footer(&mut buf, Duration::from_millis(345), None).expect("write footer");
+        let out = String::from_utf8(buf).expect("utf8 footer");
+        assert!(out.contains("345ms"), "expected 345ms in {out:?}");
+        assert!(!out.contains("branch"), "no branch part expected");
+    }
+
+    #[test]
+    fn turn_footer_seconds_render_with_one_decimal_and_branch() {
+        let mut buf = Vec::new();
+        write_turn_footer(&mut buf, Duration::from_millis(3200), Some("fix-foo"))
+            .expect("write footer");
+        let out = String::from_utf8(buf).expect("utf8 footer");
+        assert!(out.contains("3.2s"), "expected 3.2s in {out:?}");
+        assert!(
+            out.contains("branch fix-foo"),
+            "expected branch fix-foo in {out:?}"
+        );
+    }
+
+    #[test]
+    fn turn_footer_minutes_format_for_long_turns() {
+        let mut buf = Vec::new();
+        write_turn_footer(&mut buf, Duration::from_secs(75), None).expect("write footer");
+        let out = String::from_utf8(buf).expect("utf8 footer");
+        assert!(out.contains("1m15s"), "expected 1m15s in {out:?}");
+    }
+
+    #[test]
+    fn turn_duration_formatter_handles_boundary_values() {
+        assert_eq!(format_turn_duration(Duration::from_millis(0)), "0ms");
+        assert_eq!(format_turn_duration(Duration::from_millis(999)), "999ms");
+        assert_eq!(format_turn_duration(Duration::from_secs(1)), "1.0s");
+        assert_eq!(format_turn_duration(Duration::from_secs(59)), "59.0s");
+        assert_eq!(format_turn_duration(Duration::from_mins(1)), "1m0s");
+        assert_eq!(
+            format_turn_duration(Duration::from_mins(61) + Duration::from_secs(1)),
+            "61m1s"
+        );
     }
 
     #[test]
