@@ -1,0 +1,201 @@
+From bdbea89c2de6dbfe8e7bd950b2495cb07ca419c0 Mon Sep 17 00:00:00 2001
+From: prcdslnc13 <prcdslnc13@gmail.com>
+Date: Tue, 28 Apr 2026 13:56:45 -0500
+Subject: [PATCH] Quiet MCP server stderr by default; gate verbose behind
+ CLAW_MCP_VERBOSE
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Patch 0009 switched MCP stdio framing to NDJSON but left
+`McpStdioProcess::spawn` inheriting stderr from the parent. That meant
+any benign warning the spawned MCP server emitted at startup —
+e.g. ONNX Runtime's GPU device-discovery line under WSL2, which the
+brain MCP triggers via `fastembed` — landed directly on the user's TTY
+the moment claw started.
+
+Pipe MCP stderr instead of inheriting it. A background tokio task
+drains the pipe and routes lines to a per-server log file at
+`<config_home>/logs/mcp-<server>.stderr` so panics and real errors
+remain diagnosable. Set `CLAW_MCP_VERBOSE=1` to restore the old
+inherit-stderr behavior for live debugging.
+
+Two env knobs:
+
+- CLAW_MCP_VERBOSE=1   forward stderr to the parent (today's behavior).
+- CLAW_MCP_LOG_DISABLED=1   discard stderr instead of writing to disk
+  (used by integration tests to avoid leaving empty log files in the
+  developer's real ~/.claw/logs/).
+
+Runtime crate's own lib tests skip the log path via cfg!(test).
+
+Tokio's `fs` feature is added to the runtime crate so the drain task
+can append asynchronously without blocking the executor.
+
+Refs: carried-forward "Patch 0009 MCP stderr noise" from the
+2026-04-28 session checkpoint.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ rust/crates/runtime/Cargo.toml       |  2 +-
+ rust/crates/runtime/src/mcp_stdio.rs | 91 +++++++++++++++++++++++++++-
+ 2 files changed, 89 insertions(+), 4 deletions(-)
+
+diff --git a/rust/crates/runtime/Cargo.toml b/rust/crates/runtime/Cargo.toml
+index b1bd04f..e2780ef 100644
+--- a/rust/crates/runtime/Cargo.toml
++++ b/rust/crates/runtime/Cargo.toml
+@@ -13,7 +13,7 @@ regex = "1"
+ serde = { version = "1", features = ["derive"] }
+ serde_json.workspace = true
+ telemetry = { path = "../telemetry" }
+-tokio = { version = "1", features = ["io-std", "io-util", "macros", "process", "rt", "rt-multi-thread", "time"] }
++tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "process", "rt", "rt-multi-thread", "time"] }
+ walkdir = "2"
+ 
+ [lints]
+diff --git a/rust/crates/runtime/src/mcp_stdio.rs b/rust/crates/runtime/src/mcp_stdio.rs
+index d661e29..03d2937 100644
+--- a/rust/crates/runtime/src/mcp_stdio.rs
++++ b/rust/crates/runtime/src/mcp_stdio.rs
+@@ -1,6 +1,7 @@
+ use std::collections::BTreeMap;
+ use std::future::Future;
+ use std::io;
++use std::path::{Path, PathBuf};
+ use std::process::Stdio;
+ use std::time::Duration;
+ 
+@@ -8,7 +9,7 @@ use serde::de::DeserializeOwned;
+ use serde::{Deserialize, Serialize};
+ use serde_json::Value as JsonValue;
+ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
++use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
+ use tokio::time::timeout;
+ 
+ use crate::config::{McpTransport, RuntimeConfig, ScopedMcpServerConfig};
+@@ -1148,12 +1149,24 @@ pub struct McpStdioProcess {
+ 
+ impl McpStdioProcess {
+     pub fn spawn(transport: &McpStdioTransport) -> io::Result<Self> {
++        Self::spawn_with_logging(transport, None)
++    }
++
++    pub fn spawn_with_logging(
++        transport: &McpStdioTransport,
++        server_name: Option<&str>,
++    ) -> io::Result<Self> {
++        let verbose = mcp_stderr_is_verbose();
+         let mut command = Command::new(&transport.command);
+         command
+             .args(&transport.args)
+             .stdin(Stdio::piped())
+             .stdout(Stdio::piped())
+-            .stderr(Stdio::inherit());
++            .stderr(if verbose {
++                Stdio::inherit()
++            } else {
++                Stdio::piped()
++            });
+         apply_env(&mut command, &transport.env);
+ 
+         let mut child = command.spawn()?;
+@@ -1166,6 +1179,13 @@ impl McpStdioProcess {
+             .take()
+             .ok_or_else(|| io::Error::other("stdio MCP process missing stdout pipe"))?;
+ 
++        if !verbose {
++            if let Some(stderr) = child.stderr.take() {
++                let log_path = server_name.and_then(mcp_stderr_log_path);
++                tokio::spawn(drain_mcp_stderr(stderr, log_path));
++            }
++        }
++
+         Ok(Self {
+             child,
+             stdin,
+@@ -1336,7 +1356,9 @@ impl McpStdioProcess {
+ 
+ pub fn spawn_mcp_stdio_process(bootstrap: &McpClientBootstrap) -> io::Result<McpStdioProcess> {
+     match &bootstrap.transport {
+-        McpClientTransport::Stdio(transport) => McpStdioProcess::spawn(transport),
++        McpClientTransport::Stdio(transport) => {
++            McpStdioProcess::spawn_with_logging(transport, Some(&bootstrap.server_name))
++        }
+         other => Err(io::Error::new(
+             io::ErrorKind::InvalidInput,
+             format!(
+@@ -1347,6 +1369,69 @@ pub fn spawn_mcp_stdio_process(bootstrap: &McpClientBootstrap) -> io::Result<Mcp
+     }
+ }
+ 
++const MCP_VERBOSE_ENV: &str = "CLAW_MCP_VERBOSE";
++const MCP_LOG_DISABLED_ENV: &str = "CLAW_MCP_LOG_DISABLED";
++
++fn mcp_stderr_is_verbose() -> bool {
++    std::env::var_os(MCP_VERBOSE_ENV).is_some_and(|value| !value.is_empty())
++}
++
++fn mcp_stderr_log_path(server_name: &str) -> Option<PathBuf> {
++    if cfg!(test) || std::env::var_os(MCP_LOG_DISABLED_ENV).is_some_and(|v| !v.is_empty()) {
++        return None;
++    }
++    Some(
++        crate::config::default_config_home()
++            .join("logs")
++            .join(format!("mcp-{}.stderr", sanitize_for_filename(server_name))),
++    )
++}
++
++fn sanitize_for_filename(name: &str) -> String {
++    let sanitized: String = name
++        .chars()
++        .map(|c| {
++            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
++                c
++            } else {
++                '_'
++            }
++        })
++        .collect();
++    if sanitized.is_empty() {
++        "unnamed".to_string()
++    } else {
++        sanitized
++    }
++}
++
++async fn drain_mcp_stderr(stderr: ChildStderr, log_path: Option<PathBuf>) {
++    let mut reader = BufReader::new(stderr).lines();
++    let mut log_writer = match log_path {
++        Some(ref path) => open_mcp_stderr_log(path).await,
++        None => None,
++    };
++    while let Ok(Some(line)) = reader.next_line().await {
++        if let Some(file) = log_writer.as_mut() {
++            let _ = file.write_all(line.as_bytes()).await;
++            let _ = file.write_all(b"\n").await;
++            let _ = file.flush().await;
++        }
++    }
++}
++
++async fn open_mcp_stderr_log(path: &Path) -> Option<tokio::fs::File> {
++    if let Some(parent) = path.parent() {
++        tokio::fs::create_dir_all(parent).await.ok()?;
++    }
++    tokio::fs::OpenOptions::new()
++        .create(true)
++        .append(true)
++        .open(path)
++        .await
++        .ok()
++}
++
+ fn apply_env(command: &mut Command, env: &BTreeMap<String, String>) {
+     for (key, value) in env {
+         command.env(key, value);
+-- 
+2.43.0
+
