@@ -577,7 +577,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "Agent",
-            description: "Launch a specialized agent task and persist its handoff metadata.",
+            description: "Launch a background agent task that runs asynchronously. For synchronous read-only exploration, use SubAgent instead. Agent is for long-running background work that should not block the conversation.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
