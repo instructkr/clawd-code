@@ -3606,6 +3606,29 @@ fn run_repl(
     println!("{}", cli.startup_banner());
     println!("{}", format_connected_line(&cli.model));
 
+    // Validate key config fields and prompt setup wizard if missing
+    {
+        let cwd = std::env::current_dir().unwrap_or_default();
+        if let Ok(config) = runtime::ConfigLoader::default_for(&cwd).load() {
+            let mut missing: Vec<&str> = Vec::new();
+            if config.provider().api_key().is_none() {
+                missing.push("provider.apiKey");
+            }
+            if config.provider().base_url().is_none() {
+                missing.push("provider.baseUrl");
+            }
+            if config.subagent_model().is_none() {
+                missing.push("subagentModel");
+            }
+            if !missing.is_empty() {
+                eprintln!("
+  [33mWarning: Missing config fields:[0m {}", missing.join(", "));
+                eprintln!("  [2mRun [1mclaw setup[0m[2m or type [1m/setup[0m[2m to configure.[0m
+");
+            }
+        }
+    }
+
     // Discover and register LSP servers
     let lsp_servers = runtime::lsp_discovery::discover_available_servers();
     if !lsp_servers.is_empty() {
