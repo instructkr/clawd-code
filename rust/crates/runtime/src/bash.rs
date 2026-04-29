@@ -309,9 +309,12 @@ fn prepare_sandbox_dirs(cwd: &std::path::Path) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(windows))]
     use super::{execute_bash, BashCommandInput};
+    #[cfg(not(windows))]
     use crate::sandbox::FilesystemIsolationMode;
 
+    #[cfg(not(windows))]
     #[test]
     fn executes_simple_command() {
         let output = execute_bash(BashCommandInput {
@@ -332,6 +335,7 @@ mod tests {
         assert!(output.sandbox_status.is_some());
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn disables_sandbox_when_requested() {
         let output = execute_bash(BashCommandInput {

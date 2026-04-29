@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::fmt::{Display, Formatter};
 
 use serde_json::{Map, Value};
@@ -13,7 +14,7 @@ use crate::permissions::{
     PermissionContext, PermissionOutcome, PermissionPolicy, PermissionPrompter,
 };
 use crate::session::{ContentBlock, ConversationMessage, Session};
-use crate::usage::{TokenUsage, UsageTracker};
+use crate::usage::{pricing_for_model, TokenUsage, UsageTracker};
 
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS";
@@ -132,6 +133,8 @@ pub struct ConversationRuntime<C, T> {
     max_iterations: usize,
     usage_tracker: UsageTracker,
     hook_runner: HookRunner,
+    auto_tdd: crate::AutoTddConfig,
+    model: Option<String>,
     auto_compaction_input_tokens_threshold: u32,
     hook_abort_signal: HookAbortSignal,
     hook_progress_reporter: Option<Box<dyn HookProgressReporter>>,
@@ -181,6 +184,8 @@ where
             max_iterations: usize::MAX,
             usage_tracker,
             hook_runner: HookRunner::from_feature_config(feature_config),
+            auto_tdd: feature_config.auto_tdd().clone(),
+            model: feature_config.model().map(ToOwned::to_owned),
             auto_compaction_input_tokens_threshold: auto_compaction_threshold_from_env(),
             hook_abort_signal: HookAbortSignal::default(),
             hook_progress_reporter: None,
@@ -482,6 +487,15 @@ where
                                 || post_hook_result.is_cancelled(),
                         );
 
+                        if !is_error {
+                            self.apply_auto_tdd_after_tool(
+                                &tool_name,
+                                &effective_input,
+                                &mut output,
+                                &mut is_error,
+                            );
+                        }
+
                         ConversationMessage::tool_result(tool_use_id, tool_name, output, is_error)
                     }
                     PermissionOutcome::Deny { reason } => ConversationMessage::tool_result(
@@ -670,6 +684,34 @@ where
             "prompt_cache_events".to_string(),
             Value::from(summary.prompt_cache_events.len() as u64),
         );
+        attributes.insert(
+            "usage".to_string(),
+            serde_json::json!({
+                "input_tokens": summary.usage.input_tokens,
+                "output_tokens": summary.usage.output_tokens,
+                "cache_creation_input_tokens": summary.usage.cache_creation_input_tokens,
+                "cache_read_input_tokens": summary.usage.cache_read_input_tokens,
+                "total_tokens": summary.usage.total_tokens(),
+            }),
+        );
+
+        let pricing = self.model.as_deref().and_then(pricing_for_model);
+        let cost = pricing.map_or_else(
+            || summary.usage.estimate_cost_usd(),
+            |p| summary.usage.estimate_cost_usd_with_pricing(p),
+        );
+        attributes.insert(
+            "cost".to_string(),
+            serde_json::json!({
+                "model": self.model,
+                "pricing_known": pricing.is_some(),
+                "total_cost_usd": cost.total_cost_usd(),
+                "input_cost_usd": cost.input_cost_usd,
+                "output_cost_usd": cost.output_cost_usd,
+                "cache_creation_cost_usd": cost.cache_creation_cost_usd,
+                "cache_read_cost_usd": cost.cache_read_cost_usd,
+            }),
+        );
         session_tracer.record("turn_completed", attributes);
     }
 
@@ -682,6 +724,149 @@ where
         attributes.insert("iteration".to_string(), Value::from(iteration as u64));
         attributes.insert("error".to_string(), Value::String(error.to_string()));
         session_tracer.record("turn_failed", attributes);
+    }
+}
+
+impl<C, T> ConversationRuntime<C, T> {
+    fn apply_auto_tdd_after_tool(
+        &self,
+        tool_name: &str,
+        tool_input: &str,
+        output: &mut String,
+        is_error: &mut bool,
+    ) {
+        if !self.auto_tdd.enabled() {
+            return;
+        }
+        if self.auto_tdd.commands().is_empty() {
+            return;
+        }
+        if !self.auto_tdd.tools().iter().any(|t| t == tool_name) {
+            return;
+        }
+        if std::env::var("CLAW_STAGING_WRITE")
+            .ok()
+            .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        {
+            return;
+        }
+        // If the tool output indicates a staged write, avoid running tests on unchanged working tree.
+        if output.contains("\"kind\":\"stage\"") || output.contains("\"kind\": \"stage\"") {
+            return;
+        }
+
+        let mut section = String::new();
+        section.push_str("\n\n---\nAuto-TDD (post-write checks)\n");
+        let _ = writeln!(section, "tool: {tool_name}");
+        let _ = writeln!(section, "input: {tool_input}");
+
+        for cmd in self.auto_tdd.commands() {
+            let run = run_shell_command(cmd);
+            section.push_str("\n$ ");
+            section.push_str(cmd);
+            section.push('\n');
+            match run {
+                CommandRun::Ok { stdout, stderr } => {
+                    if !stdout.is_empty() {
+                        section.push_str(&truncate_for_tool_output(&stdout));
+                        section.push('\n');
+                    }
+                    if !stderr.is_empty() {
+                        section.push_str(&truncate_for_tool_output(&stderr));
+                        section.push('\n');
+                    }
+                }
+                CommandRun::Failed {
+                    code,
+                    stdout,
+                    stderr,
+                } => {
+                    *is_error = true;
+                    let _ = writeln!(section, "(exit code {code})");
+                    if !stdout.is_empty() {
+                        section.push_str(&truncate_for_tool_output(&stdout));
+                        section.push('\n');
+                    }
+                    if !stderr.is_empty() {
+                        section.push_str(&truncate_for_tool_output(&stderr));
+                        section.push('\n');
+                    }
+                    break;
+                }
+            }
+        }
+
+        output.push_str(&section);
+    }
+}
+
+enum CommandRun {
+    Ok {
+        stdout: String,
+        stderr: String,
+    },
+    Failed {
+        code: i32,
+        stdout: String,
+        stderr: String,
+    },
+}
+
+fn truncate_for_tool_output(s: &str) -> String {
+    const LIMIT: usize = 24_000;
+    if s.len() <= LIMIT {
+        return s.to_string();
+    }
+    let mut out = s[..LIMIT].to_string();
+    out.push_str("\n… truncated …");
+    out
+}
+
+fn run_shell_command(command: &str) -> CommandRun {
+    use std::process::Command;
+
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut c = Command::new("cmd");
+        c.arg("/C").arg(command);
+        c
+    };
+
+    #[cfg(not(windows))]
+    let mut cmd = {
+        let mut c = Command::new("sh");
+        c.arg("-lc").arg(command);
+        c
+    };
+
+    let output = match cmd.output() {
+        Ok(o) => o,
+        Err(e) => {
+            return CommandRun::Failed {
+                code: 127,
+                stdout: String::new(),
+                stderr: e.to_string(),
+            };
+        }
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    match output.status.code() {
+        Some(0) => CommandRun::Ok { stdout, stderr },
+        Some(code) => CommandRun::Failed {
+            code,
+            stdout,
+            stderr,
+        },
+        None => CommandRun::Failed {
+            code: 1,
+            stdout,
+            stderr: if stderr.is_empty() {
+                "terminated by signal".to_string()
+            } else {
+                stderr
+            },
+        },
     }
 }
 
@@ -841,6 +1026,16 @@ mod tests {
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
     use telemetry::{MemoryTelemetrySink, SessionTracer, TelemetryEvent};
+
+    #[cfg(windows)]
+    fn hook_print(text: &str) -> String {
+        format!(r"echo {text}")
+    }
+
+    #[cfg(not(windows))]
+    fn hook_print(text: &str) -> String {
+        format!("printf '{text}'")
+    }
 
     struct ScriptedApiClient {
         call_count: usize,
@@ -1219,8 +1414,8 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
             &RuntimeFeatureConfig::default().with_hooks(RuntimeHookConfig::new(
-                vec![shell_snippet("printf 'pre hook ran'")],
-                vec![shell_snippet("printf 'post hook ran'")],
+                vec![shell_snippet(&hook_print("pre hook ran"))],
+                vec![shell_snippet(&hook_print("post hook ran"))],
                 Vec::new(),
             )),
         );
@@ -1297,8 +1492,8 @@ mod tests {
             vec!["system".to_string()],
             &RuntimeFeatureConfig::default().with_hooks(RuntimeHookConfig::new(
                 Vec::new(),
-                vec![shell_snippet("printf 'post hook should not run'")],
-                vec![shell_snippet("printf 'failure hook ran'")],
+                vec![shell_snippet(&hook_print("post hook should not run"))],
+                vec![shell_snippet(&hook_print("failure hook ran"))],
             )),
         );
 

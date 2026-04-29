@@ -65,6 +65,32 @@ pub struct RuntimeFeatureConfig {
     sandbox: SandboxConfig,
     provider_fallbacks: ProviderFallbackConfig,
     trusted_roots: Vec<String>,
+    auto_tdd: AutoTddConfig,
+}
+
+/// Configures automatic lint/test runs after write tools complete.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AutoTddConfig {
+    enabled: bool,
+    tools: Vec<String>,
+    commands: Vec<String>,
+}
+
+impl AutoTddConfig {
+    #[must_use]
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    #[must_use]
+    pub fn tools(&self) -> &[String] {
+        &self.tools
+    }
+
+    #[must_use]
+    pub fn commands(&self) -> &[String] {
+        &self.commands
+    }
 }
 
 /// Ordered chain of fallback model identifiers used when the primary
@@ -315,6 +341,7 @@ impl ConfigLoader {
             sandbox: parse_optional_sandbox_config(&merged_value)?,
             provider_fallbacks: parse_optional_provider_fallbacks(&merged_value)?,
             trusted_roots: parse_optional_trusted_roots(&merged_value)?,
+            auto_tdd: parse_optional_auto_tdd_config(&merged_value)?,
         };
 
         Ok(RuntimeConfig {
@@ -414,6 +441,11 @@ impl RuntimeConfig {
     pub fn trusted_roots(&self) -> &[String] {
         &self.feature_config.trusted_roots
     }
+
+    #[must_use]
+    pub fn auto_tdd(&self) -> &AutoTddConfig {
+        &self.feature_config.auto_tdd
+    }
 }
 
 impl RuntimeFeatureConfig {
@@ -482,6 +514,11 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn trusted_roots(&self) -> &[String] {
         &self.trusted_roots
+    }
+
+    #[must_use]
+    pub fn auto_tdd(&self) -> &AutoTddConfig {
+        &self.auto_tdd
     }
 }
 
@@ -752,6 +789,26 @@ fn parse_optional_hooks_config(root: &JsonValue) -> Result<RuntimeHookConfig, Co
         return Ok(RuntimeHookConfig::default());
     };
     parse_optional_hooks_config_object(object, "merged settings.hooks")
+}
+
+fn parse_optional_auto_tdd_config(root: &JsonValue) -> Result<AutoTddConfig, ConfigError> {
+    let Some(object) = root.as_object() else {
+        return Ok(AutoTddConfig::default());
+    };
+    let Some(value) = object.get("autoTdd") else {
+        return Ok(AutoTddConfig::default());
+    };
+    let auto = expect_object(value, "merged settings.autoTdd")?;
+    let enabled = optional_bool(auto, "enabled", "merged settings.autoTdd")?.unwrap_or(false);
+    let tools = optional_string_array(auto, "tools", "merged settings.autoTdd")?
+        .unwrap_or_else(|| vec![String::from("write_file"), String::from("edit_file")]);
+    let commands =
+        optional_string_array(auto, "commands", "merged settings.autoTdd")?.unwrap_or_default();
+    Ok(AutoTddConfig {
+        enabled,
+        tools,
+        commands,
+    })
 }
 
 fn parse_optional_hooks_config_object(

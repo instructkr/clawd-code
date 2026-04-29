@@ -191,15 +191,19 @@ fn run_claw(
     args: &[&str],
 ) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_claw"));
+    command.current_dir(cwd);
+    // On Windows, clearing the entire environment can break process execution
+    // (missing SystemRoot, PATHEXT, etc.) and hang the test harness.
+    #[cfg(not(windows))]
+    {
+        command.env_clear().env("PATH", "/usr/bin:/bin");
+    }
     command
-        .current_dir(cwd)
-        .env_clear()
         .env("ANTHROPIC_API_KEY", "test-compact-key")
         .env("ANTHROPIC_BASE_URL", base_url)
         .env("CLAW_CONFIG_HOME", config_home)
         .env("HOME", home)
         .env("NO_COLOR", "1")
-        .env("PATH", "/usr/bin:/bin")
         .args(args);
     command.output().expect("claw should launch")
 }

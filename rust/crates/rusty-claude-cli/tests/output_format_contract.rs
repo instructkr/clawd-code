@@ -402,8 +402,17 @@ fn assert_json_command_with_env(current_dir: &Path, args: &[&str], envs: &[(&str
 fn run_claw(current_dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_claw"));
     command.current_dir(current_dir).args(args);
+    let mut has_home = false;
     for (key, value) in envs {
+        if *key == "HOME" {
+            has_home = true;
+        }
         command.env(key, value);
+    }
+    if !has_home {
+        let home = current_dir.join("home");
+        fs::create_dir_all(&home).expect("home dir should exist");
+        command.env("HOME", &home);
     }
     command.output().expect("claw should launch")
 }

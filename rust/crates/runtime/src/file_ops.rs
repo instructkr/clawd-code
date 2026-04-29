@@ -5,15 +5,56 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use glob::Pattern;
+use ignore::WalkBuilder;
 use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
-use walkdir::WalkDir;
 
 /// Maximum file size that can be read (10 MB).
 const MAX_READ_SIZE: u64 = 10 * 1024 * 1024;
 
 /// Maximum file size that can be written (10 MB).
 const MAX_WRITE_SIZE: usize = 10 * 1024 * 1024;
+
+fn staging_write_enabled() -> bool {
+    matches!(
+        std::env::var("CLAW_STAGING_WRITE").ok().as_deref(),
+        Some("1" | "true" | "TRUE" | "yes" | "YES")
+    )
+}
+
+fn staging_dir(workspace_root: &Path) -> PathBuf {
+    if let Ok(p) = std::env::var("CLAW_STAGING_DIR") {
+        return PathBuf::from(p);
+    }
+    workspace_root.join(".claw").join("staging")
+}
+
+fn now_ms() -> u128 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+fn structured_patch_to_unified_diff(path: &str, hunks: &[StructuredPatchHunk]) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(out, "--- a/{path}");
+    let _ = writeln!(out, "+++ b/{path}");
+    for h in hunks {
+        let _ = writeln!(
+            out,
+            "@@ -{},{} +{},{} @@",
+            h.old_start, h.old_lines, h.new_start, h.new_lines
+        );
+        for line in &h.lines {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
 
 /// Check whether a file appears to contain binary content by examining
 /// the first chunk for NUL bytes.
@@ -302,26 +343,89 @@ pub fn glob_search(pattern: &str, path: Option<&str>) -> io::Result<GlobSearchOu
         .map(normalize_path)
         .transpose()?
         .unwrap_or(std::env::current_dir()?);
-    let search_pattern = if Path::new(pattern).is_absolute() {
-        pattern.to_owned()
-    } else {
-        base_dir.join(pattern).to_string_lossy().into_owned()
-    };
-
-    // The `glob` crate does not support brace expansion ({a,b,c}).
-    // Expand braces into multiple patterns so patterns like
-    // `Assets/**/*.{cs,uxml,uss}` work correctly.
-    let expanded = expand_braces(&search_pattern);
-
-    let mut seen = std::collections::HashSet::new();
-    let mut matches = Vec::new();
-    for pat in &expanded {
-        let entries = glob::glob(pat)
+    if Path::new(pattern).is_absolute() {
+        // Keep legacy behavior for absolute patterns.
+        let mut matches = Vec::new();
+        let entries = glob::glob(pattern)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
         for entry in entries.flatten() {
-            if entry.is_file() && seen.insert(entry.clone()) {
+            if entry.is_file() {
                 matches.push(entry);
             }
+        }
+
+        matches.sort_by_key(|path| {
+            fs::metadata(path)
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .map(Reverse)
+        });
+
+        let truncated = matches.len() > 100;
+        let filenames = matches
+            .into_iter()
+            .take(100)
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        return Ok(GlobSearchOutput {
+            duration_ms: started.elapsed().as_millis(),
+            num_files: filenames.len(),
+            filenames,
+            truncated,
+        });
+    }
+
+    // Relative patterns: walk the tree and respect .gitignore/.ignore + custom .clawignore.
+    let mut b = globset::GlobSetBuilder::new();
+    let g = globset::Glob::new(pattern)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+    b.add(g);
+    let set = b
+        .build()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+
+    // Brace expansion: build multiple globsets so patterns like
+    // `Assets/**/*.{cs,uxml,uss}` match all alternatives.
+    //
+    // Note: we intentionally do *not* use the `glob` crate for relative patterns,
+    // because we want to respect `.gitignore` / `.ignore` and a custom `.clawignore`.
+    let expanded = expand_braces(pattern);
+    let sets = expanded
+        .into_iter()
+        .map(|pat| {
+            let mut b = globset::GlobSetBuilder::new();
+            let g = globset::Glob::new(&pat)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+            b.add(g);
+            b.build()
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+
+    let mut matches = Vec::new();
+    let mut walker = WalkBuilder::new(&base_dir);
+    walker
+        .follow_links(false)
+        .git_ignore(true)
+        .git_exclude(true)
+        .ignore(true)
+        .hidden(false)
+        .add_custom_ignore_filename(".clawignore");
+    for result in walker.build() {
+        let Ok(entry) = result else {
+            continue;
+        };
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(rel) = path.strip_prefix(&base_dir) else {
+            continue;
+        };
+        let rel_s = rel.to_string_lossy().replace('\\', "/");
+        if sets.iter().any(|set| set.is_match(rel_s.as_str())) {
+            matches.push(path.to_path_buf());
         }
     }
 
@@ -379,7 +483,7 @@ pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
     let mut content_lines = Vec::new();
     let mut total_matches = 0usize;
 
-    for file_path in collect_search_files(&base_path)? {
+    for file_path in collect_search_files(&base_path) {
         if !matches_optional_filters(&file_path, glob_filter.as_ref(), file_type) {
             continue;
         }
@@ -457,19 +561,29 @@ pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
     })
 }
 
-fn collect_search_files(base_path: &Path) -> io::Result<Vec<PathBuf>> {
+fn collect_search_files(base_path: &Path) -> Vec<PathBuf> {
     if base_path.is_file() {
-        return Ok(vec![base_path.to_path_buf()]);
+        return vec![base_path.to_path_buf()];
     }
 
     let mut files = Vec::new();
-    for entry in WalkDir::new(base_path) {
-        let entry = entry.map_err(|error| io::Error::other(error.to_string()))?;
-        if entry.file_type().is_file() {
+    let mut walker = WalkBuilder::new(base_path);
+    walker
+        .follow_links(false)
+        .git_ignore(true)
+        .git_exclude(true)
+        .ignore(true)
+        .hidden(false)
+        .add_custom_ignore_filename(".clawignore");
+    for result in walker.build() {
+        let Ok(entry) = result else {
+            continue;
+        };
+        if entry.file_type().is_some_and(|t| t.is_file()) {
             files.push(entry.path().to_path_buf());
         }
     }
-    Ok(files)
+    files
 }
 
 fn matches_optional_filters(
@@ -593,6 +707,52 @@ pub fn write_file_in_workspace(
         .canonicalize()
         .unwrap_or_else(|_| workspace_root.to_path_buf());
     validate_workspace_boundary(&absolute_path, &canonical_root)?;
+
+    if staging_write_enabled() {
+        if content.len() > MAX_WRITE_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "content is too large ({} bytes, max {} bytes)",
+                    content.len(),
+                    MAX_WRITE_SIZE
+                ),
+            ));
+        }
+
+        let original_file = fs::read_to_string(&absolute_path).ok();
+        let structured_patch = make_patch(original_file.as_deref().unwrap_or(""), content);
+
+        let rel_path = absolute_path
+            .strip_prefix(&canonical_root)
+            .unwrap_or(&absolute_path)
+            .to_string_lossy()
+            .replace('\\', "/");
+
+        let staging_root = staging_dir(&canonical_root);
+        let batch_dir = staging_root.join(format!("write-{}", now_ms()));
+        let proposed_path = batch_dir.join(rel_path.as_str());
+        let diff_path = batch_dir.join(format!("{rel_path}.diff"));
+        if let Some(parent) = proposed_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&proposed_path, content)?;
+        let diff = structured_patch_to_unified_diff(&rel_path, &structured_patch);
+        if let Some(parent) = diff_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&diff_path, diff)?;
+
+        return Ok(WriteFileOutput {
+            kind: String::from("stage"),
+            file_path: absolute_path.to_string_lossy().into_owned(),
+            content: content.to_owned(),
+            structured_patch,
+            original_file,
+            git_diff: None,
+        });
+    }
+
     write_file(path, content)
 }
 
@@ -610,6 +770,59 @@ pub fn edit_file_in_workspace(
         .canonicalize()
         .unwrap_or_else(|_| workspace_root.to_path_buf());
     validate_workspace_boundary(&absolute_path, &canonical_root)?;
+
+    if staging_write_enabled() {
+        let original_file = fs::read_to_string(&absolute_path)?;
+        if old_string == new_string {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "old_string and new_string must differ",
+            ));
+        }
+        if !original_file.contains(old_string) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "old_string not found in file",
+            ));
+        }
+        let updated = if replace_all {
+            original_file.replace(old_string, new_string)
+        } else {
+            original_file.replacen(old_string, new_string, 1)
+        };
+
+        let structured_patch = make_patch(&original_file, &updated);
+        let rel_path = absolute_path
+            .strip_prefix(&canonical_root)
+            .unwrap_or(&absolute_path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let staging_root = staging_dir(&canonical_root);
+        let batch_dir = staging_root.join(format!("edit-{}", now_ms()));
+        let proposed_path = batch_dir.join(rel_path.as_str());
+        let diff_path = batch_dir.join(format!("{rel_path}.diff"));
+        if let Some(parent) = proposed_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&proposed_path, &updated)?;
+        let diff = structured_patch_to_unified_diff(&rel_path, &structured_patch);
+        if let Some(parent) = diff_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&diff_path, diff)?;
+
+        return Ok(EditFileOutput {
+            file_path: absolute_path.to_string_lossy().into_owned(),
+            old_string: old_string.to_owned(),
+            new_string: new_string.to_owned(),
+            original_file,
+            structured_patch,
+            user_modified: false,
+            replace_all,
+            git_diff: None,
+        });
+    }
+
     edit_file(path, old_string, new_string, replace_all)
 }
 
@@ -742,17 +955,52 @@ mod tests {
         let outside = temp_path("symlink-target.txt");
         std::fs::write(&outside, "target content").expect("target should write");
 
-        let link_path = workspace.join("escape-link.txt");
+        let _link_path = workspace.join("escape-link.txt");
         #[cfg(unix)]
         {
-            std::os::unix::fs::symlink(&outside, &link_path).expect("symlink should create");
-            assert!(is_symlink_escape(&link_path, &workspace).expect("check should succeed"));
+            std::os::unix::fs::symlink(&outside, &_link_path).expect("symlink should create");
+            assert!(is_symlink_escape(&_link_path, &workspace).expect("check should succeed"));
         }
 
         // Non-symlink file should not be an escape
         let normal = workspace.join("normal.txt");
         std::fs::write(&normal, "normal content").expect("normal file should write");
         assert!(!is_symlink_escape(&normal, &workspace).expect("check should succeed"));
+    }
+
+    #[test]
+    fn staging_write_creates_diff_without_modifying_file() {
+        let workspace = temp_path("staging-workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace dir should be created");
+        let file = workspace.join("demo.txt");
+        write_file(file.to_string_lossy().as_ref(), "old").expect("seed write");
+
+        std::env::set_var("CLAW_STAGING_WRITE", "1");
+        let out =
+            super::write_file_in_workspace(file.to_string_lossy().as_ref(), "new", &workspace)
+                .expect("staged write should succeed");
+        assert_eq!(out.kind, "stage");
+        assert_eq!(
+            std::fs::read_to_string(&file).expect("original should remain"),
+            "old"
+        );
+
+        let staging = workspace.join(".claw").join("staging");
+        let mut found_diff = false;
+        for entry in walkdir::WalkDir::new(&staging) {
+            let entry = entry.expect("walk");
+            if entry.path().is_file()
+                && entry
+                    .path()
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("diff"))
+            {
+                found_diff = true;
+                break;
+            }
+        }
+        assert!(found_diff, "expected a staged .diff file");
+        std::env::remove_var("CLAW_STAGING_WRITE");
     }
 
     #[test]
@@ -791,6 +1039,68 @@ mod tests {
     }
 
     #[test]
+    fn glob_and_grep_respect_gitignore_and_clawignore() {
+        let dir = temp_path("search-ignore-dir");
+        std::fs::create_dir_all(&dir).expect("directory should be created");
+        std::fs::create_dir_all(dir.join(".git")).expect("repo marker");
+        std::fs::write(dir.join(".gitignore"), "node_modules/\n").expect("write gitignore");
+        std::fs::write(dir.join(".clawignore"), "ignored_dir/\n").expect("write clawignore");
+
+        let kept = dir.join("src").join("kept.rs");
+        std::fs::create_dir_all(kept.parent().expect("parent")).expect("mk src");
+        write_file(
+            kept.to_string_lossy().as_ref(),
+            "fn kept() {\n println!(\"hello\");\n}\n",
+        )
+        .expect("kept write");
+
+        let ignored_nm = dir.join("node_modules").join("ignored.rs");
+        std::fs::create_dir_all(ignored_nm.parent().expect("parent")).expect("mk node_modules");
+        write_file(
+            ignored_nm.to_string_lossy().as_ref(),
+            "fn ignored() {\n println!(\"hello\");\n}\n",
+        )
+        .expect("ignored write");
+
+        let ignored_custom = dir.join("ignored_dir").join("also_ignored.rs");
+        std::fs::create_dir_all(ignored_custom.parent().expect("parent")).expect("mk ignored_dir");
+        write_file(
+            ignored_custom.to_string_lossy().as_ref(),
+            "fn ignored2() {\n println!(\"hello\");\n}\n",
+        )
+        .expect("ignored2 write");
+
+        let globbed = glob_search("**/*.rs", Some(dir.to_string_lossy().as_ref()))
+            .expect("glob should succeed");
+        assert_eq!(globbed.num_files, 1);
+        assert!(globbed.filenames[0]
+            .replace('\\', "/")
+            .ends_with("/src/kept.rs"));
+
+        let grep_output = grep_search(&GrepSearchInput {
+            pattern: String::from("hello"),
+            path: Some(dir.to_string_lossy().into_owned()),
+            glob: Some(String::from("**/*.rs")),
+            output_mode: Some(String::from("files_with_matches")),
+            before: None,
+            after: None,
+            context_short: None,
+            context: None,
+            line_numbers: Some(true),
+            case_insensitive: Some(false),
+            file_type: None,
+            head_limit: Some(50),
+            offset: Some(0),
+            multiline: Some(false),
+        })
+        .expect("grep should succeed");
+        assert_eq!(grep_output.num_files, 1);
+        assert!(grep_output.filenames[0]
+            .replace('\\', "/")
+            .ends_with("/src/kept.rs"));
+    }
+
+    #[test]
     fn expand_braces_no_braces() {
         assert_eq!(expand_braces("*.rs"), vec!["*.rs"]);
     }
@@ -799,20 +1109,14 @@ mod tests {
     fn expand_braces_single_group() {
         let mut result = expand_braces("Assets/**/*.{cs,uxml,uss}");
         result.sort();
-        assert_eq!(
-            result,
-            vec!["Assets/**/*.cs", "Assets/**/*.uss", "Assets/**/*.uxml",]
-        );
+        assert_eq!(result, vec!["Assets/**/*.cs", "Assets/**/*.uss", "Assets/**/*.uxml",]);
     }
 
     #[test]
     fn expand_braces_nested() {
         let mut result = expand_braces("src/{a,b}.{rs,toml}");
         result.sort();
-        assert_eq!(
-            result,
-            vec!["src/a.rs", "src/a.toml", "src/b.rs", "src/b.toml"]
-        );
+        assert_eq!(result, vec!["src/a.rs", "src/a.toml", "src/b.rs", "src/b.toml"]);
     }
 
     #[test]
@@ -828,12 +1132,8 @@ mod tests {
         std::fs::write(dir.join("b.toml"), "[package]").unwrap();
         std::fs::write(dir.join("c.txt"), "hello").unwrap();
 
-        let result =
-            glob_search("*.{rs,toml}", Some(dir.to_str().unwrap())).expect("glob should succeed");
-        assert_eq!(
-            result.num_files, 2,
-            "should match .rs and .toml but not .txt"
-        );
+        let result = glob_search("*.{rs,toml}", Some(dir.to_str().unwrap())).expect("glob ok");
+        assert_eq!(result.num_files, 2, "should match .rs and .toml but not .txt");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

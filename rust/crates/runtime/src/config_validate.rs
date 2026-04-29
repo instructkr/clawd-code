@@ -197,6 +197,25 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
         name: "trustedRoots",
         expected: FieldType::StringArray,
     },
+    FieldSpec {
+        name: "autoTdd",
+        expected: FieldType::Object,
+    },
+];
+
+const AUTO_TDD_FIELDS: &[FieldSpec] = &[
+    FieldSpec {
+        name: "enabled",
+        expected: FieldType::Bool,
+    },
+    FieldSpec {
+        name: "tools",
+        expected: FieldType::StringArray,
+    },
+    FieldSpec {
+        name: "commands",
+        expected: FieldType::StringArray,
+    },
 ];
 
 const HOOKS_FIELDS: &[FieldSpec] = &[
@@ -501,6 +520,15 @@ pub fn validate_config_file(
             &path_display,
         ));
     }
+    if let Some(auto_tdd) = object.get("autoTdd").and_then(JsonValue::as_object) {
+        result.merge(validate_object_keys(
+            auto_tdd,
+            AUTO_TDD_FIELDS,
+            "autoTdd",
+            source,
+            &path_display,
+        ));
+    }
 
     result
 }
@@ -737,6 +765,7 @@ mod tests {
   "hooks": {"PreToolUse": ["guard"]},
   "permissions": {"defaultMode": "plan", "allow": ["Read"]},
   "mcpServers": {},
+  "autoTdd": {"enabled": true, "commands": ["echo ok"]},
   "sandbox": {"enabled": false}
 }"#;
         let parsed = JsonValue::parse(source).expect("valid json");

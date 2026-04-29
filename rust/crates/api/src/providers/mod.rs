@@ -446,13 +446,36 @@ pub(crate) fn load_dotenv_file(
     Some(parse_dotenv(&content))
 }
 
-/// Look up `key` in a `.env` file located in the current working directory.
-/// Returns `None` when the file is missing, the key is absent, or the value
-/// is empty.
+const DOTENV_WALK_MAX_ANCESTORS: usize = 64;
+
+fn dotenv_candidate_files(
+    start: &std::path::Path,
+) -> impl Iterator<Item = std::path::PathBuf> + '_ {
+    start
+        .ancestors()
+        .take(DOTENV_WALK_MAX_ANCESTORS)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .flat_map(|dir| [dir.join(".env"), dir.join(".claude").join(".env")].into_iter())
+}
+
+/// Look up `key` in `.env` files discovered from the current working directory
+/// upward: each directory is tried as `DIR/.env` then `DIR/.claude/.env`, then
+/// the parent directory, and so on (bounded walk). Returns `None` when no file
+/// contains a non-empty value for `key`.
 pub(crate) fn dotenv_value(key: &str) -> Option<String> {
     let cwd = std::env::current_dir().ok()?;
-    let values = load_dotenv_file(&cwd.join(".env"))?;
-    values.get(key).filter(|value| !value.is_empty()).cloned()
+    dotenv_value_for_workdir(&cwd, key)
+}
+
+fn dotenv_value_for_workdir(workdir: &std::path::Path, key: &str) -> Option<String> {
+    for path in dotenv_candidate_files(workdir) {
+        if let Some(values) = load_dotenv_file(&path) {
+            if let Some(value) = values.get(key).filter(|value| !value.is_empty()) {
+                return Some(value.clone());
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -892,6 +915,33 @@ NO_EQUALS_LINE
             Some("xai-secret")
         );
         assert!(missing.is_none());
+
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn dotenv_value_finds_key_in_parent_claude_env() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "api-dotenv-walk-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos())
+        ));
+        let child = temp_root.join("rust");
+        std::fs::create_dir_all(&child).expect("create nested dir");
+        let claude_env = temp_root.join(".claude");
+        std::fs::create_dir_all(&claude_env).expect("create .claude");
+        std::fs::write(
+            claude_env.join(".env"),
+            "OPENAI_API_KEY=from-parent-claude-env\n",
+        )
+        .expect("write parent .claude/.env");
+
+        assert_eq!(
+            super::dotenv_value_for_workdir(&child, "OPENAI_API_KEY").as_deref(),
+            Some("from-parent-claude-env")
+        );
 
         let _ = std::fs::remove_dir_all(&temp_root);
     }

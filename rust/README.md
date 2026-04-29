@@ -24,6 +24,22 @@ cargo run -p rusty-claude-cli -- prompt "explain this codebase"
 cargo run -p rusty-claude-cli -- --output-format json prompt "summarize src/main.rs"
 ```
 
+### Minimal harness (`claw-analog`)
+
+Smaller tool loop on the same `api` providers: `read_file`, `list_dir`, `glob_workspace`, `grep_workspace` / `grep_search`, optional `write_file`, workspace jail, optional `stream_message` (`--stream` / `--no-stream`), `.claw-analog.toml`, `--session` JSON resume, `--preset`, optional `~/.claw-analog/profile.toml`, `claw-analog doctor`, and `runtime::PermissionEnforcer` by default. See [`../how_to_run.md`](../how_to_run.md) for usage and design notes.
+
+```bash
+cd rust/
+cargo run -p claw-analog -- --help
+cargo run -p claw-analog -- -w . "What does rust/README.md say about parity?"
+cargo run -p claw-analog -- --stream -w . "Short summary of crates/claw-analog"
+# NDJSON lines for CI/agents (see how_to_run.md):
+cargo run -p claw-analog -- --output-format json --stream -w . "Say hi once."
+# allow writes under -w:
+cargo run -p claw-analog -- --permission workspace-write -w . "Add a one-line comment to Cargo.toml if missing"
+cargo test -p claw-analog
+```
+
 ## Configuration
 
 Set your API credentials:
@@ -186,6 +202,7 @@ rust/
     ├── commands/           # Shared slash-command registry + help rendering
     ├── compat-harness/     # TS manifest extraction harness
     ├── mock-anthropic-service/ # Deterministic local Anthropic-compatible mock
+    ├── claw-rag-service/   # Local RAG: ingest + SQLite + HTTP query (embeddings via OpenAI API or mock)
     ├── plugins/            # Plugin metadata, manager, install/enable/disable surfaces
     ├── runtime/            # Session, config, permissions, MCP, prompts, auth/runtime loop
     ├── rusty-claude-cli/   # Main CLI binary (`claw`)
@@ -199,6 +216,7 @@ rust/
 - **commands** — slash command definitions, parsing, help text generation, JSON/text command rendering
 - **compat-harness** — extracts tool/prompt manifests from upstream TS source
 - **mock-anthropic-service** — deterministic `/v1/messages` mock for CLI parity tests and local harness runs
+- **claw-rag-service** — workspace ingest, SQLite chunk+embedding store, HTTP `serve` with `GET /` (minimal UI), `/v1/stats`, `/v1/query` (cosine search; optional mock embeddings for tests)
 - **plugins** — plugin metadata, install/enable/disable/update flows, plugin tool definitions, hook integration surfaces
 - **runtime** — `ConversationRuntime`, config loading, session persistence, permission policy, MCP client lifecycle, system prompt assembly, usage tracking
 - **rusty-claude-cli** — REPL, one-shot prompt, direct CLI subcommands, streaming display, tool call rendering, CLI argument parsing
