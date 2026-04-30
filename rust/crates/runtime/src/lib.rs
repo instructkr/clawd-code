@@ -9,6 +9,7 @@ pub mod bash_validation;
 mod bootstrap;
 pub mod branch_lock;
 mod compact;
+pub mod trident;
 mod config;
 pub mod config_validate;
 mod conversation;

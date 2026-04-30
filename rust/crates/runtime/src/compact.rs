@@ -108,10 +108,15 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
         .first()
         .and_then(extract_existing_compacted_summary);
     let compacted_prefix_len = usize::from(existing_summary.is_some());
-    let raw_keep_from = session
-        .messages
-        .len()
-        .saturating_sub(config.preserve_recent_messages);
+    // When preserve_recent_messages is 0, the caller wants maximum compaction
+    // (no recent messages preserved). Without this guard, saturating_sub(0)
+    // returns messages.len(), which later indexes past the end of the array
+    // at session.messages[k] because keep_from == messages.len() is out of bounds.
+    let raw_keep_from = if config.preserve_recent_messages == 0 {
+        session.messages.len()
+    } else {
+        session.messages.len().saturating_sub(config.preserve_recent_messages)
+    };
     // Ensure we do not split a tool-use / tool-result pair at the compaction
     // boundary. If the first preserved message is a user message whose first
     // block is a ToolResult, the assistant message with the matching ToolUse
@@ -128,7 +133,7 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
         // is NOT an assistant message that contains a ToolUse block (i.e. the
         // pair is actually broken at the boundary).
         loop {
-            if k == 0 || k <= compacted_prefix_len {
+            if k == 0 || k <= compacted_prefix_len || k >= session.messages.len() {
                 break;
             }
             let first_preserved = &session.messages[k];
