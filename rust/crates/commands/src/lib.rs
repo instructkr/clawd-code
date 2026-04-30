@@ -2420,6 +2420,13 @@ pub fn handle_skills_slash_command_json(args: Option<&str>, cwd: &Path) -> std::
 pub fn classify_skills_slash_command(args: Option<&str>) -> SkillSlashDispatch {
     match normalize_optional_args(args) {
         None | Some("list" | "help" | "-h" | "--help") => SkillSlashDispatch::Local,
+        Some(args)
+            if args
+                .split_whitespace()
+                .any(|part| matches!(part, "-h" | "--help")) =>
+        {
+            SkillSlashDispatch::Local
+        }
         Some(args) if args == "install" || args.starts_with("install ") => {
             SkillSlashDispatch::Local
         }

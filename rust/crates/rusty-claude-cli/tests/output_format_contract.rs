@@ -65,6 +65,33 @@ fn acp_guidance_emits_json_when_requested() {
 }
 
 #[test]
+fn skills_subcommand_help_json_is_bounded_and_static() {
+    let root = unique_temp_dir("skills-help-json");
+    fs::create_dir_all(&root).expect("temp dir should exist");
+
+    for args in [
+        &["skills", "list", "--help", "--output-format", "json"][..],
+        &["skills", "install", "--help", "--output-format", "json"][..],
+        &["skills", "show", "--help", "--output-format", "json"][..],
+        &[
+            "skills",
+            "missing-skill",
+            "--help",
+            "--output-format",
+            "json",
+        ][..],
+    ] {
+        let help = assert_json_command(&root, args);
+        assert_eq!(help["kind"], "skills");
+        assert_eq!(help["action"], "help");
+        assert!(help["usage"]["direct_cli"]
+            .as_str()
+            .expect("direct CLI usage")
+            .contains("claw skills"));
+    }
+}
+
+#[test]
 fn inventory_commands_emit_structured_json_when_requested() {
     let root = unique_temp_dir("inventory-json");
     fs::create_dir_all(&root).expect("temp dir should exist");

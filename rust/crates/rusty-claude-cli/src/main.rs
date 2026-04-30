@@ -10143,6 +10143,47 @@ mod tests {
             }
         );
         assert_eq!(
+            parse_args(&[
+                "skills".to_string(),
+                "list".to_string(),
+                "--help".to_string(),
+                "--output-format".to_string(),
+                "json".to_string(),
+            ])
+            .expect("skills list help json should stay local"),
+            CliAction::Skills {
+                args: Some("list --help".to_string()),
+                output_format: CliOutputFormat::Json,
+            }
+        );
+        assert_eq!(
+            parse_args(&[
+                "skills".to_string(),
+                "show".to_string(),
+                "--help".to_string(),
+                "--output-format=json".to_string(),
+            ])
+            .expect("skills show help json should stay local"),
+            CliAction::Skills {
+                args: Some("show --help".to_string()),
+                output_format: CliOutputFormat::Json,
+            }
+        );
+        assert_eq!(
+            parse_args(&[
+                "skills".to_string(),
+                "missing-skill".to_string(),
+                "--help".to_string(),
+                "--output-format".to_string(),
+                "json".to_string(),
+            ])
+            .expect("missing skill help json should stay local"),
+            CliAction::Skills {
+                args: Some("missing-skill --help".to_string()),
+                output_format: CliOutputFormat::Json,
+            }
+        );
+        assert_eq!(
             parse_args(&["agents".to_string(), "--help".to_string()])
                 .expect("agents help should parse"),
             CliAction::Agents {
