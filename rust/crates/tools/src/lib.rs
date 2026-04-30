@@ -1175,6 +1175,80 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             }),
             required_permission: PermissionMode::DangerFullAccess,
         },
+        ToolSpec {
+            name: "GitStatus",
+            description: "Show the working tree status (branch, staged, unstaged, untracked). Equivalent to 'git status --short --branch'. Use this instead of running git status via bash to get structured, parseable output.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "short": { "type": "boolean" }
+                },
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "GitDiff",
+            description: "Show changes between commits, the index, and the working tree. Supports staged changes ('git diff --cached'), specific paths, commit ranges, and comparing two commits. Use this instead of running git diff via bash to get structured output.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "staged": { "type": "boolean" },
+                    "commit": { "type": "string" },
+                    "commit2": { "type": "string" }
+                },
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "GitLog",
+            description: "Show commit history. Supports limiting count, filtering by author/date/path, and oneline format. Defaults to the last 20 commits. Use this instead of running git log via bash to get structured output.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "count": { "type": "integer", "minimum": 1 },
+                    "oneline": { "type": "boolean" },
+                    "author": { "type": "string" },
+                    "since": { "type": "string" },
+                    "until": { "type": "string" }
+                },
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "GitShow",
+            description: "Show a commit, tag, or tree object with its diff. Supports showing a specific file at a commit (commit:path) and stat-only mode. Use this instead of running git show via bash to get structured output.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "commit": { "type": "string" },
+                    "path": { "type": "string" },
+                    "stat": { "type": "boolean" }
+                },
+                "required": ["commit"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "GitBlame",
+            description: "Show what revision and author last modified each line of a file. Supports line range filtering (start_line, end_line). Use this instead of running git blame via bash to get structured output.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "start_line": { "type": "integer", "minimum": 1 },
+                    "end_line": { "type": "integer", "minimum": 1 }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
     ]
 }
 
@@ -1293,6 +1367,11 @@ fn execute_tool_with_enforcer(
         "TestingPermission" => {
             from_value::<TestingPermissionInput>(input).and_then(run_testing_permission)
         }
+        "GitStatus" => from_value::<GitStatusInput>(input).and_then(run_git_status),
+        "GitDiff" => from_value::<GitDiffInput>(input).and_then(run_git_diff),
+        "GitLog" => from_value::<GitLogInput>(input).and_then(run_git_log),
+        "GitShow" => from_value::<GitShowInput>(input).and_then(run_git_show),
+        "GitBlame" => from_value::<GitBlameInput>(input).and_then(run_git_blame),
         _ => Err(format!("unsupported tool: {name}")),
     }
 }
@@ -1841,6 +1920,123 @@ fn run_testing_permission(input: TestingPermissionInput) -> Result<String, Strin
         "message": "Testing permission tool stub"
     }))
 }
+
+#[allow(clippy::needless_pass_by_value)]
+/// Execute `git status --short --branch` and return structured JSON output.
+/// Falls back to full `git status` if `short` is explicitly set to false.
+fn run_git_status(input: GitStatusInput) -> Result<String, String> {
+    let mut args: Vec<&str> = vec!["status"];
+    if input.short.unwrap_or(true) {
+        args.push("--short");
+        args.push("--branch");
+    }
+    match git_stdout(&args) {
+        Some(output) => to_pretty_json(json!({
+            "output": output
+        })),
+        None => Err("git status failed. Ensure the current directory is inside a git repository.".to_string()),
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+/// Execute `git diff` with optional --cached, commit, and path filters.
+/// Returns the diff output wrapped in a JSON object.
+fn run_git_diff(input: GitDiffInput) -> Result<String, String> {
+    let mut args: Vec<String> = vec!["diff".to_string()];
+    if input.staged.unwrap_or(false) {
+        args.push("--cached".to_string());
+    }
+    if let Some(ref commit) = input.commit {
+        if let Some(ref commit2) = input.commit2 {
+            args.push(format!("{commit}...{commit2}"));
+        } else {
+            args.push(commit.clone());
+        }
+    }
+    if let Some(ref path) = input.path {
+        args.push("--".to_string());
+        args.push(path.clone());
+    }
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    match git_stdout(&arg_refs) {
+        Some(output) => to_pretty_json(json!({
+            "output": output
+        })),
+        None => Err("git diff failed. Ensure the current directory is inside a git repository.".to_string()),
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+/// Execute `git log` with count, author, date, and path filters.
+/// Defaults to the last 20 commits.
+fn run_git_log(input: GitLogInput) -> Result<String, String> {
+    let mut args: Vec<String> = vec!["log".to_string()];
+    let count = input.count.unwrap_or(20);
+    args.push(format!("-n{count}"));
+    if input.oneline.unwrap_or(false) {
+        args.push("--oneline".to_string());
+    }
+    if let Some(ref author) = input.author {
+        args.push(format!("--author={author}"));
+    }
+    if let Some(ref since) = input.since {
+        args.push(format!("--since={since}"));
+    }
+    if let Some(ref until) = input.until {
+        args.push(format!("--until={until}"));
+    }
+    if let Some(ref path) = input.path {
+        args.push("--".to_string());
+        args.push(path.clone());
+    }
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    match git_stdout(&arg_refs) {
+        Some(output) => to_pretty_json(json!({
+            "output": output
+        })),
+        None => Err("git log failed. Ensure the current directory is inside a git repository.".to_string()),
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+/// Execute `git show` for a given commit, optionally with --stat or a file path.
+/// Uses the `commit:path` syntax when a path is specified.
+fn run_git_show(input: GitShowInput) -> Result<String, String> {
+    let mut args: Vec<String> = vec!["show".to_string()];
+    if input.stat.unwrap_or(false) {
+        args.push("--stat".to_string());
+    }
+    if let Some(ref path) = input.path {
+        args.push(format!("{}:{}", input.commit, path));
+    } else {
+        args.push(input.commit.clone());
+    }
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    match git_stdout(&arg_refs) {
+        Some(output) => to_pretty_json(json!({
+            "output": output
+        })),
+        None => Err(format!("git show {} failed. Ensure the commit exists.", input.commit)),
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+/// Execute `git blame` on a file, optionally restricted to a line range.
+fn run_git_blame(input: GitBlameInput) -> Result<String, String> {
+    let mut args: Vec<String> = vec!["blame".to_string()];
+    if let (Some(start), Some(end)) = (input.start_line, input.end_line) {
+        args.push(format!("-L{start},{end}"));
+    }
+    args.push(input.path.clone());
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    match git_stdout(&arg_refs) {
+        Some(output) => to_pretty_json(json!({
+            "output": output
+        })),
+        None => Err(format!("git blame {} failed. Ensure the file exists and the directory is inside a git repository.", input.path)),
+    }
+}
+
 fn from_value<T: for<'de> Deserialize<'de>>(input: &Value) -> Result<T, String> {
     serde_json::from_value(input.clone()).map_err(|error| error.to_string())
 }
@@ -2545,6 +2741,85 @@ struct McpToolInput {
 #[derive(Debug, Deserialize)]
 struct TestingPermissionInput {
     action: String,
+}
+
+/// Input for the GitStatus tool: shows working tree status.
+/// Defaults to --short --branch mode for concise, parseable output.
+#[derive(Debug, Deserialize)]
+struct GitStatusInput {
+    #[serde(default)]
+    /// If true, use --short --branch format. Defaults to true.
+    short: Option<bool>,
+}
+
+/// Input for the GitDiff tool: shows changes between commits, index, and working tree.
+/// All fields are optional - calling with no options is equivalent to `git diff`.
+#[derive(Debug, Deserialize)]
+struct GitDiffInput {
+    #[serde(default)]
+    /// File path to diff. Prepends `--` before the path.
+    path: Option<String>,
+    #[serde(default)]
+    /// If true, show staged changes (`git diff --cached`).
+    staged: Option<bool>,
+    #[serde(default)]
+    /// A commit hash, tag, or branch to diff against.
+    commit: Option<String>,
+    #[serde(default)]
+    /// A second commit for range diffs (commit...commit2).
+    commit2: Option<String>,
+}
+
+/// Input for the GitLog tool: shows commit history.
+/// Defaults to the last 20 commits in full format.
+#[derive(Debug, Deserialize)]
+struct GitLogInput {
+    #[serde(default)]
+    /// File or directory path to filter commits by.
+    path: Option<String>,
+    #[serde(default)]
+    /// Maximum number of commits to return. Defaults to 20.
+    count: Option<usize>,
+    #[serde(default)]
+    /// If true, use --oneline format (hash + subject only).
+    oneline: Option<bool>,
+    #[serde(default)]
+    /// Filter commits by author pattern.
+    author: Option<String>,
+    #[serde(default)]
+    /// Filter commits since date (e.g. "2024-01-01" or "2.weeks").
+    since: Option<String>,
+    #[serde(default)]
+    /// Filter commits until date.
+    until: Option<String>,
+}
+
+/// Input for the GitShow tool: shows a commit, tag, or tree object.
+#[derive(Debug, Deserialize)]
+struct GitShowInput {
+    /// Commit hash, tag, or branch ref to show. Required.
+    commit: String,
+    #[serde(default)]
+    /// If set, show only this file at the given commit (commit:path syntax).
+    path: Option<String>,
+    #[serde(default)]
+    /// If true, show diffstat summary instead of full diff.
+    stat: Option<bool>,
+}
+
+/// Input for the GitBlame tool: shows per-line author/revision info for a file.
+#[derive(Debug, Deserialize)]
+struct GitBlameInput {
+    /// File path to blame. Required.
+    path: String,
+    #[serde(rename = "start_line")]
+    #[serde(default)]
+    /// Start of line range (1-based). Only used if end_line is also set.
+    start_line: Option<usize>,
+    #[serde(rename = "end_line")]
+    #[serde(default)]
+    /// End of line range (1-based). Only used if start_line is also set.
+    end_line: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
