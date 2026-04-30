@@ -40,6 +40,45 @@ pub struct RuntimeConfig {
     feature_config: RuntimeFeatureConfig,
 }
 
+/// Machine-readable load state for a discovered config file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigFileStatus {
+    Loaded,
+    NotFound,
+    Skipped,
+    LoadError,
+}
+
+impl ConfigFileStatus {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Loaded => "loaded",
+            Self::NotFound => "not_found",
+            Self::Skipped => "skipped",
+            Self::LoadError => "load_error",
+        }
+    }
+}
+
+/// Structured status for a single discovered config file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigFileReport {
+    pub entry: ConfigEntry,
+    pub loaded: bool,
+    pub status: ConfigFileStatus,
+    pub reason: Option<String>,
+    pub detail: Option<String>,
+}
+
+/// Best-effort inspection of the full config discovery/load pipeline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigInspection {
+    pub files: Vec<ConfigFileReport>,
+    pub runtime_config: Option<RuntimeConfig>,
+    pub load_error: Option<String>,
+}
+
 /// Parsed plugin-related settings extracted from runtime config.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RuntimePluginConfig {
@@ -276,7 +315,7 @@ impl ConfigLoader {
 
         for entry in self.discover() {
             crate::config_validate::check_unsupported_format(&entry.path)?;
-            let Some(parsed) = read_optional_json_object(&entry.path)? else {
+            let OptionalConfigFile::Loaded(parsed) = read_optional_json_object(&entry.path)? else {
                 continue;
             };
             let validation = crate::config_validate::validate_config_file(
@@ -299,30 +338,186 @@ impl ConfigLoader {
             eprintln!("warning: {warning}");
         }
 
-        let merged_value = JsonValue::Object(merged.clone());
-
-        let feature_config = RuntimeFeatureConfig {
-            hooks: parse_optional_hooks_config(&merged_value)?,
-            plugins: parse_optional_plugin_config(&merged_value)?,
-            mcp: McpConfigCollection {
-                servers: mcp_servers,
-            },
-            oauth: parse_optional_oauth_config(&merged_value, "merged settings.oauth")?,
-            model: parse_optional_model(&merged_value),
-            aliases: parse_optional_aliases(&merged_value)?,
-            permission_mode: parse_optional_permission_mode(&merged_value)?,
-            permission_rules: parse_optional_permission_rules(&merged_value)?,
-            sandbox: parse_optional_sandbox_config(&merged_value)?,
-            provider_fallbacks: parse_optional_provider_fallbacks(&merged_value)?,
-            trusted_roots: parse_optional_trusted_roots(&merged_value)?,
-        };
-
-        Ok(RuntimeConfig {
-            merged,
-            loaded_entries,
-            feature_config,
-        })
+        build_runtime_config(merged, loaded_entries, mcp_servers)
     }
+
+    /// Inspect discovered files and return per-file statuses without aborting
+    /// the whole report on the first missing/skipped/invalid file.
+    #[must_use]
+    pub fn inspect(&self) -> ConfigInspection {
+        let mut merged = BTreeMap::new();
+        let mut loaded_entries = Vec::new();
+        let mut mcp_servers = BTreeMap::new();
+        let mut all_warnings = Vec::new();
+        let mut files = Vec::new();
+        let mut first_error = None;
+
+        for entry in self.discover() {
+            if let Err(error) = crate::config_validate::check_unsupported_format(&entry.path) {
+                let detail = error.to_string();
+                first_error.get_or_insert_with(|| detail.clone());
+                files.push(ConfigFileReport {
+                    entry,
+                    loaded: false,
+                    status: ConfigFileStatus::LoadError,
+                    reason: Some("unsupported_format".to_string()),
+                    detail: Some(detail),
+                });
+                continue;
+            }
+
+            let parsed = match read_optional_json_object(&entry.path) {
+                Ok(OptionalConfigFile::Loaded(parsed)) => parsed,
+                Ok(OptionalConfigFile::NotFound) => {
+                    files.push(ConfigFileReport {
+                        entry,
+                        loaded: false,
+                        status: ConfigFileStatus::NotFound,
+                        reason: Some("not_found".to_string()),
+                        detail: None,
+                    });
+                    continue;
+                }
+                Ok(OptionalConfigFile::Skipped { reason, detail }) => {
+                    files.push(ConfigFileReport {
+                        entry,
+                        loaded: false,
+                        status: ConfigFileStatus::Skipped,
+                        reason: Some(reason),
+                        detail,
+                    });
+                    continue;
+                }
+                Err(error) => {
+                    let detail = error.to_string();
+                    first_error.get_or_insert_with(|| detail.clone());
+                    let reason = match &error {
+                        ConfigError::Io(io_error)
+                            if io_error.kind() == std::io::ErrorKind::PermissionDenied =>
+                        {
+                            "permission_denied"
+                        }
+                        ConfigError::Io(_) => "io_error",
+                        ConfigError::Parse(_) => "parse_error",
+                    };
+                    files.push(ConfigFileReport {
+                        entry,
+                        loaded: false,
+                        status: ConfigFileStatus::LoadError,
+                        reason: Some(reason.to_string()),
+                        detail: Some(detail),
+                    });
+                    continue;
+                }
+            };
+
+            let validation = crate::config_validate::validate_config_file(
+                &parsed.object,
+                &parsed.source,
+                &entry.path,
+            );
+            if !validation.is_ok() {
+                let detail = validation.errors[0].to_string();
+                first_error.get_or_insert_with(|| detail.clone());
+                files.push(ConfigFileReport {
+                    entry,
+                    loaded: false,
+                    status: ConfigFileStatus::LoadError,
+                    reason: Some("validation_error".to_string()),
+                    detail: Some(detail),
+                });
+                continue;
+            }
+            all_warnings.extend(validation.warnings);
+
+            if let Err(error) = validate_optional_hooks_config(&parsed.object, &entry.path) {
+                let detail = error.to_string();
+                first_error.get_or_insert_with(|| detail.clone());
+                files.push(ConfigFileReport {
+                    entry,
+                    loaded: false,
+                    status: ConfigFileStatus::LoadError,
+                    reason: Some("validation_error".to_string()),
+                    detail: Some(detail),
+                });
+                continue;
+            }
+
+            if let Err(error) =
+                merge_mcp_servers(&mut mcp_servers, entry.source, &parsed.object, &entry.path)
+            {
+                let detail = error.to_string();
+                first_error.get_or_insert_with(|| detail.clone());
+                files.push(ConfigFileReport {
+                    entry,
+                    loaded: false,
+                    status: ConfigFileStatus::LoadError,
+                    reason: Some("parse_error".to_string()),
+                    detail: Some(detail),
+                });
+                continue;
+            }
+
+            deep_merge_objects(&mut merged, &parsed.object);
+            loaded_entries.push(entry.clone());
+            files.push(ConfigFileReport {
+                entry,
+                loaded: true,
+                status: ConfigFileStatus::Loaded,
+                reason: None,
+                detail: None,
+            });
+        }
+
+        for warning in &all_warnings {
+            eprintln!("warning: {warning}");
+        }
+
+        match build_runtime_config(merged, loaded_entries, mcp_servers) {
+            Ok(runtime_config) => ConfigInspection {
+                files,
+                runtime_config: Some(runtime_config),
+                load_error: first_error,
+            },
+            Err(error) => {
+                first_error.get_or_insert_with(|| error.to_string());
+                ConfigInspection {
+                    files,
+                    runtime_config: None,
+                    load_error: first_error,
+                }
+            }
+        }
+    }
+}
+
+fn build_runtime_config(
+    merged: BTreeMap<String, JsonValue>,
+    loaded_entries: Vec<ConfigEntry>,
+    mcp_servers: BTreeMap<String, ScopedMcpServerConfig>,
+) -> Result<RuntimeConfig, ConfigError> {
+    let merged_value = JsonValue::Object(merged.clone());
+    let feature_config = RuntimeFeatureConfig {
+        hooks: parse_optional_hooks_config(&merged_value)?,
+        plugins: parse_optional_plugin_config(&merged_value)?,
+        mcp: McpConfigCollection {
+            servers: mcp_servers,
+        },
+        oauth: parse_optional_oauth_config(&merged_value, "merged settings.oauth")?,
+        model: parse_optional_model(&merged_value),
+        aliases: parse_optional_aliases(&merged_value)?,
+        permission_mode: parse_optional_permission_mode(&merged_value)?,
+        permission_rules: parse_optional_permission_rules(&merged_value)?,
+        sandbox: parse_optional_sandbox_config(&merged_value)?,
+        provider_fallbacks: parse_optional_provider_fallbacks(&merged_value)?,
+        trusted_roots: parse_optional_trusted_roots(&merged_value)?,
+    };
+
+    Ok(RuntimeConfig {
+        merged,
+        loaded_entries,
+        feature_config,
+    })
 }
 
 impl RuntimeConfig {
@@ -671,16 +866,27 @@ struct ParsedConfigFile {
     source: String,
 }
 
-fn read_optional_json_object(path: &Path) -> Result<Option<ParsedConfigFile>, ConfigError> {
+enum OptionalConfigFile {
+    Loaded(ParsedConfigFile),
+    NotFound,
+    Skipped {
+        reason: String,
+        detail: Option<String>,
+    },
+}
+
+fn read_optional_json_object(path: &Path) -> Result<OptionalConfigFile, ConfigError> {
     let is_legacy_config = path.file_name().and_then(|name| name.to_str()) == Some(".claw.json");
     let contents = match fs::read_to_string(path) {
         Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(OptionalConfigFile::NotFound);
+        }
         Err(error) => return Err(ConfigError::Io(error)),
     };
 
     if contents.trim().is_empty() {
-        return Ok(Some(ParsedConfigFile {
+        return Ok(OptionalConfigFile::Loaded(ParsedConfigFile {
             object: BTreeMap::new(),
             source: contents,
         }));
@@ -688,19 +894,30 @@ fn read_optional_json_object(path: &Path) -> Result<Option<ParsedConfigFile>, Co
 
     let parsed = match JsonValue::parse(&contents) {
         Ok(parsed) => parsed,
-        Err(_error) if is_legacy_config => return Ok(None),
+        Err(error) if is_legacy_config => {
+            return Ok(OptionalConfigFile::Skipped {
+                reason: "legacy_invalid_json".to_string(),
+                detail: Some(format!("{}: {error}", path.display())),
+            });
+        }
         Err(error) => return Err(ConfigError::Parse(format!("{}: {error}", path.display()))),
     };
     let Some(object) = parsed.as_object() else {
         if is_legacy_config {
-            return Ok(None);
+            return Ok(OptionalConfigFile::Skipped {
+                reason: "legacy_non_object".to_string(),
+                detail: Some(format!(
+                    "{}: top-level legacy settings value is not a JSON object",
+                    path.display()
+                )),
+            });
         }
         return Err(ConfigError::Parse(format!(
             "{}: top-level settings value must be a JSON object",
             path.display()
         )));
     };
-    Ok(Some(ParsedConfigFile {
+    Ok(OptionalConfigFile::Loaded(ParsedConfigFile {
         object: object.clone(),
         source: contents,
     }))
@@ -1244,8 +1461,8 @@ fn push_unique(target: &mut Vec<String>, value: String) {
 #[cfg(test)]
 mod tests {
     use super::{
-        deep_merge_objects, parse_permission_mode_label, ConfigLoader, ConfigSource,
-        McpServerConfig, McpTransport, ResolvedPermissionMode, RuntimeHookConfig,
+        deep_merge_objects, parse_permission_mode_label, ConfigFileStatus, ConfigLoader,
+        ConfigSource, McpServerConfig, McpTransport, ResolvedPermissionMode, RuntimeHookConfig,
         RuntimePluginConfig, CLAW_SETTINGS_SCHEMA_NAME,
     };
     use crate::json::JsonValue;
@@ -1831,6 +2048,47 @@ mod tests {
         assert_eq!(loaded.loaded_entries().len(), 1);
         assert_eq!(loaded.permission_mode(), None);
         assert_eq!(loaded.plugins().enabled_plugins().len(), 0);
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn inspect_classifies_missing_loaded_and_legacy_skipped_files() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(cwd.join(".claw")).expect("project claw dir");
+        fs::create_dir_all(&home).expect("home dir");
+        fs::write(cwd.join(".claw.json"), "{not json").expect("legacy config");
+        fs::write(cwd.join(".claw/settings.json"), r#"{"model":"opus"}"#)
+            .expect("project settings");
+
+        let inspection = ConfigLoader::new(&cwd, &home).inspect();
+        assert!(inspection.load_error.is_none());
+        assert!(inspection.runtime_config.is_some());
+
+        let loaded = inspection
+            .files
+            .iter()
+            .find(|file| file.loaded)
+            .expect("loaded file");
+        assert_eq!(loaded.status, ConfigFileStatus::Loaded);
+        assert_eq!(loaded.reason, None);
+
+        let missing = inspection
+            .files
+            .iter()
+            .find(|file| file.status == ConfigFileStatus::NotFound)
+            .expect("missing file");
+        assert_eq!(missing.reason.as_deref(), Some("not_found"));
+
+        let skipped = inspection
+            .files
+            .iter()
+            .find(|file| file.status == ConfigFileStatus::Skipped)
+            .expect("skipped legacy file");
+        assert_eq!(skipped.reason.as_deref(), Some("legacy_invalid_json"));
+        assert!(!skipped.loaded);
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

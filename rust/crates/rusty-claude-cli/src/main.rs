@@ -6211,42 +6211,88 @@ fn render_config_json(
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
     let loader = ConfigLoader::default_for(&cwd);
-    let discovered = loader.discover();
-    let runtime_config = loader.load()?;
+    let inspection = loader.inspect();
 
-    let loaded_paths: Vec<_> = runtime_config
-        .loaded_entries()
-        .iter()
-        .map(|e| e.path.display().to_string())
-        .collect();
+    let (loaded_files, merged_key_count) =
+        inspection
+            .runtime_config
+            .as_ref()
+            .map_or((0, 0), |runtime_config| {
+                (
+                    runtime_config.loaded_entries().len(),
+                    runtime_config.merged().len(),
+                )
+            });
 
-    let files: Vec<_> = discovered
+    let files: Vec<_> = inspection
+        .files
         .iter()
-        .map(|e| {
-            let source = match e.source {
+        .map(|file| {
+            let source = match file.entry.source {
                 ConfigSource::User => "user",
                 ConfigSource::Project => "project",
                 ConfigSource::Local => "local",
             };
-            let is_loaded = runtime_config
-                .loaded_entries()
-                .iter()
-                .any(|le| le.path == e.path);
-            serde_json::json!({
-                "path": e.path.display().to_string(),
-                "source": source,
-                "loaded": is_loaded,
-            })
+            let mut object = serde_json::Map::new();
+            object.insert(
+                "path".to_string(),
+                serde_json::Value::String(file.entry.path.display().to_string()),
+            );
+            object.insert(
+                "source".to_string(),
+                serde_json::Value::String(source.to_string()),
+            );
+            object.insert("loaded".to_string(), serde_json::Value::Bool(file.loaded));
+            object.insert(
+                "status".to_string(),
+                serde_json::Value::String(file.status.as_str().to_string()),
+            );
+            if let Some(reason) = &file.reason {
+                object.insert(
+                    "reason".to_string(),
+                    serde_json::Value::String(reason.clone()),
+                );
+            }
+            if let Some(reason) = &file.reason {
+                object.insert(
+                    "skip_reason".to_string(),
+                    serde_json::Value::String(reason.clone()),
+                );
+            }
+            if let Some(detail) = &file.detail {
+                object.insert(
+                    "detail".to_string(),
+                    serde_json::Value::String(detail.clone()),
+                );
+            }
+            serde_json::Value::Object(object)
         })
         .collect();
 
-    Ok(serde_json::json!({
+    let status = if inspection.load_error.is_some() {
+        "error"
+    } else {
+        "ok"
+    };
+
+    let mut value = serde_json::json!({
         "kind": "config",
+        "status": status,
         "cwd": cwd.display().to_string(),
-        "loaded_files": loaded_paths.len(),
-        "merged_keys": runtime_config.merged().len(),
+        "loaded_files": loaded_files,
+        "merged_keys": merged_key_count,
+        "merged_key_count": merged_key_count,
+        "merged_keys_meaning": "count of top-level keys in the effective merged JSON object",
         "files": files,
-    }))
+    });
+
+    if let Some(error) = inspection.load_error {
+        if let Some(object) = value.as_object_mut() {
+            object.insert("load_error".to_string(), serde_json::Value::String(error));
+        }
+    }
+
+    Ok(value)
 }
 
 fn render_memory_report() -> Result<String, Box<dyn std::error::Error>> {
@@ -9248,9 +9294,9 @@ mod tests {
         merge_prompt_with_stdin, normalize_permission_mode, parse_args, parse_export_args,
         parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
         parse_history_count, permission_policy, print_help_to, push_output_block,
-        render_config_report, render_diff_report, render_diff_report_for, render_help_topic,
-        render_memory_report, render_prompt_history_report, render_repl_help, render_resume_usage,
-        render_session_list, render_session_markdown, resolve_model_alias,
+        render_config_json, render_config_report, render_diff_report, render_diff_report_for,
+        render_help_topic, render_memory_report, render_prompt_history_report, render_repl_help,
+        render_resume_usage, render_session_list, render_session_markdown, resolve_model_alias,
         resolve_model_alias_with_config, resolve_repl_model, resolve_session_reference,
         response_to_events, resume_supported_slash_commands, run_resume_command, short_tool_id,
         slash_command_completion_candidates_with_sessions, split_error_hint, status_context,
@@ -12104,6 +12150,102 @@ mod tests {
         assert!(report.contains("Config"));
         assert!(report.contains("Discovered files"));
         assert!(report.contains("Merged JSON"));
+    }
+
+    #[test]
+    fn config_json_reports_structured_unloaded_file_reasons() {
+        let _guard = env_lock();
+        let root = temp_dir();
+        let workspace = root.join("workspace");
+        let config_home = root.join("home").join(".claw");
+        fs::create_dir_all(workspace.join(".claw")).expect("workspace config dir");
+        fs::create_dir_all(&config_home).expect("config home dir");
+        fs::write(workspace.join(".claw/settings.json"), r#"{"model":"opus"}"#)
+            .expect("write project settings");
+
+        let previous_config_home = std::env::var_os("CLAW_CONFIG_HOME");
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        let value = with_current_dir(&workspace, || {
+            render_config_json(None).expect("config json should render")
+        });
+        match previous_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+
+        assert_eq!(value["kind"], "config");
+        assert_eq!(value["status"], "ok");
+        assert_eq!(value["loaded_files"].as_u64(), Some(1));
+        assert_eq!(value["merged_keys"], value["merged_key_count"]);
+        assert_eq!(
+            value["merged_keys_meaning"].as_str(),
+            Some("count of top-level keys in the effective merged JSON object")
+        );
+
+        let files = value["files"].as_array().expect("files array");
+        let loaded_project = files
+            .iter()
+            .find(|file| {
+                file["loaded"] == true
+                    && file["path"]
+                        .as_str()
+                        .is_some_and(|path| path.ends_with(".claw/settings.json"))
+            })
+            .expect("project settings entry");
+        assert_eq!(loaded_project["loaded"], true);
+        assert_eq!(loaded_project["status"], "loaded");
+        assert!(loaded_project.get("reason").is_none());
+
+        let missing = files
+            .iter()
+            .find(|file| file["loaded"] == false && file["status"] == "not_found")
+            .expect("at least one missing discovered config");
+        assert_eq!(missing["reason"], "not_found");
+        assert_eq!(missing["skip_reason"], "not_found");
+
+        fs::remove_dir_all(root).expect("cleanup temp root");
+    }
+
+    #[test]
+    fn config_json_reports_parse_errors_without_dropping_file_statuses() {
+        let _guard = env_lock();
+        let root = temp_dir();
+        let workspace = root.join("workspace");
+        let config_home = root.join("home").join(".claw");
+        fs::create_dir_all(workspace.join(".claw")).expect("workspace config dir");
+        fs::create_dir_all(&config_home).expect("config home dir");
+        fs::write(workspace.join(".claw/settings.json"), "{not json")
+            .expect("write invalid project settings");
+
+        let previous_config_home = std::env::var_os("CLAW_CONFIG_HOME");
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        let value = with_current_dir(&workspace, || {
+            render_config_json(None).expect("config json should render")
+        });
+        match previous_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+
+        assert_eq!(value["status"], "error");
+        assert!(value["load_error"].as_str().is_some());
+        let files = value["files"].as_array().expect("files array");
+        let error_file = files
+            .iter()
+            .find(|file| {
+                file["status"] == "load_error"
+                    && file["path"]
+                        .as_str()
+                        .is_some_and(|path| path.ends_with(".claw/settings.json"))
+            })
+            .expect("project settings entry");
+        assert_eq!(error_file["loaded"], false);
+        assert_eq!(error_file["status"], "load_error");
+        assert_eq!(error_file["reason"], "parse_error");
+        assert_eq!(error_file["skip_reason"], "parse_error");
+        assert!(error_file["detail"].as_str().is_some());
+
+        fs::remove_dir_all(root).expect("cleanup temp root");
     }
 
     #[test]
