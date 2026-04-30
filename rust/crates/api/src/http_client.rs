@@ -1,8 +1,68 @@
+use std::time::Duration;
+
 use crate::error::ApiError;
 
 const HTTP_PROXY_KEYS: [&str; 2] = ["HTTP_PROXY", "http_proxy"];
 const HTTPS_PROXY_KEYS: [&str; 2] = ["HTTPS_PROXY", "https_proxy"];
 const NO_PROXY_KEYS: [&str; 2] = ["NO_PROXY", "no_proxy"];
+
+/// Timeout configuration for outbound HTTP requests.
+///
+/// When set, the `reqwest::Client` will abort requests that take longer
+/// than the configured duration and return a timeout error (which is
+/// retryable by the existing exponential backoff logic).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimeoutConfig {
+    /// Maximum time to wait for a connection to be established.
+    /// Defaults to 30 seconds.
+    pub connect_timeout: Duration,
+    /// Maximum time for the entire request (including reading the response
+    /// body). For streaming responses this is the timeout for the initial
+    /// handshake only; the stream itself is governed by SSE parsing.
+    /// Defaults to 5 minutes (300 seconds).
+    pub request_timeout: Duration,
+}
+
+impl Default for TimeoutConfig {
+    fn default() -> Self {
+        Self {
+            connect_timeout: Duration::from_secs(30),
+            request_timeout: Duration::from_secs(300),
+        }
+    }
+}
+
+impl TimeoutConfig {
+    /// Read timeout settings from the process environment.
+    /// - `CLAW_API_CONNECT_TIMEOUT` — connect timeout in seconds
+    /// - `CLAW_API_REQUEST_TIMEOUT` — overall request timeout in seconds
+    #[must_use]
+    pub fn from_env() -> Self {
+        let connect_timeout = std::env::var("CLAW_API_CONNECT_TIMEOUT")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::from_secs(30));
+        let request_timeout = std::env::var("CLAW_API_REQUEST_TIMEOUT")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::from_secs(300));
+        Self {
+            connect_timeout,
+            request_timeout,
+        }
+    }
+
+    /// Create from explicit second values (used by config file parsing).
+    #[must_use]
+    pub fn from_seconds(connect_secs: u64, request_secs: u64) -> Self {
+        Self {
+            connect_timeout: Duration::from_secs(connect_secs),
+            request_timeout: Duration::from_secs(request_secs),
+        }
+    }
+}
 
 /// Snapshot of the proxy-related environment variables that influence the
 /// outbound HTTP client. Captured up front so callers can inspect, log, and
@@ -61,7 +121,7 @@ impl ProxyConfig {
 /// `HTTPS_PROXY`, and `NO_PROXY` environment variables. When no proxy is
 /// configured the client behaves identically to `reqwest::Client::new()`.
 pub fn build_http_client() -> Result<reqwest::Client, ApiError> {
-    build_http_client_with(&ProxyConfig::from_env())
+    build_http_client_with_opts(&ProxyConfig::from_env(), &TimeoutConfig::from_env())
 }
 
 /// Infallible counterpart to [`build_http_client`] for constructors that
@@ -71,17 +131,26 @@ pub fn build_http_client() -> Result<reqwest::Client, ApiError> {
 /// first outbound request instead of at construction time.
 #[must_use]
 pub fn build_http_client_or_default() -> reqwest::Client {
-    build_http_client().unwrap_or_else(|_| reqwest::Client::new())
+    build_http_client_with_opts(&ProxyConfig::from_env(), &TimeoutConfig::from_env())
+        .unwrap_or_else(|_| reqwest::Client::new())
 }
 
 /// Build a `reqwest::Client` from an explicit [`ProxyConfig`]. Used by tests
 /// and by callers that want to override process-level environment lookups.
-///
-/// When `config.proxy_url` is set it overrides the per-scheme `http_proxy`
-/// and `https_proxy` fields and is registered as both an HTTP and HTTPS
-/// proxy so a single value can route every outbound request.
 pub fn build_http_client_with(config: &ProxyConfig) -> Result<reqwest::Client, ApiError> {
-    let mut builder = reqwest::Client::builder().no_proxy();
+    build_http_client_with_opts(config, &TimeoutConfig::from_env())
+}
+
+/// Build a `reqwest::Client` from explicit [`ProxyConfig`] and [`TimeoutConfig`].
+/// Used by callers that want to control both proxy routing and request timing.
+pub fn build_http_client_with_opts(
+    config: &ProxyConfig,
+    timeout: &TimeoutConfig,
+) -> Result<reqwest::Client, ApiError> {
+    let mut builder = reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(timeout.connect_timeout)
+        .timeout(timeout.request_timeout);
 
     let no_proxy = config
         .no_proxy
@@ -124,7 +193,7 @@ where
 mod tests {
     use std::collections::HashMap;
 
-    use super::{build_http_client_with, ProxyConfig};
+    use super::{build_http_client_with, build_http_client_with_opts, ProxyConfig, TimeoutConfig};
 
     fn config_from_map(pairs: &[(&str, &str)]) -> ProxyConfig {
         let map: HashMap<String, String> = pairs
@@ -136,30 +205,19 @@ mod tests {
 
     #[test]
     fn proxy_config_is_empty_when_no_env_vars_are_set() {
-        // given
         let config = config_from_map(&[]);
-
-        // when
-        let empty = config.is_empty();
-
-        // then
-        assert!(empty);
+        assert!(config.is_empty());
         assert_eq!(config, ProxyConfig::default());
     }
 
     #[test]
     fn proxy_config_reads_uppercase_http_https_and_no_proxy() {
-        // given
         let pairs = [
             ("HTTP_PROXY", "http://proxy.internal:3128"),
             ("HTTPS_PROXY", "http://secure.internal:3129"),
             ("NO_PROXY", "localhost,127.0.0.1,.corp"),
         ];
-
-        // when
         let config = config_from_map(&pairs);
-
-        // then
         assert_eq!(
             config.http_proxy.as_deref(),
             Some("http://proxy.internal:3128")
@@ -177,17 +235,12 @@ mod tests {
 
     #[test]
     fn proxy_config_falls_back_to_lowercase_keys() {
-        // given
         let pairs = [
             ("http_proxy", "http://lower.internal:3128"),
             ("https_proxy", "http://lower-secure.internal:3129"),
             ("no_proxy", ".lower"),
         ];
-
-        // when
         let config = config_from_map(&pairs);
-
-        // then
         assert_eq!(
             config.http_proxy.as_deref(),
             Some("http://lower.internal:3128")
@@ -201,16 +254,11 @@ mod tests {
 
     #[test]
     fn proxy_config_prefers_uppercase_over_lowercase_when_both_set() {
-        // given
         let pairs = [
             ("HTTP_PROXY", "http://upper.internal:3128"),
             ("http_proxy", "http://lower.internal:3128"),
         ];
-
-        // when
         let config = config_from_map(&pairs);
-
-        // then
         assert_eq!(
             config.http_proxy.as_deref(),
             Some("http://upper.internal:3128")
@@ -219,59 +267,39 @@ mod tests {
 
     #[test]
     fn proxy_config_treats_empty_strings_as_unset() {
-        // given
         let pairs = [("HTTP_PROXY", ""), ("http_proxy", "")];
-
-        // when
         let config = config_from_map(&pairs);
-
-        // then
         assert!(config.http_proxy.is_none());
     }
 
     #[test]
     fn build_http_client_succeeds_when_no_proxy_is_configured() {
-        // given
         let config = ProxyConfig::default();
-
-        // when
         let result = build_http_client_with(&config);
-
-        // then
         assert!(result.is_ok());
     }
 
     #[test]
     fn build_http_client_succeeds_with_valid_http_and_https_proxies() {
-        // given
         let config = ProxyConfig {
             http_proxy: Some("http://proxy.internal:3128".to_string()),
             https_proxy: Some("http://secure.internal:3129".to_string()),
             no_proxy: Some("localhost,127.0.0.1".to_string()),
             proxy_url: None,
         };
-
-        // when
         let result = build_http_client_with(&config);
-
-        // then
         assert!(result.is_ok());
     }
 
     #[test]
     fn build_http_client_returns_http_error_for_invalid_proxy_url() {
-        // given
         let config = ProxyConfig {
             http_proxy: None,
             https_proxy: Some("not a url".to_string()),
             no_proxy: None,
             proxy_url: None,
         };
-
-        // when
         let result = build_http_client_with(&config);
-
-        // then
         let error = result.expect_err("invalid proxy URL must be reported as a build failure");
         assert!(
             matches!(error, crate::error::ApiError::Http(_)),
@@ -281,10 +309,7 @@ mod tests {
 
     #[test]
     fn from_proxy_url_sets_unified_field_and_leaves_per_scheme_empty() {
-        // given / when
         let config = ProxyConfig::from_proxy_url("http://unified.internal:3128");
-
-        // then
         assert_eq!(
             config.proxy_url.as_deref(),
             Some("http://unified.internal:3128")
@@ -296,49 +321,56 @@ mod tests {
 
     #[test]
     fn build_http_client_succeeds_with_unified_proxy_url() {
-        // given
         let config = ProxyConfig {
             proxy_url: Some("http://unified.internal:3128".to_string()),
             no_proxy: Some("localhost".to_string()),
             ..ProxyConfig::default()
         };
-
-        // when
         let result = build_http_client_with(&config);
-
-        // then
         assert!(result.is_ok());
     }
 
     #[test]
     fn proxy_url_takes_precedence_over_per_scheme_fields() {
-        // given – both per-scheme and unified are set
         let config = ProxyConfig {
             http_proxy: Some("http://per-scheme.internal:1111".to_string()),
             https_proxy: Some("http://per-scheme.internal:2222".to_string()),
             no_proxy: None,
             proxy_url: Some("http://unified.internal:3128".to_string()),
         };
-
-        // when – building succeeds (the unified URL is valid)
         let result = build_http_client_with(&config);
-
-        // then
         assert!(result.is_ok());
     }
 
     #[test]
     fn build_http_client_returns_error_for_invalid_unified_proxy_url() {
-        // given
         let config = ProxyConfig::from_proxy_url("not a url");
-
-        // when
         let result = build_http_client_with(&config);
-
-        // then
         assert!(
             matches!(result, Err(crate::error::ApiError::Http(_))),
             "invalid unified proxy URL should fail: {result:?}"
         );
+    }
+
+    #[test]
+    fn timeout_config_defaults() {
+        let config = TimeoutConfig::default();
+        assert_eq!(config.connect_timeout, std::time::Duration::from_secs(30));
+        assert_eq!(config.request_timeout, std::time::Duration::from_secs(300));
+    }
+
+    #[test]
+    fn timeout_config_from_seconds() {
+        let config = TimeoutConfig::from_seconds(10, 60);
+        assert_eq!(config.connect_timeout, std::time::Duration::from_secs(10));
+        assert_eq!(config.request_timeout, std::time::Duration::from_secs(60));
+    }
+
+    #[test]
+    fn build_http_client_with_custom_timeouts() {
+        let config = ProxyConfig::default();
+        let timeout = TimeoutConfig::from_seconds(5, 120);
+        let result = build_http_client_with_opts(&config, &timeout);
+        assert!(result.is_ok());
     }
 }
