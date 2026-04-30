@@ -211,6 +211,7 @@ fn discover_instruction_files(cwd: &Path) -> std::io::Result<Vec<ContextFile>> {
 
     let mut files = Vec::new();
     for dir in directories {
+        // Single-file instruction files (existing)
         for candidate in [
             dir.join("CLAUDE.md"),
             dir.join("CLAUDE.local.md"),
@@ -219,8 +220,104 @@ fn discover_instruction_files(cwd: &Path) -> std::io::Result<Vec<ContextFile>> {
         ] {
             push_context_file(&mut files, candidate)?;
         }
+        // .claw/rules/ directory: all .md files loaded in sorted order
+        push_rules_dir(&mut files, dir.join(".claw").join("rules"))?;
+        // .claw/rules.local/ directory: personal/local rules (gitignored)
+        push_rules_dir(&mut files, dir.join(".claw").join("rules.local"))?;
+        // Auto-import from other frameworks (Cursor, Copilot, Windsurf, Aider)
+        push_framework_imports(&mut files, &dir)?;
     }
     Ok(dedupe_instruction_files(files))
+}
+
+/// Load all .md files from a rules directory, sorted alphabetically.
+fn push_rules_dir(files: &mut Vec<ContextFile>, dir: PathBuf) -> std::io::Result<()> {
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+                || p.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("txt"))
+                || p.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("mdc"))
+        })
+        .collect();
+    paths.sort();
+    for path in paths {
+        push_context_file(files, path)?;
+    }
+    Ok(())
+}
+
+/// Detect and import rules from other AI coding frameworks so that
+/// users switching to claw-code don't have to duplicate their rules.
+///
+/// Supported frameworks:
+/// - Cursor: .cursorrules, .cursor/rules/
+/// - GitHub Copilot: .github/copilot-instructions.md
+/// - Windsurf: .windsurfrules, .windsurfrules/
+/// - Aider: .aider.conf.yml instructions block
+/// - Pi (Plandex): .plandex/plan.md, .plandex/instructions.md
+/// - OpenCode: opencode.json instructions field
+/// - CrushCode / Crush: .crush/rules/, .crush/CLAUDE.md
+fn push_framework_imports(files: &mut Vec<ContextFile>, dir: &Path) -> std::io::Result<()> {
+    // Cursor
+    push_context_file(files, dir.join(".cursorrules"))?;
+    push_rules_dir(files, dir.join(".cursor").join("rules"))?;
+    // GitHub Copilot
+    push_context_file(files, dir.join(".github").join("copilot-instructions.md"))?;
+    // Windsurf
+    push_context_file(files, dir.join(".windsurfrules"))?;
+    push_rules_dir(files, dir.join(".windsurfrules"))?;
+    // Aider — reads the instruction lines from .aider.conf.yml
+    if let Some(aider_instructions) = read_aider_instructions(dir) {
+        files.push(ContextFile {
+            path: dir.join(".aider.conf.yml").join("instructions"),
+            content: aider_instructions,
+        });
+    }
+    // Pi (Plandex)
+    push_context_file(files, dir.join(".plandex").join("instructions.md"))?;
+    push_context_file(files, dir.join(".plandex").join("plan.md"))?;
+    // OpenCode — reads instructions from opencode.json config
+    if let Some(opencode_instructions) = read_opencode_instructions(dir) {
+        files.push(ContextFile {
+            path: dir.join("opencode.json").join("instructions"),
+            content: opencode_instructions,
+        });
+    }
+    // CrushCode / Crush
+    push_context_file(files, dir.join(".crush").join("CLAUDE.md"))?;
+    push_rules_dir(files, dir.join(".crush").join("rules"))?;
+    Ok(())
+}
+
+/// Extract instructions from an opencode.json config file.
+/// OpenCode stores rules in a top-level "instructions" field.
+fn read_opencode_instructions(dir: &Path) -> Option<String> {
+    let content = fs::read_to_string(dir.join("opencode.json")).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&content).ok()?;
+    parsed.get("instructions")?.as_str().map(str::to_owned)
+}
+
+/// Extract instruction lines from an .aider.conf.yml file.
+/// Aider stores instructions like: `instructions: ...` or multiline block.
+fn read_aider_instructions(dir: &Path) -> Option<String> {
+    let content = fs::read_to_string(dir.join(".aider.conf.yml")).ok()?;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if let Some(val) = trimmed.strip_prefix("instructions:") {
+            let instruction = val.trim();
+            if !instruction.is_empty() {
+                return Some(instruction.to_owned());
+            }
+        }
+    }
+    None
 }
 
 fn push_context_file(files: &mut Vec<ContextFile>, path: PathBuf) -> std::io::Result<()> {
