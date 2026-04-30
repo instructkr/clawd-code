@@ -2,6 +2,13 @@
     dead_code,
     unused_imports,
     unused_variables,
+    clippy::doc_markdown,
+    clippy::len_zero,
+    clippy::manual_string_new,
+    clippy::match_same_arms,
+    clippy::result_large_err,
+    clippy::too_many_lines,
+    clippy::uninlined_format_args,
     clippy::unneeded_struct_pattern,
     clippy::unnecessary_wraps,
     clippy::unused_self
@@ -9,6 +16,7 @@
 mod init;
 mod input;
 mod render;
+mod setup_wizard;
 
 use std::collections::BTreeSet;
 use std::env;
@@ -415,6 +423,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::Acp { output_format } => print_acp_status(output_format)?,
         CliAction::State { output_format } => run_worker_state(output_format)?,
         CliAction::Init { output_format } => run_init(output_format)?,
+        CliAction::Setup { .. } => setup_wizard::run_setup_wizard()?,
         // #146: dispatch pure-local introspection. Text mode uses existing
         // render_config_report/render_diff_report; JSON mode uses the
         // corresponding _json helpers already exposed for resume sessions.
@@ -570,6 +579,9 @@ enum CliAction {
     HelpTopic(LocalHelpTopic),
     // prompt-mode formatting is only supported for non-interactive runs
     Help {
+        output_format: CliOutputFormat,
+    },
+    Setup {
         output_format: CliOutputFormat,
     },
 }
@@ -1108,6 +1120,7 @@ fn parse_single_word_command_alias(
         "sandbox" => Some(Ok(CliAction::Sandbox { output_format })),
         "doctor" => Some(Ok(CliAction::Doctor { output_format })),
         "state" => Some(Ok(CliAction::State { output_format })),
+        "setup" => Some(Ok(CliAction::Setup { output_format })),
         // #146: let `config` and `diff` fall through to parse_subcommand
         // where they are wired as pure-local introspection, instead of
         // producing the "is a slash command" guidance. Zero-arg cases
@@ -1129,6 +1142,7 @@ fn bare_slash_command_guidance(command_name: &str) -> Option<String> {
             | "init"
             | "prompt"
             | "export"
+            | "setup"
     ) {
         return None;
     }
@@ -1576,7 +1590,8 @@ fn config_permission_mode_for_current_dir() -> Option<PermissionMode> {
 fn config_model_for_current_dir() -> Option<String> {
     let cwd = env::current_dir().ok()?;
     let loader = ConfigLoader::default_for(&cwd);
-    loader.load().ok()?.model().map(ToOwned::to_owned)
+    let config = loader.load().ok()?;
+    config.model().map(ToOwned::to_owned).or_else(|| config.provider().model().map(ToOwned::to_owned))
 }
 
 fn resolve_repl_model(cli_model: String) -> String {
@@ -3326,12 +3341,13 @@ fn run_resume_command(
             json: Some(serde_json::json!({ "kind": "help", "text": render_repl_help() })),
         }),
         SlashCommand::Compact => {
-            let result = runtime::compact_session(
+            let result = runtime::trident::trident_compact_session(
                 session,
                 CompactionConfig {
                     max_estimated_tokens: 0,
                     ..CompactionConfig::default()
                 },
+                &runtime::trident::TridentConfig::default(),
             );
             let removed = result.removed_message_count;
             let kept = result.compacted_session.messages.len();
@@ -3666,8 +3682,10 @@ fn run_resume_command(
         | SlashCommand::Ide { .. }
         | SlashCommand::Tag { .. }
         | SlashCommand::OutputStyle { .. }
-        | SlashCommand::AddDir { .. } => Err("unsupported resumed slash command".into()),
-    }
+        | SlashCommand::AddDir { .. }
+        | SlashCommand::Lsp { .. }
+        | SlashCommand::Team { .. }
+        | SlashCommand::Setup => Err("unsupported resumed slash command".into()),    }
 }
 
 /// Detect if the current working directory is "broad" (home directory or
@@ -3773,11 +3791,72 @@ fn run_repl(
     run_stale_base_preflight(base_commit.as_deref());
     let resolved_model = resolve_repl_model(model);
     let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
+
+    // Read config for LSP auto-start setting
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let lsp_auto = runtime::ConfigLoader::default_for(&cwd)
+        .load()
+        .map(|c| c.lsp_auto_start())
+        .unwrap_or(true);
+    cli.lsp_auto_start = lsp_auto;
     cli.set_reasoning_effort(reasoning_effort);
     let mut editor =
         input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
     println!("{}", cli.startup_banner());
     println!("{}", format_connected_line(&cli.model));
+
+    // Validate key config fields and prompt setup wizard if missing
+    {
+        let cwd = std::env::current_dir().unwrap_or_default();
+        if let Ok(config) = runtime::ConfigLoader::default_for(&cwd).load() {
+            let mut missing: Vec<&str> = Vec::new();
+            if config.provider().api_key().is_none() {
+                missing.push("provider.apiKey");
+            }
+            if config.provider().base_url().is_none() {
+                missing.push("provider.baseUrl");
+            }
+            if config.subagent_model().is_none() {
+                missing.push("subagentModel");
+            }
+            if !missing.is_empty() {
+                eprintln!("
+  [33mWarning: Missing config fields:[0m {}", missing.join(", "));
+                eprintln!("  [2mRun [1mclaw setup[0m[2m or type [1m/setup[0m[2m to configure.[0m
+");
+            }
+        }
+    }
+
+    // Discover and register LSP servers
+    let lsp_servers = runtime::lsp_discovery::discover_available_servers();
+    if !lsp_servers.is_empty() {
+        eprintln!("Loading LSP servers...");
+        for server in &lsp_servers {
+            tools::global_lsp_registry().register_with_descriptor(
+                &server.language,
+                runtime::lsp_client::LspServerStatus::Starting,
+                None,
+                vec![],
+                server.clone(),
+            );
+        }
+        // Auto-start all discovered servers if enabled
+        if cli.lsp_auto_start {
+            let registry = tools::global_lsp_registry();
+            for server in &lsp_servers {
+                match registry.start_server(&server.language) {
+                    Ok(()) => eprintln!("  ✓ {} ({})", server.language, server.command),
+                    Err(e) => eprintln!("  ✗ {} — {e}", server.language),
+                }
+            }
+            eprintln!("  Disable with: /lsp toggle or set lspAutoStart=false in settings.json");
+        } else {
+            let names: Vec<&str> = lsp_servers.iter().map(|s| s.language.as_str()).collect();
+            eprintln!("  Available but not started: {}", names.join(", "));
+            eprintln!("  Start with: /lsp start <language> or set lspAutoStart=true in settings.json");
+        }
+    }
 
     loop {
         editor.set_completions(cli.repl_completion_candidates().unwrap_or_default());
@@ -3788,6 +3867,7 @@ fn run_repl(
                     continue;
                 }
                 if matches!(trimmed.as_str(), "/exit" | "/quit") {
+                    cli.shutdown_lsp_servers();
                     cli.persist_session()?;
                     break;
                 }
@@ -3818,8 +3898,30 @@ fn run_repl(
                 cli.record_prompt_history(&trimmed);
                 cli.run_turn(&trimmed)?;
             }
+            input::ReadOutcome::ProviderSwap => {
+                // Ctrl+P triggered — launch setup wizard and hot-swap model
+                setup_wizard::run_setup_wizard()?;
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let config = runtime::ConfigLoader::default_for(&cwd).load().ok();
+                if let Some(new_model) = config.as_ref().and_then(|c| c.provider().model().map(str::to_string)) {
+                    cli.set_model(Some(new_model))?;
+                }
+                println!("{}", format_connected_line(&cli.model));
+            }
+            input::ReadOutcome::TeamToggle => {
+                // Ctrl+T toggles agent teams mode
+                let current = std::env::var("CLAWD_AGENT_TEAMS").unwrap_or_default();
+                if current == "1" {
+                    std::env::set_var("CLAWD_AGENT_TEAMS", "0");
+                    eprintln!("[team] Agent teams disabled");
+                } else {
+                    std::env::set_var("CLAWD_AGENT_TEAMS", "1");
+                    eprintln!("[team] Agent teams enabled (TeamCreate now available)");
+                }
+            }
             input::ReadOutcome::Cancel => {}
             input::ReadOutcome::Exit => {
+                cli.shutdown_lsp_servers();
                 cli.persist_session()?;
                 break;
             }
@@ -3855,6 +3957,7 @@ struct LiveCli {
     runtime: BuiltRuntime,
     session: SessionHandle,
     prompt_history: Vec<PromptHistoryEntry>,
+    lsp_auto_start: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -4363,6 +4466,7 @@ impl LiveCli {
             runtime,
             session,
             prompt_history: Vec::new(),
+            lsp_auto_start: true,
         };
         cli.persist_session()?;
         Ok(cli)
@@ -4494,6 +4598,114 @@ impl LiveCli {
                     TerminalRenderer::new().color_theme(),
                     &mut stdout,
                 )?;
+                
+                // ============================================================================
+                // Auto-compact retry on context window errors
+                // ============================================================================
+                // When the model API returns a context_window_blocked error (because the request
+                // exceeds the model's context window), we automatically:
+                // 1. Compact the session (remove old messages to free up space)
+                // 2. Retry the original request with the compacted session
+                // 3. Report results to the user
+                //
+                // This eliminates the need for users to manually run /compact when they
+                // hit context limits - the recovery happens automatically.
+                //
+                // Detection: We look for "context_window" or "Context window" in the error
+                // message, which covers error types like:
+                // - "context_window_blocked"
+                // - "Context window blocked"
+                // - "This model's maximum context length is X tokens..."
+                // ============================================================================
+                
+                let error_str = error.to_string();
+                let is_context_window = error_str.contains("context_window")
+                    || error_str.contains("Context window")
+                    || error_str.contains("no parseable body");
+                
+                if is_context_window {
+                    // Progressive auto-compact retry loop:
+                    // Each round compacts more aggressively (fewer preserved messages)
+                    // until the request fits in the model's context window.
+                    // Max 4 rounds of compaction before giving up.
+                    let max_compact_rounds = 4;
+                    let preserve_schedule = [4, 2, 1, 0];
+                    
+                    for round in 0..max_compact_rounds {
+                        let preserve = preserve_schedule[round];
+                        println!(
+                            "  Auto-compacting session (round {}/{}, preserving {} recent messages)...",
+                            round + 1,
+                            max_compact_rounds,
+                            preserve
+                        );
+                        
+                        // Run Trident pipeline then summary-based compaction
+                        let result = runtime::trident::trident_compact_session(
+                            runtime.session(),
+                            CompactionConfig {
+                                preserve_recent_messages: preserve,
+                                max_estimated_tokens: 0,
+                            },
+                            &runtime::trident::TridentConfig::default(),
+                        );
+                        let removed = result.removed_message_count;
+                        
+                        if removed == 0 && round > 0 {
+                            // No more messages to compact — further rounds won't help
+                            println!("  No further compaction possible.");
+                            break;
+                        }
+                        
+                        if removed > 0 {
+                            println!("{}", format_compact_report(removed, result.compacted_session.messages.len(), false));
+                        }
+                        
+                        // Replace self.runtime's session with the compacted version
+                        // so prepare_turn_runtime builds from the compacted session
+                        *self.runtime.session_mut() = result.compacted_session.clone();
+                        
+                        // Build a new runtime with the compacted session and retry
+                        let (mut new_runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
+                        drop(hook_abort_monitor);
+                        
+                        let mut rp = CliPermissionPrompter::new(self.permission_mode);
+                        match new_runtime.run_turn(input, Some(&mut rp)) {
+                            Ok(summary) => {
+                                self.replace_runtime(new_runtime)?;
+                                spinner.finish(
+                                    if round == 0 { "✨ Done (after auto-compact)" } else { "✨ Done (after aggressive auto-compact)" },
+                                    TerminalRenderer::new().color_theme(),
+                                    &mut stdout,
+                                )?;
+                                println!();
+                                if let Some(event) = summary.auto_compaction {
+                                    println!("{}", format_auto_compaction_notice(event.removed_message_count));
+                                }
+                                self.persist_session()?;
+                                return Ok(());
+                            }
+                            Err(retry_error) => {
+                                let retry_str = retry_error.to_string();
+                                let still_context_window = retry_str.contains("context_window")
+                                    || retry_str.contains("Context window")
+                                    || retry_str.contains("no parseable body");
+                                
+                                if still_context_window && round + 1 < max_compact_rounds {
+                                    // Still too large — compact more aggressively next round
+                                    runtime.shutdown_plugins()?;
+                                    runtime = new_runtime;
+                                    continue;
+                                }
+                                
+                                // Not a context window error, or out of rounds
+                                return Err(Box::new(retry_error));
+                            }
+                        }
+                    }
+                }
+                
+                // If not a context window error, return original error
                 Err(Box::new(error))
             }
         }
@@ -4669,6 +4881,49 @@ impl LiveCli {
                 run_init(CliOutputFormat::Text)?;
                 false
             }
+            SlashCommand::Team { action } => {
+                match action.as_deref().unwrap_or("") {
+                    "on" | "enable" => {
+                        std::env::set_var("CLAWD_AGENT_TEAMS", "1");
+                        eprintln!("[team] Agent teams enabled (TeamCreate now available)");
+                    }
+                    "off" | "disable" => {
+                        std::env::set_var("CLAWD_AGENT_TEAMS", "0");
+                        eprintln!("[team] Agent teams disabled");
+                    }
+                    "status" => {
+                        let current = std::env::var("CLAWD_AGENT_TEAMS").unwrap_or_default();
+                        if current == "1" {
+                            eprintln!("[team] Agent teams: ENABLED");
+                        } else {
+                            eprintln!("[team] Agent teams: DISABLED (use /team on or Ctrl+T to enable)");
+                        }
+                    }
+                    "" => {
+                        // Toggle
+                        let current = std::env::var("CLAWD_AGENT_TEAMS").unwrap_or_default();
+                        if current == "1" {
+                            std::env::set_var("CLAWD_AGENT_TEAMS", "0");
+                            eprintln!("[team] Agent teams disabled");
+                        } else {
+                            std::env::set_var("CLAWD_AGENT_TEAMS", "1");
+                            eprintln!("[team] Agent teams enabled (TeamCreate now available)");
+                        }
+                    }
+                    other => eprintln!("[team] unknown action: {other}. Use: /team [on|off|status]"),
+                }
+                false
+            }
+            SlashCommand::Setup => {
+                setup_wizard::run_setup_wizard()?;
+                // Reload the model from config after wizard saves
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let config = runtime::ConfigLoader::default_for(&cwd).load().ok();
+                if let Some(new_model) = config.as_ref().and_then(|c| c.provider().model().map(str::to_string)) {
+                    self.set_model(Some(new_model))?;
+                }
+                false
+            }
             SlashCommand::Diff => {
                 Self::print_diff()?;
                 false
@@ -4755,11 +5010,69 @@ impl LiveCli {
                 eprintln!("{cmd_name} is not yet implemented in this build.");
                 false
             }
+            SlashCommand::Lsp { action, target } => {
+                self.handle_lsp_command(action.as_deref(), target.as_deref());
+                false
+            }
             SlashCommand::Unknown(name) => {
                 eprintln!("{}", format_unknown_slash_command(&name));
                 false
             }
         })
+    }
+
+    fn handle_lsp_command(&mut self, action: Option<&str>, target: Option<&str>) {
+        let registry = tools::global_lsp_registry();
+        match action {
+            Some("start") => {
+                let lang = target.unwrap_or("unknown");
+                match registry.start_server(lang) {
+                    Ok(()) => eprintln!("LSP server '{lang}' started."),
+                    Err(e) => eprintln!("Failed to start LSP server '{lang}': {e}"),
+                }
+            }
+            Some("stop") => {
+                let lang = target.unwrap_or("unknown");
+                match registry.stop_server(lang) {
+                    Ok(()) => eprintln!("LSP server '{lang}' stopped."),
+                    Err(e) => eprintln!("Failed to stop LSP server '{lang}': {e}"),
+                }
+            }
+            Some("restart") => {
+                let lang = target.unwrap_or("unknown");
+                let _ = registry.stop_server(lang);
+                match registry.start_server(lang) {
+                    Ok(()) => eprintln!("LSP server '{lang}' restarted."),
+                    Err(e) => eprintln!("Failed to restart LSP server '{lang}': {e}"),
+                }
+            }
+            Some("toggle") => {
+                self.lsp_auto_start = !self.lsp_auto_start;
+                let state = if self.lsp_auto_start { "on" } else { "off" };
+                eprintln!("LSP auto-start: {state}");
+            }
+            _ => {
+                let servers = registry.list_servers();
+                let auto_state = if self.lsp_auto_start { "on" } else { "off" };
+                eprintln!("LSP auto-start: {auto_state}");
+                if servers.is_empty() {
+                    eprintln!("No LSP servers registered.");
+                } else {
+                    for s in &servers {
+                        eprintln!("  {} [{}]", s.language, s.status);
+                    }
+                }
+            }
+        }
+    }
+
+    fn shutdown_lsp_servers(&self) {
+        let registry = tools::global_lsp_registry();
+        for server in registry.list_servers() {
+            if server.status == runtime::lsp_client::LspServerStatus::Connected {
+                let _ = registry.stop_server(&server.language);
+            }
+        }
     }
 
     fn persist_session(&self) -> Result<(), Box<dyn std::error::Error>> {
@@ -4994,7 +5307,8 @@ impl LiveCli {
             return Ok(false);
         };
 
-        let (handle, session) = load_session_reference(&session_ref)?;
+        let (handle, session) =
+            load_session_reference_excluding(&session_ref, Some(&self.session.id))?;
         let message_count = session.messages.len();
         let session_id = session.session_id.clone();
         let runtime = build_runtime(
@@ -5490,8 +5804,16 @@ fn latest_managed_session() -> Result<ManagedSessionSummary, Box<dyn std::error:
 fn load_session_reference(
     reference: &str,
 ) -> Result<(SessionHandle, Session), Box<dyn std::error::Error>> {
-    let loaded = current_session_store()?
-        .load_session(reference)
+    load_session_reference_excluding(reference, None)
+}
+
+fn load_session_reference_excluding(
+    reference: &str,
+    exclude_id: Option<&str>,
+) -> Result<(SessionHandle, Session), Box<dyn std::error::Error>> {
+    let store = current_session_store()?;
+    let loaded = store
+        .load_session_excluding(reference, exclude_id)
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
     Ok((
         SessionHandle {
@@ -9004,6 +9326,153 @@ impl ToolExecutor for CliToolExecutor {
             }
         }
     }
+
+    fn execute_batch(&mut self, calls: Vec<runtime::ToolCall>) -> Vec<runtime::ToolResult> {
+        if calls.len() <= 1 {
+            return calls
+                .into_iter()
+                .map(|call| {
+                    let result = self.execute(&call.tool_name, &call.input);
+                    runtime::ToolResult {
+                        tool_use_id: call.tool_use_id,
+                        tool_name: call.tool_name,
+                        result,
+                    }
+                })
+                .collect();
+        }
+
+        /// Tools that are safe to run in parallel because they only read
+        /// state and dispatch through the stateless tool registry.
+        const PARALLEL_SAFE_TOOLS: &[&str] = &[
+            "read_file",
+            "glob_search",
+            "grep_search",
+            "WebFetch",
+            "WebSearch",
+            "ToolSearch",
+            "Skill",
+            "LSP",
+            "Agent",
+            "AgentMessage",
+                        "TeamStatus",
+            "TaskClaim",
+            "AgentSuggestion",
+            "ContextRequest", "TaskGet",
+            "TaskList",
+            "TaskOutput",
+            "GitStatus",
+            "GitDiff",
+            "GitLog",
+            "GitShow",
+            "GitBlame",
+        ];
+
+        let emit_output = self.emit_output;
+        let mut results: Vec<Option<runtime::ToolResult>> = vec![None; calls.len()];
+        let mut parallel_calls: Vec<(usize, String, String, String)> = Vec::new();
+        let mut sequential_indices: Vec<usize> = Vec::new();
+
+        // Classify calls as parallel-safe or sequential
+        for (i, call) in calls.iter().enumerate() {
+            if self
+                .allowed_tools
+                .as_ref()
+                .is_some_and(|allowed| !allowed.contains(&call.tool_name))
+            {
+                results[i] = Some(runtime::ToolResult {
+                    tool_use_id: call.tool_use_id.clone(),
+                    tool_name: call.tool_name.clone(),
+                    result: Err(ToolError::new(format!(
+                        "tool `{}` is not enabled by the current --allowedTools setting",
+                        call.tool_name
+                    ))),
+                });
+            } else if PARALLEL_SAFE_TOOLS.contains(&call.tool_name.as_str())
+                && !self.tool_registry.has_runtime_tool(&call.tool_name)
+            {
+                parallel_calls.push((
+                    i,
+                    call.tool_use_id.clone(),
+                    call.tool_name.clone(),
+                    call.input.clone(),
+                ));
+            } else {
+                sequential_indices.push(i);
+            }
+        }
+
+        // Execute parallel-safe tools concurrently
+        if !parallel_calls.is_empty() {
+            let registry = self.tool_registry.clone();
+            let parallel_results: Vec<(usize, String, String, Result<String, ToolError>)> =
+                std::thread::scope(|s| {
+                    let mut handles = Vec::new();
+                    for (idx, tool_use_id, tool_name, input) in &parallel_calls {
+                        let registry = &registry;
+                        let tool_use_id = tool_use_id.clone();
+                        let tool_name = tool_name.clone();
+                        let input = input.clone();
+                        let idx = *idx;
+                        handles.push(s.spawn(move || {
+                            let value = serde_json::from_str(&input)
+                                .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")));
+                            let result = match value {
+                                Ok(v) => registry
+                                    .execute(&tool_name, &v)
+                                    .map_err(ToolError::new),
+                                Err(e) => Err(e),
+                            };
+                            (idx, tool_use_id, tool_name, result)
+                        }));
+                    }
+                    handles
+                        .into_iter()
+                        .map(|h| h.join().unwrap_or_else(|_| {
+                            (
+                                0,
+                                String::new(),
+                                String::new(),
+                                Err(ToolError::new("parallel thread panicked")),
+                            )
+                        }))
+                        .collect()
+                });
+
+            for (idx, tool_use_id, tool_name, result) in parallel_results {
+                if emit_output {
+                    let output_str = match &result {
+                        Ok(o) => o.clone(),
+                        Err(e) => e.to_string(),
+                    };
+                    let is_error = result.is_err();
+                    let markdown = format_tool_result(&tool_name, &output_str, is_error);
+                    self.renderer
+                        .stream_markdown(&markdown, &mut io::stdout())
+                        .map_err(|error| ToolError::new(error.to_string()))
+                        .ok();
+                }
+                results[idx] = Some(runtime::ToolResult {
+                    tool_use_id,
+                    tool_name,
+                    result,
+                });
+            }
+        }
+
+        // Execute sequential tools one at a time
+        for idx in sequential_indices {
+            let call = &calls[idx];
+            let result = self.execute(&call.tool_name, &call.input);
+            results[idx] = Some(runtime::ToolResult {
+                tool_use_id: call.tool_use_id.clone(),
+                tool_name: call.tool_name.clone(),
+                result,
+            });
+        }
+
+        results.into_iter().map(|r| r.unwrap()).collect()
+    }
 }
 
 fn permission_policy(
@@ -9317,7 +9786,8 @@ mod tests {
             body: String::new(),
             retryable: true,
             suggested_action: None,
-        };
+            retry_after: None,
+};
 
         let rendered = format_user_visible_api_error("session-issue-22", &error);
         assert!(rendered.contains("provider_internal"));
@@ -9340,7 +9810,8 @@ mod tests {
                 body: String::new(),
                 retryable: true,
                 suggested_action: None,
-            }),
+                retry_after: None,
+}),
         };
 
         let rendered = format_user_visible_api_error("session-issue-22", &error);
@@ -9404,7 +9875,8 @@ mod tests {
             body: String::new(),
             retryable: false,
             suggested_action: None,
-        };
+            retry_after: None,
+};
 
         let rendered = format_user_visible_api_error("session-issue-32", &error);
         assert!(rendered.contains("context_window_blocked"), "{rendered}");
@@ -9436,7 +9908,8 @@ mod tests {
                 body: String::new(),
                 retryable: false,
                 suggested_action: None,
-            }),
+                retry_after: None,
+}),
         };
 
         let rendered = format_user_visible_api_error("session-issue-32", &error);

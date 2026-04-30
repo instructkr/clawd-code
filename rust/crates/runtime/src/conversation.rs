@@ -57,6 +57,40 @@ pub trait ApiClient {
 /// Trait implemented by tool dispatchers that execute model-requested tools.
 pub trait ToolExecutor {
     fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError>;
+
+    /// Execute a batch of tool calls, potentially in parallel.
+    /// Returns results in the same order as the input calls.
+    /// The default implementation executes sequentially via `execute`.
+    /// Override this to provide parallel execution for read-only tools.
+    fn execute_batch(&mut self, calls: Vec<ToolCall>) -> Vec<ToolResult> {
+        calls
+            .into_iter()
+            .map(|call| {
+                let result = self.execute(&call.tool_name, &call.input);
+                ToolResult {
+                    tool_use_id: call.tool_use_id,
+                    tool_name: call.tool_name,
+                    result,
+                }
+            })
+            .collect()
+    }
+}
+
+/// A single tool call to execute.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolCall {
+    pub tool_use_id: String,
+    pub tool_name: String,
+    pub input: String,
+}
+
+/// The result of executing a tool call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolResult {
+    pub tool_use_id: String,
+    pub tool_name: String,
+    pub result: Result<String, ToolError>,
 }
 
 /// Error returned when a tool invocation fails locally.
@@ -81,6 +115,22 @@ impl Display for ToolError {
 }
 
 impl std::error::Error for ToolError {}
+
+/// Callback trait for reporting tool execution progress during a turn.
+/// Implementations can post progress to a team inbox, log to stderr, etc.
+/// Called after each tool call completes (success or failure).
+pub trait TurnProgressReporter: Send + Sync {
+    /// Called after a tool execution completes.
+    /// `iteration` is 1-based index of the tool call within this turn.
+    fn on_tool_result(
+        &self,
+        iteration: usize,
+        max_iterations: usize,
+        tool_name: &str,
+        input: &str,
+        result: Result<&str, &str>,
+    );
+}
 
 /// Error returned when a conversation turn cannot be completed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,6 +186,7 @@ pub struct ConversationRuntime<C, T> {
     hook_abort_signal: HookAbortSignal,
     hook_progress_reporter: Option<Box<dyn HookProgressReporter>>,
     session_tracer: Option<SessionTracer>,
+    turn_progress_reporter: Option<Box<dyn TurnProgressReporter>>,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -185,6 +236,7 @@ where
             hook_abort_signal: HookAbortSignal::default(),
             hook_progress_reporter: None,
             session_tracer: None,
+            turn_progress_reporter: None,
         }
     }
 
@@ -218,6 +270,14 @@ where
     #[must_use]
     pub fn with_session_tracer(mut self, session_tracer: SessionTracer) -> Self {
         self.session_tracer = Some(session_tracer);
+        self
+    }
+
+    pub fn with_turn_progress_reporter(
+        mut self,
+        reporter: Box<dyn TurnProgressReporter>,
+    ) -> Self {
+        self.turn_progress_reporter = Some(reporter);
         self
     }
 
@@ -397,11 +457,24 @@ where
                 break;
             }
 
-            for (tool_use_id, tool_name, input) in pending_tool_uses {
-                let pre_hook_result = self.run_pre_tool_use_hook(&tool_name, &input);
+            // Phase 1: Pre-hooks and permission checks (sequential).
+            // Hooks may mutate state and must run in order.
+            struct PendingTool {
+                tool_use_id: String,
+                tool_name: String,
+                effective_input: String,
+                pre_hook_messages: Vec<String>,
+                allowed: bool,
+                deny_reason: Option<String>,
+            }
+
+            let mut pending = Vec::with_capacity(pending_tool_uses.len());
+            for (tool_use_id, tool_name, input) in &pending_tool_uses {
+                let pre_hook_result = self.run_pre_tool_use_hook(tool_name, input);
                 let effective_input = pre_hook_result
                     .updated_input()
                     .map_or_else(|| input.clone(), ToOwned::to_owned);
+                let pre_hook_messages = pre_hook_result.messages().to_vec();
                 let permission_context = PermissionContext::new(
                     pre_hook_result.permission_override(),
                     pre_hook_result.permission_reason().map(ToOwned::to_owned),
@@ -430,71 +503,129 @@ where
                     }
                 } else if let Some(prompt) = prompter.as_mut() {
                     self.permission_policy.authorize_with_context(
-                        &tool_name,
+                        tool_name,
                         &effective_input,
                         &permission_context,
                         Some(*prompt),
                     )
                 } else {
                     self.permission_policy.authorize_with_context(
-                        &tool_name,
+                        tool_name,
                         &effective_input,
                         &permission_context,
                         None,
                     )
                 };
 
-                let result_message = match permission_outcome {
+                match permission_outcome {
                     PermissionOutcome::Allow => {
-                        self.record_tool_started(iterations, &tool_name);
-                        let (mut output, mut is_error) =
-                            match self.tool_executor.execute(&tool_name, &effective_input) {
-                                Ok(output) => (output, false),
-                                Err(error) => (error.to_string(), true),
-                            };
-                        output = merge_hook_feedback(pre_hook_result.messages(), output, false);
-
-                        let post_hook_result = if is_error {
-                            self.run_post_tool_use_failure_hook(
-                                &tool_name,
-                                &effective_input,
-                                &output,
-                            )
-                        } else {
-                            self.run_post_tool_use_hook(
-                                &tool_name,
-                                &effective_input,
-                                &output,
-                                false,
-                            )
-                        };
-                        if post_hook_result.is_denied()
-                            || post_hook_result.is_failed()
-                            || post_hook_result.is_cancelled()
-                        {
-                            is_error = true;
-                        }
-                        output = merge_hook_feedback(
-                            post_hook_result.messages(),
-                            output,
-                            post_hook_result.is_denied()
-                                || post_hook_result.is_failed()
-                                || post_hook_result.is_cancelled(),
-                        );
-
-                        ConversationMessage::tool_result(tool_use_id, tool_name, output, is_error)
+                        pending.push(PendingTool {
+                            tool_use_id: tool_use_id.clone(),
+                            tool_name: tool_name.clone(),
+                            effective_input,
+                            pre_hook_messages,
+                            allowed: true,
+                            deny_reason: None,
+                        });
                     }
-                    PermissionOutcome::Deny { reason } => ConversationMessage::tool_result(
-                        tool_use_id,
-                        tool_name,
-                        merge_hook_feedback(pre_hook_result.messages(), reason, true),
+                    PermissionOutcome::Deny { reason } => {
+                        pending.push(PendingTool {
+                            tool_use_id: tool_use_id.clone(),
+                            tool_name: tool_name.clone(),
+                            effective_input: String::new(),
+                            pre_hook_messages,
+                            allowed: false,
+                            deny_reason: Some(reason),
+                        });
+                    }
+                }
+            }
+
+            // Phase 2: Execute allowed tools (batch, may run in parallel).
+            let allowed_calls: Vec<ToolCall> = pending
+                .iter()
+                .filter(|p| p.allowed)
+                .map(|p| {
+                    self.record_tool_started(iterations, &p.tool_name);
+                    ToolCall {
+                        tool_use_id: p.tool_use_id.clone(),
+                        tool_name: p.tool_name.clone(),
+                        input: p.effective_input.clone(),
+                    }
+                })
+                .collect();
+            let batch_results = self.tool_executor.execute_batch(allowed_calls);
+            let mut batch_index = 0;
+
+            // Phase 3: Post-hooks and session updates (sequential, original order).
+            for p in &pending {
+                // Capture progress data for the reporter.
+                let (progress_tool_name, progress_input, progress_output, progress_is_error, result_message) = if p.allowed {
+                    let batch_result = &batch_results[batch_index];
+                    batch_index += 1;
+                    let (mut output, mut is_error) = match &batch_result.result {
+                        Ok(output) => (output.clone(), false),
+                        Err(error) => (error.to_string(), true),
+                    };
+                    output = merge_hook_feedback(&p.pre_hook_messages, output, false);
+
+                    let post_hook_result = if is_error {
+                        self.run_post_tool_use_failure_hook(
+                            &p.tool_name,
+                            &p.effective_input,
+                            &output,
+                        )
+                    } else {
+                        self.run_post_tool_use_hook(
+                            &p.tool_name,
+                            &p.effective_input,
+                            &output,
+                            false,
+                        )
+                    };
+                    if post_hook_result.is_denied()
+                        || post_hook_result.is_failed()
+                        || post_hook_result.is_cancelled()
+                    {
+                        is_error = true;
+                    }
+                    output = merge_hook_feedback(
+                        post_hook_result.messages(),
+                        output,
+                        post_hook_result.is_denied()
+                            || post_hook_result.is_failed()
+                            || post_hook_result.is_cancelled(),
+                    );
+                    let progress_output = output.clone();
+                    let result_message = ConversationMessage::tool_result(
+                        p.tool_use_id.clone(),
+                        p.tool_name.clone(),
+                        output,
+                        is_error,
+                    );
+                    (p.tool_name.clone(), p.effective_input.clone(), progress_output, is_error, result_message)
+                } else {
+                    let denied_output = merge_hook_feedback(&p.pre_hook_messages, p.deny_reason.clone().unwrap_or_default(), true);
+                    let result_message = ConversationMessage::tool_result(
+                        p.tool_use_id.clone(),
+                        p.tool_name.clone(),
+                        denied_output,
                         true,
-                    ),
+                    );
+                    (p.tool_name.clone(), String::new(), String::new(), true, result_message)
                 };
                 self.session
                     .push_message(result_message.clone())
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
                 self.record_tool_finished(iterations, &result_message);
+                if let Some(ref reporter) = self.turn_progress_reporter {
+                    let report_result = if progress_is_error {
+                        Err(progress_output.as_str())
+                    } else {
+                        Ok(progress_output.as_str())
+                    };
+                    reporter.on_tool_result(iterations, self.max_iterations, &progress_tool_name, &progress_input, report_result);
+                }
                 tool_results.push(result_message);
             }
         }

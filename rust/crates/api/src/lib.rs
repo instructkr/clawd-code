@@ -12,7 +12,9 @@ pub use client::{
 };
 pub use error::ApiError;
 pub use http_client::{
-    build_http_client, build_http_client_or_default, build_http_client_with, ProxyConfig,
+    TimeoutConfig,
+    build_http_client, build_http_client_or_default, build_http_client_with,
+    build_http_client_with_opts, ProxyConfig,
 };
 pub use prompt_cache::{
     CacheBreakEvent, PromptCache, PromptCacheConfig, PromptCachePaths, PromptCacheRecord,
@@ -25,7 +27,7 @@ pub use providers::openai_compat::{
 };
 pub use providers::{
     detect_provider_kind, max_tokens_for_model, max_tokens_for_model_with_override,
-    resolve_model_alias, ProviderKind,
+    model_token_limit, ModelTokenLimit, resolve_model_alias, ProviderKind,
 };
 pub use sse::{parse_frame, SseParser};
 pub use types::{

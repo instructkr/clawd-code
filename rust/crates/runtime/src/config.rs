@@ -51,20 +51,131 @@ pub struct RuntimePluginConfig {
     max_output_tokens: Option<u32>,
 }
 
+/// Per-language LSP server configuration supplied by the user in settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LspServerConfig {
+    pub command: String,
+    pub args: Vec<String>,
+    pub enabled: bool,
+}
+
+/// API timeout and retry configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiTimeoutConfig {
+    /// Connect timeout in seconds. Defaults to 30.
+    pub connect_timeout_secs: u64,
+    /// Request timeout in seconds. Defaults to 300 (5 minutes).
+    pub request_timeout_secs: u64,
+    /// Maximum retry attempts on transient failures. Defaults to 8.
+    pub max_retries: u32,
+}
+
+impl Default for ApiTimeoutConfig {
+    fn default() -> Self {
+        Self {
+            connect_timeout_secs: 30,
+            request_timeout_secs: 300,
+            max_retries: 8,
+        }
+    }
+}
 /// Structured feature configuration consumed by runtime subsystems.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeFeatureConfig {
     hooks: RuntimeHookConfig,
     plugins: RuntimePluginConfig,
     mcp: McpConfigCollection,
     oauth: Option<OAuthConfig>,
     model: Option<String>,
+    lsp_auto_start: bool,
     aliases: BTreeMap<String, String>,
     permission_mode: Option<ResolvedPermissionMode>,
     permission_rules: RuntimePermissionRuleConfig,
     sandbox: SandboxConfig,
     provider_fallbacks: ProviderFallbackConfig,
     trusted_roots: Vec<String>,
+    provider: RuntimeProviderConfig,
+    lsp: BTreeMap<String, LspServerConfig>,
+    api_timeout: ApiTimeoutConfig,
+    subagent_model: Option<String>,
+}
+
+impl Default for RuntimeFeatureConfig {
+    fn default() -> Self {
+        Self {
+            hooks: RuntimeHookConfig::default(),
+            plugins: RuntimePluginConfig::default(),
+            mcp: McpConfigCollection::default(),
+            oauth: None,
+            model: None,
+            lsp_auto_start: true,
+            aliases: BTreeMap::new(),
+            permission_mode: None,
+            permission_rules: RuntimePermissionRuleConfig::default(),
+            sandbox: SandboxConfig::default(),
+            provider_fallbacks: ProviderFallbackConfig::default(),
+            trusted_roots: Vec::new(),
+            provider: RuntimeProviderConfig::default(),
+            lsp: BTreeMap::new(),
+            api_timeout: ApiTimeoutConfig::default(),
+            subagent_model: None,
+        }
+    }
+}
+
+/// Controls which external AI coding framework rules are auto-imported
+/// into the system prompt.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum RulesImportConfig {
+    /// Auto-import from all supported frameworks (Cursor, Copilot, Windsurf, Aider)
+    Auto,
+    /// No auto-import — only .claw/rules/ and CLAUDE.md files are loaded
+    None,
+    /// Import only from the listed frameworks
+    List(Vec<String>),
+    #[default]
+    /// Default: auto-import all detected frameworks
+    Default,
+}
+
+impl RulesImportConfig {
+    pub fn should_import(&self, framework: &str) -> bool {
+        match self {
+            Self::Auto | Self::Default => true,
+            Self::None => false,
+            Self::List(frameworks) => frameworks.iter().any(|f| f.eq_ignore_ascii_case(framework)),
+        }
+    }
+}
+
+/// Stored provider configuration from the setup wizard.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RuntimeProviderConfig {
+    kind: Option<String>,
+    api_key: Option<String>,
+    base_url: Option<String>,
+    model: Option<String>,
+}
+
+impl RuntimeProviderConfig {
+    #[must_use]
+    pub fn kind(&self) -> Option<&str> {
+        self.kind.as_deref()
+    }
+
+    #[must_use]
+    pub fn api_key(&self) -> Option<&str> {
+        self.api_key.as_deref()
+    }
+
+    #[must_use]
+    pub fn base_url(&self) -> Option<&str> {
+        self.base_url.as_deref()
+    }
+
+    #[must_use]
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()    }
 }
 
 /// Ordered chain of fallback model identifiers used when the primary
@@ -315,6 +426,15 @@ impl ConfigLoader {
             sandbox: parse_optional_sandbox_config(&merged_value)?,
             provider_fallbacks: parse_optional_provider_fallbacks(&merged_value)?,
             trusted_roots: parse_optional_trusted_roots(&merged_value)?,
+            provider: parse_optional_provider_config(&merged_value)?,
+            lsp: parse_optional_lsp_config(&merged_value)?,
+            lsp_auto_start: merged_value
+                .as_object()
+                .and_then(|o| o.get("lspAutoStart"))
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(true),
+            api_timeout: parse_optional_api_timeout_config(&merged_value)?,
+            subagent_model: parse_optional_subagent_model(&merged_value),
         };
 
         Ok(RuntimeConfig {
@@ -414,6 +534,26 @@ impl RuntimeConfig {
     pub fn trusted_roots(&self) -> &[String] {
         &self.feature_config.trusted_roots
     }
+
+    #[must_use]
+    pub fn provider(&self) -> &RuntimeProviderConfig {
+        &self.feature_config.provider
+    }
+
+    #[must_use]
+    pub fn lsp(&self) -> &BTreeMap<String, LspServerConfig> {
+        &self.feature_config.lsp
+    }
+
+    #[must_use]
+    pub fn lsp_auto_start(&self) -> bool {
+        self.feature_config.lsp_auto_start
+    }
+
+    #[must_use]
+    pub fn subagent_model(&self) -> Option<&str> {
+        self.feature_config.subagent_model.as_deref()
+    }
 }
 
 impl RuntimeFeatureConfig {
@@ -482,6 +622,21 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn trusted_roots(&self) -> &[String] {
         &self.trusted_roots
+    }
+
+    #[must_use]
+    pub fn provider(&self) -> &RuntimeProviderConfig {
+        &self.provider
+    }
+
+    #[must_use]
+    pub fn lsp(&self) -> &BTreeMap<String, LspServerConfig> {
+        &self.lsp
+    }
+
+    #[must_use]
+    pub fn lsp_auto_start(&self) -> bool {
+        self.lsp_auto_start
     }
 }
 
@@ -562,6 +717,92 @@ pub fn default_config_home() -> PathBuf {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".claw")))
         .unwrap_or_else(|| PathBuf::from(".claw"))
+}
+
+/// Save provider settings to the user-level `~/.claw/settings.json`.
+/// Creates the file and directory if they don't exist. Sets file permissions
+/// to `0o600` (owner read/write only) to protect stored API keys.
+pub fn save_user_provider_settings(
+    kind: &str,
+    api_key: &str,
+    base_url: Option<&str>,
+    model: Option<&str>,
+) -> Result<(), ConfigError> {
+    let config_home = default_config_home();
+    fs::create_dir_all(&config_home).map_err(ConfigError::Io)?;
+    let settings_path = config_home.join("settings.json");
+
+    let mut root = read_settings_root(&settings_path);
+
+    let mut provider = serde_json::Map::new();
+    provider.insert("kind".to_string(), serde_json::Value::String(kind.to_string()));
+    provider.insert("apiKey".to_string(), serde_json::Value::String(api_key.to_string()));
+    if let Some(base_url) = base_url {
+        provider.insert("baseUrl".to_string(), serde_json::Value::String(base_url.to_string()));
+    } else {
+        provider.remove("baseUrl");
+    }
+    root.insert("provider".to_string(), serde_json::Value::Object(provider));
+    if let Some(model) = model {
+        root.insert("model".to_string(), serde_json::Value::String(model.to_string()));
+    } else {
+        root.remove("model");
+    }
+
+    write_settings_root(&settings_path, &root)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        fs::set_permissions(&settings_path, perms).map_err(ConfigError::Io)?;
+    }
+
+    Ok(())
+}
+
+/// Remove the `provider` section from the user-level `~/.claw/settings.json`.
+pub fn clear_user_provider_settings() -> Result<(), ConfigError> {
+    let config_home = default_config_home();
+    let settings_path = config_home.join("settings.json");
+
+    if !settings_path.exists() {
+        return Ok(());
+    }
+
+    let mut root = read_settings_root(&settings_path);
+    if root.remove("provider").is_none() {
+        return Ok(());
+    }
+    root.remove("model");
+
+    write_settings_root(&settings_path, &root)?;
+
+    Ok(())
+}
+
+fn read_settings_root(path: &Path) -> serde_json::Map<String, serde_json::Value> {
+    match fs::read_to_string(path) {
+        Ok(contents) if !contents.trim().is_empty() => {
+            serde_json::from_str::<serde_json::Value>(&contents)
+                .ok()
+                .and_then(|v| v.as_object().cloned())
+                .unwrap_or_default()
+        }
+        _ => serde_json::Map::new(),
+    }
+}
+
+fn write_settings_root(
+    path: &Path,
+    root: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), ConfigError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(ConfigError::Io)?;
+    }
+    let rendered = serde_json::to_string_pretty(&serde_json::Value::Object(root.clone()))
+        .map_err(|e| ConfigError::Parse(e.to_string()))?;
+    fs::write(path, format!("{rendered}\n")).map_err(ConfigError::Io)
 }
 
 impl RuntimeHookConfig {
@@ -904,6 +1145,28 @@ fn parse_optional_provider_fallbacks(
     Ok(ProviderFallbackConfig { primary, fallbacks })
 }
 
+fn parse_optional_api_timeout_config(root: &JsonValue) -> Result<ApiTimeoutConfig, ConfigError> {
+    let Some(timeout_value) = root.as_object().and_then(|obj| obj.get("apiTimeout")) else {
+        return Ok(ApiTimeoutConfig::default());
+    };
+    let Some(obj) = timeout_value.as_object() else {
+        return Ok(ApiTimeoutConfig::default());
+    };
+    let context = "merged settings.apiTimeout";
+    let connect_timeout_secs = optional_u64(obj, "connectTimeout", context)?
+        .unwrap_or(30);
+    let request_timeout_secs = optional_u64(obj, "requestTimeout", context)?
+        .unwrap_or(300);
+    let max_retries = optional_u64(obj, "maxRetries", context)?
+        .map(|v| v as u32)
+        .unwrap_or(8);
+    Ok(ApiTimeoutConfig {
+        connect_timeout_secs,
+        request_timeout_secs,
+        max_retries,
+    })
+}
+
 fn parse_optional_trusted_roots(root: &JsonValue) -> Result<Vec<String>, ConfigError> {
     let Some(object) = root.as_object() else {
         return Ok(Vec::new());
@@ -914,6 +1177,34 @@ fn parse_optional_trusted_roots(root: &JsonValue) -> Result<Vec<String>, ConfigE
     )
 }
 
+
+fn parse_optional_rules_import(root: &JsonValue) -> Result<RulesImportConfig, ConfigError> {
+    let Some(object) = root.as_object() else {
+        return Ok(RulesImportConfig::Default);
+    };
+    let Some(value) = object.get("rulesImport") else {
+        return Ok(RulesImportConfig::Default);
+    };
+    match value {
+        JsonValue::String(s) => match s.as_str() {
+            "auto" => Ok(RulesImportConfig::Auto),
+            "none" => Ok(RulesImportConfig::None),
+            other => Err(ConfigError::Parse(format!(
+                r#"merged settings.rulesImport: expected "auto", "none", or an array, got "{other}""#
+            ))),
+        },
+        JsonValue::Array(arr) => {
+            let frameworks: Vec<String> = arr
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect();
+            Ok(RulesImportConfig::List(frameworks))
+        }
+        _ => Err(ConfigError::Parse(format!(
+            r#"merged settings.rulesImport: expected "auto", "none", or an array"#
+        ))),
+    }
+}
 fn parse_filesystem_mode_label(value: &str) -> Result<FilesystemIsolationMode, ConfigError> {
     match value {
         "off" => Ok(FilesystemIsolationMode::Off),
@@ -948,6 +1239,53 @@ fn parse_optional_oauth_config(
         manual_redirect_url,
         scopes,
     }))
+}
+
+fn parse_optional_provider_config(root: &JsonValue) -> Result<RuntimeProviderConfig, ConfigError> {
+    let Some(provider_value) = root.as_object().and_then(|object| object.get("provider")) else {
+        return Ok(RuntimeProviderConfig::default());
+    };
+    let Some(object) = provider_value.as_object() else {
+        return Ok(RuntimeProviderConfig::default());
+    };
+    let kind = optional_string(object, "kind", "provider")?.map(str::to_string);
+    let api_key = optional_string(object, "apiKey", "provider")?.map(str::to_string);
+    let base_url = optional_string(object, "baseUrl", "provider")?.map(str::to_string);
+    let model = optional_string(object, "model", "provider")?.map(str::to_string);
+    Ok(RuntimeProviderConfig {
+        kind,
+        api_key,
+        base_url,
+        model,
+    })
+}
+
+fn parse_optional_lsp_config(
+    root: &JsonValue,
+) -> Result<BTreeMap<String, LspServerConfig>, ConfigError> {
+    let Some(lsp_value) = root.as_object().and_then(|object| object.get("lsp")) else {
+        return Ok(BTreeMap::new());
+    };
+    let lsp_object = expect_object(lsp_value, "merged settings.lsp")?;
+    let mut result = BTreeMap::new();
+    for (language, value) in lsp_object {
+        let entry = expect_object(value, &format!("merged settings.lsp.{language}"))?;
+        let command = expect_string(entry, "command", &format!("merged settings.lsp.{language}"))?
+            .to_string();
+        let args = optional_string_array(entry, "args", &format!("merged settings.lsp.{language}"))?
+            .unwrap_or_default();
+        let enabled = optional_bool(entry, "enabled", &format!("merged settings.lsp.{language}"))?
+            .unwrap_or(true);
+        result.insert(
+            language.clone(),
+            LspServerConfig {
+                command,
+                args,
+                enabled,
+            },
+        );
+    }
+    Ok(result)
 }
 
 fn parse_mcp_server_config(
@@ -1239,6 +1577,19 @@ fn push_unique(target: &mut Vec<String>, value: String) {
     if !target.iter().any(|existing| existing == &value) {
         target.push(value);
     }
+}
+
+fn parse_optional_subagent_model(value: &JsonValue) -> Option<String> {
+    value
+        .as_object()
+        .and_then(|object| {
+            object
+                .get("subagentModel")
+                .or_else(|| object.get("subagent_model"))
+        })
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim().to_string())
 }
 
 #[cfg(test)]

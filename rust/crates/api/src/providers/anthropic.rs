@@ -211,6 +211,19 @@ impl AnthropicClient {
         self
     }
 
+    /// Replace the internal HTTP client with one that respects the given
+    /// timeout configuration. This controls connect and request-level
+    /// timeouts for all outbound API calls.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: &crate::http_client::TimeoutConfig) -> Self {
+        self.http = crate::http_client::build_http_client_with_opts(
+            &crate::http_client::ProxyConfig::from_env(),
+            timeout,
+        )
+        .unwrap_or_else(|_| reqwest::Client::new());
+        self
+    }
+
     #[must_use]
     pub fn with_session_tracer(mut self, session_tracer: SessionTracer) -> Self {
         self.session_tracer = Some(session_tracer);
@@ -454,7 +467,12 @@ impl AnthropicClient {
                 break;
             }
 
-            tokio::time::sleep(self.jittered_backoff_for_attempt(attempts)?).await;
+            let delay = if let Some(retry_after) = last_error.as_ref().and_then(|e| e.retry_after()) {
+                retry_after
+            } else {
+                self.jittered_backoff_for_attempt(attempts)?
+            };
+            tokio::time::sleep(delay).await;
         }
 
         Err(ApiError::RetriesExhausted {
@@ -738,11 +756,7 @@ fn now_unix_timestamp() -> u64 {
 }
 
 fn read_env_non_empty(key: &str) -> Result<Option<String>, ApiError> {
-    match std::env::var(key) {
-        Ok(value) if !value.is_empty() => Ok(Some(value)),
-        Ok(_) | Err(std::env::VarError::NotPresent) => Ok(super::dotenv_value(key)),
-        Err(error) => Err(ApiError::from(error)),
-    }
+    super::read_env_or_config(key)
 }
 
 #[cfg(test)]
@@ -763,7 +777,10 @@ fn read_auth_token() -> Option<String> {
 
 #[must_use]
 pub fn read_base_url() -> String {
-    std::env::var("ANTHROPIC_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string())
+    super::read_env_or_config("ANTHROPIC_BASE_URL")
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| DEFAULT_BASE_URL.to_string())
 }
 
 fn request_id_from_headers(headers: &reqwest::header::HeaderMap) -> Option<String> {
@@ -869,10 +886,12 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
         return Ok(response);
     }
 
-    let request_id = request_id_from_headers(response.headers());
+    let headers = response.headers().clone();
+    let request_id = request_id_from_headers(&headers);
     let body = response.text().await.unwrap_or_else(|_| String::new());
     let parsed_error = serde_json::from_str::<AnthropicErrorEnvelope>(&body).ok();
-    let retryable = is_retryable_status(status);
+    let retryable = is_retryable_status(status) || is_retryable_400(status, &body);
+    let retry_after = parse_retry_after(&headers, status);
 
     Err(ApiError::Api {
         status,
@@ -886,11 +905,44 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
         body,
         retryable,
         suggested_action: None,
+        retry_after,
     })
+}
+
+fn parse_retry_after(headers: &reqwest::header::HeaderMap, status: reqwest::StatusCode) -> Option<std::time::Duration> {
+    if status != reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return None;
+    }
+    headers
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
 }
 
 const fn is_retryable_status(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 408 | 409 | 429 | 500 | 502 | 503 | 504)
+}
+
+/// Some providers return HTTP 400 with an unparseable body when a gateway
+/// or proxy flakes (e.g. "HTTP 400 from backend (no parseable body)").
+/// These are transient network blips, not actual bad requests, and should
+/// be retried. We detect them by checking the body for known gateway error
+/// phrases.
+fn is_retryable_400(status: reqwest::StatusCode, body: &str) -> bool {
+    if status != reqwest::StatusCode::BAD_REQUEST {
+        return false;
+    }
+    let lowered = body.to_ascii_lowercase();
+    // Gateway/proxy flakes that return 400 with transient error bodies
+    lowered.contains("no parseable body")
+        || lowered.contains("connection reset")
+        || lowered.contains("broken pipe")
+        || lowered.contains("empty reply from server")
+        // Anthropic sometimes returns 400 invalid_request_error when their
+        // backend flakes — the body contains "no parseable body" in the
+        // message field of the JSON error envelope.
+        || (lowered.contains("invalid_request_error") && lowered.contains("no parseable body"))
 }
 
 /// Anthropic API keys (`sk-ant-*`) are accepted over the `x-api-key` header
@@ -911,6 +963,8 @@ fn enrich_bearer_auth_error(error: ApiError, auth: &AuthSource) -> ApiError {
         body,
         retryable,
         suggested_action,
+        retry_after,
+        ..
     } = error
     else {
         return error;
@@ -924,6 +978,7 @@ fn enrich_bearer_auth_error(error: ApiError, auth: &AuthSource) -> ApiError {
             body,
             retryable,
             suggested_action,
+            retry_after,
         };
     }
     let Some(bearer_token) = auth.bearer_token() else {
@@ -935,6 +990,7 @@ fn enrich_bearer_auth_error(error: ApiError, auth: &AuthSource) -> ApiError {
             body,
             retryable,
             suggested_action,
+            retry_after,
         };
     };
     if !bearer_token.starts_with("sk-ant-") {
@@ -946,6 +1002,7 @@ fn enrich_bearer_auth_error(error: ApiError, auth: &AuthSource) -> ApiError {
             body,
             retryable,
             suggested_action,
+            retry_after,
         };
     }
     // Only append the hint when the AuthSource is pure BearerToken. If both
@@ -961,6 +1018,7 @@ fn enrich_bearer_auth_error(error: ApiError, auth: &AuthSource) -> ApiError {
             body,
             retryable,
             suggested_action,
+            retry_after,
         };
     }
     let enriched_message = match message {
@@ -975,6 +1033,7 @@ fn enrich_bearer_auth_error(error: ApiError, auth: &AuthSource) -> ApiError {
         body,
         retryable,
         suggested_action,
+        retry_after,
     }
 }
 
@@ -1563,6 +1622,7 @@ mod tests {
             body: String::new(),
             retryable: false,
             suggested_action: None,
+            retry_after: None,
         };
 
         // when
@@ -1604,6 +1664,7 @@ mod tests {
             body: String::new(),
             retryable: true,
             suggested_action: None,
+            retry_after: None,
         };
 
         // when
@@ -1633,6 +1694,7 @@ mod tests {
             body: String::new(),
             retryable: false,
             suggested_action: None,
+            retry_after: None,
         };
 
         // when
@@ -1661,6 +1723,7 @@ mod tests {
             body: String::new(),
             retryable: false,
             suggested_action: None,
+            retry_after: None,
         };
 
         // when
@@ -1686,6 +1749,7 @@ mod tests {
             body: String::new(),
             retryable: false,
             suggested_action: None,
+            retry_after: None,
         };
 
         // when

@@ -314,6 +314,13 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: true,
     },
     SlashCommandSpec {
+        name: "setup",
+        aliases: &[],
+        summary: "Configure provider, API key, and model interactively",
+        argument_hint: None,
+        resume_supported: true,
+    },
+    SlashCommandSpec {
         name: "stats",
         aliases: &[],
         summary: "Show workspace and session statistics",
@@ -1034,6 +1041,13 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         argument_hint: None,
         resume_supported: true,
     },
+    SlashCommandSpec {
+        name: "lsp",
+        aliases: &[],
+        summary: "Show or manage LSP server status",
+        argument_hint: Some("[start|stop|restart <language>]"),
+        resume_supported: true,
+    },
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1140,6 +1154,7 @@ pub enum SlashCommand {
     Usage {
         scope: Option<String>,
     },
+    Setup,
     Rename {
         name: Option<String>,
     },
@@ -1178,6 +1193,13 @@ pub enum SlashCommand {
     },
     History {
         count: Option<String>,
+    },
+    Lsp {
+        action: Option<String>,
+        target: Option<String>,
+    },
+    Team {
+        action: Option<String>,
     },
     Unknown(String),
 }
@@ -1265,6 +1287,8 @@ impl SlashCommand {
             Self::Theme { .. } => "/theme",
             Self::Voice { .. } => "/voice",
             Self::Usage { .. } => "/usage",
+            Self::Team { .. } => "/team",
+            Self::Setup => "/setup",
             Self::Rename { .. } => "/rename",
             Self::Copy { .. } => "/copy",
             Self::Hooks { .. } => "/hooks",
@@ -1277,6 +1301,7 @@ impl SlashCommand {
             Self::Tag { .. } => "/tag",
             Self::OutputStyle { .. } => "/output-style",
             Self::AddDir { .. } => "/add-dir",
+            Self::Lsp { .. } => "/lsp",
             Self::Sandbox => "/sandbox",
             Self::Mcp { .. } => "/mcp",
             Self::Export { .. } => "/export",
@@ -1472,10 +1497,12 @@ pub fn validate_slash_command_input(
         }
         "plan" => SlashCommand::Plan { mode: remainder },
         "review" => SlashCommand::Review { scope: remainder },
+        "team" => SlashCommand::Team { action: remainder },
         "tasks" => SlashCommand::Tasks { args: remainder },
         "theme" => SlashCommand::Theme { name: remainder },
         "voice" => SlashCommand::Voice { mode: remainder },
         "usage" => SlashCommand::Usage { scope: remainder },
+        "setup" => SlashCommand::Setup,
         "rename" => SlashCommand::Rename { name: remainder },
         "copy" => SlashCommand::Copy { target: remainder },
         "hooks" => SlashCommand::Hooks { args: remainder },
@@ -1488,6 +1515,10 @@ pub fn validate_slash_command_input(
         "tag" => SlashCommand::Tag { label: remainder },
         "output-style" => SlashCommand::OutputStyle { style: remainder },
         "add-dir" => SlashCommand::AddDir { path: remainder },
+        "lsp" => SlashCommand::Lsp {
+            action: args.first().map(|s| (*s).to_string()),
+            target: args.get(1).map(|s| (*s).to_string()),
+        },
         "history" => SlashCommand::History {
             count: optional_single_arg(command, &args, "[count]")?,
         },
@@ -2537,6 +2568,7 @@ pub fn resolve_skill_path(cwd: &Path, skill: &str) -> std::io::Result<PathBuf> {
     ))
 }
 
+#[allow(clippy::unnecessary_wraps)]
 fn render_mcp_report_for(
     loader: &ConfigLoader,
     cwd: &Path,
@@ -2600,6 +2632,7 @@ fn render_mcp_report_for(
     }
 }
 
+#[allow(clippy::unnecessary_wraps)]
 fn render_mcp_report_json_for(
     loader: &ConfigLoader,
     cwd: &Path,
@@ -4167,7 +4200,9 @@ pub fn handle_slash_command(
         | SlashCommand::OutputStyle { .. }
         | SlashCommand::AddDir { .. }
         | SlashCommand::History { .. }
-        | SlashCommand::Unknown(_) => None,
+        | SlashCommand::Lsp { .. }
+        | SlashCommand::Team { .. }
+        | SlashCommand::Setup        | SlashCommand::Unknown(_) => None,
     }
 }
 
@@ -4704,8 +4739,7 @@ mod tests {
         assert!(help.contains("aliases: /skill"));
         assert!(!help.contains("/login"));
         assert!(!help.contains("/logout"));
-        assert_eq!(slash_command_specs().len(), 139);
-        assert!(resume_supported_slash_commands().len() >= 39);
+        assert_eq!(slash_command_specs().len(), 141);        assert!(resume_supported_slash_commands().len() >= 39);
     }
 
     #[test]
