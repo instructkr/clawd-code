@@ -19,6 +19,9 @@ mod hooks;
 mod json;
 mod lane_events;
 pub mod lsp_client;
+pub mod lsp_discovery;
+pub mod lsp_process;
+pub mod lsp_transport;
 mod mcp;
 mod mcp_client;
 pub mod mcp_lifecycle_hardened;
@@ -57,9 +60,10 @@ pub use compact::{
     get_compact_continuation_message, should_compact, CompactionConfig, CompactionResult,
 };
 pub use config::{
-    ConfigEntry, ConfigError, ConfigLoader, ConfigSource, McpConfigCollection,
-    McpManagedProxyServerConfig, McpOAuthConfig, McpRemoteServerConfig, McpSdkServerConfig,
-    McpServerConfig, McpStdioServerConfig, McpTransport, McpWebSocketServerConfig, OAuthConfig,
+    ConfigEntry, ConfigError,
+    ConfigLoader, ConfigSource, LspServerConfig, McpConfigCollection, McpManagedProxyServerConfig,
+    McpOAuthConfig, McpRemoteServerConfig, McpSdkServerConfig, McpServerConfig,
+    McpStdioServerConfig, McpTransport, McpWebSocketServerConfig, OAuthConfig,
     ProviderFallbackConfig, ResolvedPermissionMode, RuntimeConfig, RuntimeFeatureConfig,
     RuntimeHookConfig, RuntimePermissionRuleConfig, RuntimePluginConfig, ScopedMcpServerConfig,
     CLAW_SETTINGS_SCHEMA_NAME,
@@ -67,6 +71,10 @@ pub use config::{
 pub use config_validate::{
     check_unsupported_format, format_diagnostics, validate_config_file, ConfigDiagnostic,
     DiagnosticKind, ValidationResult,
+};
+pub use lsp_discovery::{
+    command_exists_on_path, discover_available_servers, find_server_for_file,
+    known_lsp_servers, LspServerDescriptor,
 };
 pub use conversation::{
     auto_compaction_threshold_from_env, ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent,

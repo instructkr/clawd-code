@@ -51,20 +51,83 @@ pub struct RuntimePluginConfig {
     max_output_tokens: Option<u32>,
 }
 
+/// Per-language LSP server configuration supplied by the user in settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LspServerConfig {
+    pub command: String,
+    pub args: Vec<String>,
+    pub enabled: bool,
+}
+
 /// Structured feature configuration consumed by runtime subsystems.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeFeatureConfig {
     hooks: RuntimeHookConfig,
     plugins: RuntimePluginConfig,
     mcp: McpConfigCollection,
     oauth: Option<OAuthConfig>,
     model: Option<String>,
+    lsp_auto_start: bool,
     aliases: BTreeMap<String, String>,
     permission_mode: Option<ResolvedPermissionMode>,
     permission_rules: RuntimePermissionRuleConfig,
     sandbox: SandboxConfig,
     provider_fallbacks: ProviderFallbackConfig,
     trusted_roots: Vec<String>,
+    provider: RuntimeProviderConfig,
+    lsp: BTreeMap<String, LspServerConfig>,
+}
+
+impl Default for RuntimeFeatureConfig {
+    fn default() -> Self {
+        Self {
+            hooks: RuntimeHookConfig::default(),
+            plugins: RuntimePluginConfig::default(),
+            mcp: McpConfigCollection::default(),
+            oauth: None,
+            model: None,
+            lsp_auto_start: true,
+            aliases: BTreeMap::new(),
+            permission_mode: None,
+            permission_rules: RuntimePermissionRuleConfig::default(),
+            sandbox: SandboxConfig::default(),
+            provider_fallbacks: ProviderFallbackConfig::default(),
+            trusted_roots: Vec::new(),
+            provider: RuntimeProviderConfig::default(),
+            lsp: BTreeMap::new(),
+        }
+    }
+}
+
+/// Stored provider configuration from the setup wizard.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RuntimeProviderConfig {
+    kind: Option<String>,
+    api_key: Option<String>,
+    base_url: Option<String>,
+    model: Option<String>,
+}
+
+impl RuntimeProviderConfig {
+    #[must_use]
+    pub fn kind(&self) -> Option<&str> {
+        self.kind.as_deref()
+    }
+
+    #[must_use]
+    pub fn api_key(&self) -> Option<&str> {
+        self.api_key.as_deref()
+    }
+
+    #[must_use]
+    pub fn base_url(&self) -> Option<&str> {
+        self.base_url.as_deref()
+    }
+
+    #[must_use]
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
 }
 
 /// Ordered chain of fallback model identifiers used when the primary
@@ -315,6 +378,13 @@ impl ConfigLoader {
             sandbox: parse_optional_sandbox_config(&merged_value)?,
             provider_fallbacks: parse_optional_provider_fallbacks(&merged_value)?,
             trusted_roots: parse_optional_trusted_roots(&merged_value)?,
+            provider: parse_optional_provider_config(&merged_value)?,
+            lsp: parse_optional_lsp_config(&merged_value)?,
+            lsp_auto_start: merged_value
+                .as_object()
+                .and_then(|o| o.get("lspAutoStart"))
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(true),
         };
 
         Ok(RuntimeConfig {
@@ -414,6 +484,21 @@ impl RuntimeConfig {
     pub fn trusted_roots(&self) -> &[String] {
         &self.feature_config.trusted_roots
     }
+
+    #[must_use]
+    pub fn provider(&self) -> &RuntimeProviderConfig {
+        &self.feature_config.provider
+    }
+
+    #[must_use]
+    pub fn lsp(&self) -> &BTreeMap<String, LspServerConfig> {
+        &self.feature_config.lsp
+    }
+
+    #[must_use]
+    pub fn lsp_auto_start(&self) -> bool {
+        self.feature_config.lsp_auto_start
+    }
 }
 
 impl RuntimeFeatureConfig {
@@ -482,6 +567,21 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn trusted_roots(&self) -> &[String] {
         &self.trusted_roots
+    }
+
+    #[must_use]
+    pub fn provider(&self) -> &RuntimeProviderConfig {
+        &self.provider
+    }
+
+    #[must_use]
+    pub fn lsp(&self) -> &BTreeMap<String, LspServerConfig> {
+        &self.lsp
+    }
+
+    #[must_use]
+    pub fn lsp_auto_start(&self) -> bool {
+        self.lsp_auto_start
     }
 }
 
@@ -948,6 +1048,53 @@ fn parse_optional_oauth_config(
         manual_redirect_url,
         scopes,
     }))
+}
+
+fn parse_optional_provider_config(root: &JsonValue) -> Result<RuntimeProviderConfig, ConfigError> {
+    let Some(provider_value) = root.as_object().and_then(|object| object.get("provider")) else {
+        return Ok(RuntimeProviderConfig::default());
+    };
+    let Some(object) = provider_value.as_object() else {
+        return Ok(RuntimeProviderConfig::default());
+    };
+    let kind = optional_string(object, "kind", "provider")?.map(str::to_string);
+    let api_key = optional_string(object, "apiKey", "provider")?.map(str::to_string);
+    let base_url = optional_string(object, "baseUrl", "provider")?.map(str::to_string);
+    let model = optional_string(object, "model", "provider")?.map(str::to_string);
+    Ok(RuntimeProviderConfig {
+        kind,
+        api_key,
+        base_url,
+        model,
+    })
+}
+
+fn parse_optional_lsp_config(
+    root: &JsonValue,
+) -> Result<BTreeMap<String, LspServerConfig>, ConfigError> {
+    let Some(lsp_value) = root.as_object().and_then(|object| object.get("lsp")) else {
+        return Ok(BTreeMap::new());
+    };
+    let lsp_object = expect_object(lsp_value, "merged settings.lsp")?;
+    let mut result = BTreeMap::new();
+    for (language, value) in lsp_object {
+        let entry = expect_object(value, &format!("merged settings.lsp.{language}"))?;
+        let command = expect_string(entry, "command", &format!("merged settings.lsp.{language}"))?
+            .to_string();
+        let args = optional_string_array(entry, "args", &format!("merged settings.lsp.{language}"))?
+            .unwrap_or_default();
+        let enabled = optional_bool(entry, "enabled", &format!("merged settings.lsp.{language}"))?
+            .unwrap_or(true);
+        result.insert(
+            language.clone(),
+            LspServerConfig {
+                command,
+                args,
+                enabled,
+            },
+        );
+    }
+    Ok(result)
 }
 
 fn parse_mcp_server_config(

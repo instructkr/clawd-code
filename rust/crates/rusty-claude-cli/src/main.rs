@@ -3666,7 +3666,8 @@ fn run_resume_command(
         | SlashCommand::Ide { .. }
         | SlashCommand::Tag { .. }
         | SlashCommand::OutputStyle { .. }
-        | SlashCommand::AddDir { .. } => Err("unsupported resumed slash command".into()),
+        | SlashCommand::AddDir { .. }
+        | SlashCommand::Lsp { .. } => Err("unsupported resumed slash command".into()),
     }
 }
 
@@ -3773,11 +3774,58 @@ fn run_repl(
     run_stale_base_preflight(base_commit.as_deref());
     let resolved_model = resolve_repl_model(model);
     let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
+
+    // Read config for LSP auto-start setting
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let lsp_auto = runtime::ConfigLoader::default_for(&cwd)
+        .load()
+        .map(|c| c.lsp_auto_start())
+        .unwrap_or(true);
+    cli.lsp_auto_start = lsp_auto;
     cli.set_reasoning_effort(reasoning_effort);
     let mut editor =
         input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
     println!("{}", cli.startup_banner());
     println!("{}", format_connected_line(&cli.model));
+
+    // Discover and register LSP servers
+    let lsp_servers = runtime::lsp_discovery::discover_available_servers();
+    if !lsp_servers.is_empty() {
+        eprintln!("Loading LSP servers...");
+        for server in &lsp_servers {
+            tools::global_lsp_registry().register_with_descriptor(
+                &server.language,
+                runtime::lsp_client::LspServerStatus::Starting,
+                None,
+                vec![],
+                server.clone(),
+            );
+        }
+        // Auto-start all discovered servers if enabled
+        if cli.lsp_auto_start {
+            let registry = tools::global_lsp_registry();
+            for server in &lsp_servers {
+                match registry.start_server(&server.language) {
+                    Ok(()) => eprintln!("  ✓ {} ({})", server.language, server.command),
+                    Err(e) => eprintln!("  ✗ {} — {e}", server.language),
+                }
+            }
+            eprintln!("  Disable with: /lsp toggle or set lspAutoStart=false in settings.json");
+        } else {
+            let names: Vec<&str> = lsp_servers.iter().map(|s| s.language.as_str()).collect();
+            eprintln!("  Available but not started: {}", names.join(", "));
+            eprintln!("  Start with: /lsp start <language> or set lspAutoStart=true in settings.json");
+        }
+    }
+
+    // Show install suggestions for missing LSP servers
+    {
+        let availability = runtime::lsp_discovery::check_lsp_availability();
+        let prompt = runtime::lsp_discovery::format_install_prompt(&availability);
+        if !prompt.is_empty() {
+            eprintln!("{prompt}");
+        }
+    }
 
     loop {
         editor.set_completions(cli.repl_completion_candidates().unwrap_or_default());
@@ -3788,6 +3836,7 @@ fn run_repl(
                     continue;
                 }
                 if matches!(trimmed.as_str(), "/exit" | "/quit") {
+                    cli.shutdown_lsp_servers();
                     cli.persist_session()?;
                     break;
                 }
@@ -3820,6 +3869,7 @@ fn run_repl(
             }
             input::ReadOutcome::Cancel => {}
             input::ReadOutcome::Exit => {
+                cli.shutdown_lsp_servers();
                 cli.persist_session()?;
                 break;
             }
@@ -3855,6 +3905,7 @@ struct LiveCli {
     runtime: BuiltRuntime,
     session: SessionHandle,
     prompt_history: Vec<PromptHistoryEntry>,
+    lsp_auto_start: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -4363,6 +4414,7 @@ impl LiveCli {
             runtime,
             session,
             prompt_history: Vec::new(),
+            lsp_auto_start: true,
         };
         cli.persist_session()?;
         Ok(cli)
@@ -4755,11 +4807,69 @@ impl LiveCli {
                 eprintln!("{cmd_name} is not yet implemented in this build.");
                 false
             }
+            SlashCommand::Lsp { action, target } => {
+                self.handle_lsp_command(action.as_deref(), target.as_deref());
+                false
+            }
             SlashCommand::Unknown(name) => {
                 eprintln!("{}", format_unknown_slash_command(&name));
                 false
             }
         })
+    }
+
+    fn handle_lsp_command(&mut self, action: Option<&str>, target: Option<&str>) {
+        let registry = tools::global_lsp_registry();
+        match action {
+            Some("start") => {
+                let lang = target.unwrap_or("unknown");
+                match registry.start_server(lang) {
+                    Ok(()) => eprintln!("LSP server '{lang}' started."),
+                    Err(e) => eprintln!("Failed to start LSP server '{lang}': {e}"),
+                }
+            }
+            Some("stop") => {
+                let lang = target.unwrap_or("unknown");
+                match registry.stop_server(lang) {
+                    Ok(()) => eprintln!("LSP server '{lang}' stopped."),
+                    Err(e) => eprintln!("Failed to stop LSP server '{lang}': {e}"),
+                }
+            }
+            Some("restart") => {
+                let lang = target.unwrap_or("unknown");
+                let _ = registry.stop_server(lang);
+                match registry.start_server(lang) {
+                    Ok(()) => eprintln!("LSP server '{lang}' restarted."),
+                    Err(e) => eprintln!("Failed to restart LSP server '{lang}': {e}"),
+                }
+            }
+            Some("toggle") => {
+                self.lsp_auto_start = !self.lsp_auto_start;
+                let state = if self.lsp_auto_start { "on" } else { "off" };
+                eprintln!("LSP auto-start: {state}");
+            }
+            _ => {
+                let servers = registry.list_servers();
+                let auto_state = if self.lsp_auto_start { "on" } else { "off" };
+                eprintln!("LSP auto-start: {auto_state}");
+                if servers.is_empty() {
+                    eprintln!("No LSP servers registered.");
+                } else {
+                    for s in &servers {
+                        eprintln!("  {} [{}]", s.language, s.status);
+                    }
+                }
+            }
+        }
+    }
+
+    fn shutdown_lsp_servers(&self) {
+        let registry = tools::global_lsp_registry();
+        for server in registry.list_servers() {
+            if server.status == runtime::lsp_client::LspServerStatus::Connected {
+                let _ = registry.stop_server(&server.language);
+            }
+        }
     }
 
     fn persist_session(&self) -> Result<(), Box<dyn std::error::Error>> {
