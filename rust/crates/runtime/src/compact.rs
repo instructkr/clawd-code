@@ -128,7 +128,7 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
         // is NOT an assistant message that contains a ToolUse block (i.e. the
         // pair is actually broken at the boundary).
         loop {
-            if k == 0 || k <= compacted_prefix_len {
+            if k == 0 || k <= compacted_prefix_len || k >= session.messages.len() {
                 break;
             }
             let first_preserved = &session.messages[k];
