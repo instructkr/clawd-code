@@ -464,7 +464,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             reasoning_effort,
             allow_broad_cwd,
         )?,
-        CliAction::HelpTopic(topic) => print_help_topic(topic),
+        CliAction::HelpTopic {
+            topic,
+            output_format,
+        } => print_help_topic(topic, output_format)?,
         CliAction::Help { output_format } => print_help(output_format)?,
     }
     Ok(())
@@ -567,7 +570,10 @@ enum CliAction {
         reasoning_effort: Option<String>,
         allow_broad_cwd: bool,
     },
-    HelpTopic(LocalHelpTopic),
+    HelpTopic {
+        topic: LocalHelpTopic,
+        output_format: CliOutputFormat,
+    },
     // prompt-mode formatting is only supported for non-interactive runs
     Help {
         output_format: CliOutputFormat,
@@ -843,7 +849,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     if rest.first().map(String::as_str) == Some("--resume") {
         return parse_resume_args(&rest[1..], output_format);
     }
-    if let Some(action) = parse_local_help_action(&rest) {
+    if let Some(action) = parse_local_help_action(&rest, output_format) {
         return action;
     }
     if let Some(action) = parse_single_word_command_alias(
@@ -1021,7 +1027,10 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     }
 }
 
-fn parse_local_help_action(rest: &[String]) -> Option<Result<CliAction, String>> {
+fn parse_local_help_action(
+    rest: &[String],
+    output_format: CliOutputFormat,
+) -> Option<Result<CliAction, String>> {
     if rest.len() != 2 || !is_help_flag(&rest[1]) {
         return None;
     }
@@ -1044,7 +1053,10 @@ fn parse_local_help_action(rest: &[String]) -> Option<Result<CliAction, String>>
         "bootstrap-plan" => LocalHelpTopic::BootstrapPlan,
         _ => return None,
     };
-    Some(Ok(CliAction::HelpTopic(topic)))
+    Some(Ok(CliAction::HelpTopic {
+        topic,
+        output_format,
+    }))
 }
 
 fn is_help_flag(value: &str) -> bool {
@@ -6090,8 +6102,90 @@ fn render_help_topic(topic: LocalHelpTopic) -> String {
     }
 }
 
-fn print_help_topic(topic: LocalHelpTopic) {
-    println!("{}", render_help_topic(topic));
+fn local_help_topic_command(topic: LocalHelpTopic) -> &'static str {
+    match topic {
+        LocalHelpTopic::Status => "status",
+        LocalHelpTopic::Sandbox => "sandbox",
+        LocalHelpTopic::Doctor => "doctor",
+        LocalHelpTopic::Acp => "acp",
+        LocalHelpTopic::Init => "init",
+        LocalHelpTopic::State => "state",
+        LocalHelpTopic::Export => "export",
+        LocalHelpTopic::Version => "version",
+        LocalHelpTopic::SystemPrompt => "system-prompt",
+        LocalHelpTopic::DumpManifests => "dump-manifests",
+        LocalHelpTopic::BootstrapPlan => "bootstrap-plan",
+    }
+}
+
+fn render_export_help_json() -> serde_json::Value {
+    json!({
+        "kind": "help",
+        "topic": "export",
+        "command": "export",
+        "usage": "claw export [--session <id|latest>] [--output <path>] [--output-format <format>]",
+        "purpose": "serialize a managed session to JSON for review, transfer, or archival",
+        "defaults": {
+            "session": LATEST_SESSION_REFERENCE,
+            "session_source": ".claw/sessions/",
+            "output": "derived from the selected session when omitted"
+        },
+        "formats": ["text", "json"],
+        "options": [
+            {
+                "name": "--session",
+                "value": "<id|latest>",
+                "default": LATEST_SESSION_REFERENCE,
+                "description": "managed session to export"
+            },
+            {
+                "name": "--output",
+                "aliases": ["-o"],
+                "value": "<path>",
+                "description": "write the exported transcript to this path"
+            },
+            {
+                "name": "--output-format",
+                "value": "<format>",
+                "values": ["text", "json"],
+                "default": "text",
+                "description": "format for the command result envelope"
+            },
+            {
+                "name": "--help",
+                "aliases": ["-h"],
+                "description": "show help for the export command"
+            }
+        ],
+        "related": ["/session list", "claw --resume latest"]
+    })
+}
+
+fn render_help_topic_json(topic: LocalHelpTopic) -> serde_json::Value {
+    if topic == LocalHelpTopic::Export {
+        return render_export_help_json();
+    }
+
+    json!({
+        "kind": "help",
+        "topic": local_help_topic_command(topic),
+        "command": local_help_topic_command(topic),
+        "message": render_help_topic(topic),
+    })
+}
+
+fn print_help_topic(
+    topic: LocalHelpTopic,
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match output_format {
+        CliOutputFormat::Text => println!("{}", render_help_topic(topic)),
+        CliOutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&render_help_topic_json(topic))?
+        ),
+    }
+    Ok(())
 }
 
 fn print_acp_status(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
@@ -9249,17 +9343,17 @@ mod tests {
         parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
         parse_history_count, permission_policy, print_help_to, push_output_block,
         render_config_report, render_diff_report, render_diff_report_for, render_help_topic,
-        render_memory_report, render_prompt_history_report, render_repl_help, render_resume_usage,
-        render_session_list, render_session_markdown, resolve_model_alias,
-        resolve_model_alias_with_config, resolve_repl_model, resolve_session_reference,
-        response_to_events, resume_supported_slash_commands, run_resume_command, short_tool_id,
-        slash_command_completion_candidates_with_sessions, split_error_hint, status_context,
-        status_json_value, summarize_tool_payload_for_markdown, try_resolve_bare_skill_prompt,
-        validate_no_args, write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor,
-        GitWorkspaceSummary, InternalPromptProgressEvent, InternalPromptProgressState, LiveCli,
-        LocalHelpTopic, PromptHistoryEntry, SessionLifecycleKind, SessionLifecycleSummary,
-        SlashCommand, StatusUsage, TmuxPaneSnapshot, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
-        STUB_COMMANDS,
+        render_help_topic_json, render_memory_report, render_prompt_history_report,
+        render_repl_help, render_resume_usage, render_session_list, render_session_markdown,
+        resolve_model_alias, resolve_model_alias_with_config, resolve_repl_model,
+        resolve_session_reference, response_to_events, resume_supported_slash_commands,
+        run_resume_command, short_tool_id, slash_command_completion_candidates_with_sessions,
+        split_error_hint, status_context, status_json_value, summarize_tool_payload_for_markdown,
+        try_resolve_bare_skill_prompt, validate_no_args, write_mcp_server_fixture, CliAction,
+        CliOutputFormat, CliToolExecutor, GitWorkspaceSummary, InternalPromptProgressEvent,
+        InternalPromptProgressState, LiveCli, LocalHelpTopic, PromptHistoryEntry,
+        SessionLifecycleKind, SessionLifecycleSummary, SlashCommand, StatusUsage, TmuxPaneSnapshot,
+        DEFAULT_MODEL, LATEST_SESSION_REFERENCE, STUB_COMMANDS,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -10379,21 +10473,33 @@ mod tests {
         assert_eq!(
             parse_args(&["status".to_string(), "--help".to_string()])
                 .expect("status help should parse"),
-            CliAction::HelpTopic(LocalHelpTopic::Status)
+            CliAction::HelpTopic {
+                topic: LocalHelpTopic::Status,
+                output_format: CliOutputFormat::Text,
+            }
         );
         assert_eq!(
             parse_args(&["sandbox".to_string(), "-h".to_string()])
                 .expect("sandbox help should parse"),
-            CliAction::HelpTopic(LocalHelpTopic::Sandbox)
+            CliAction::HelpTopic {
+                topic: LocalHelpTopic::Sandbox,
+                output_format: CliOutputFormat::Text,
+            }
         );
         assert_eq!(
             parse_args(&["doctor".to_string(), "--help".to_string()])
                 .expect("doctor help should parse"),
-            CliAction::HelpTopic(LocalHelpTopic::Doctor)
+            CliAction::HelpTopic {
+                topic: LocalHelpTopic::Doctor,
+                output_format: CliOutputFormat::Text,
+            }
         );
         assert_eq!(
             parse_args(&["acp".to_string(), "--help".to_string()]).expect("acp help should parse"),
-            CliAction::HelpTopic(LocalHelpTopic::Acp)
+            CliAction::HelpTopic {
+                topic: LocalHelpTopic::Acp,
+                output_format: CliOutputFormat::Text,
+            }
         );
     }
 
@@ -10423,10 +10529,30 @@ mod tests {
                     });
                 assert_eq!(
                     parsed,
-                    CliAction::HelpTopic(*expected_topic),
+                    CliAction::HelpTopic {
+                        topic: *expected_topic,
+                        output_format: CliOutputFormat::Text,
+                    },
                     "`{subcommand} {flag}` should resolve to HelpTopic({expected_topic:?})"
                 );
             }
+            let json_parsed = parse_args(&[
+                subcommand.to_string(),
+                "--help".to_string(),
+                "--output-format".to_string(),
+                "json".to_string(),
+            ])
+            .unwrap_or_else(|error| {
+                panic!("`{subcommand} --help --output-format json` should parse: {error}")
+            });
+            assert_eq!(
+                json_parsed,
+                CliAction::HelpTopic {
+                    topic: *expected_topic,
+                    output_format: CliOutputFormat::Json,
+                },
+                "`{subcommand} --help --output-format json` should preserve json output format"
+            );
             // And the rendered help must actually mention the subcommand name
             // (or its canonical title) so users know they got the right help.
             let rendered = render_help_topic(*expected_topic);
@@ -10439,6 +10565,24 @@ mod tests {
                 "{subcommand} help text should contain a Usage line"
             );
         }
+    }
+
+    #[test]
+    fn export_help_json_is_bounded_and_parseable_384() {
+        let value = render_help_topic_json(LocalHelpTopic::Export);
+        assert_eq!(value["kind"], "help");
+        assert_eq!(value["topic"], "export");
+        assert_eq!(value["command"], "export");
+        assert_eq!(
+            value["usage"],
+            "claw export [--session <id|latest>] [--output <path>] [--output-format <format>]"
+        );
+        assert_eq!(value["defaults"]["session"], LATEST_SESSION_REFERENCE);
+        assert!(value["options"].as_array().expect("options array").len() >= 4);
+        assert!(
+            value.get("message").is_none(),
+            "export help json should be a bounded envelope, not plaintext help wrapped in json"
+        );
     }
 
     #[test]

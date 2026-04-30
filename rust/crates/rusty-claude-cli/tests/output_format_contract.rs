@@ -23,6 +23,42 @@ fn help_emits_json_when_requested() {
 }
 
 #[test]
+fn export_help_emits_bounded_json_when_requested_384() {
+    let root = unique_temp_dir("export-help-json");
+    fs::create_dir_all(&root).expect("temp dir should exist");
+
+    let parsed = assert_json_command(&root, &["export", "--help", "--output-format", "json"]);
+    assert_eq!(parsed["kind"], "help");
+    assert_eq!(parsed["topic"], "export");
+    assert_eq!(parsed["command"], "export");
+    assert_eq!(
+        parsed["usage"],
+        "claw export [--session <id|latest>] [--output <path>] [--output-format <format>]"
+    );
+    assert_eq!(parsed["defaults"]["session"], "latest");
+    assert!(parsed["options"].as_array().expect("options").len() >= 4);
+    assert!(parsed.get("message").is_none());
+}
+
+#[test]
+fn export_help_preserves_plaintext_in_text_mode_384() {
+    let root = unique_temp_dir("export-help-text");
+    fs::create_dir_all(&root).expect("temp dir should exist");
+
+    let output = run_claw(&root, &["export", "--help"], &[]);
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\n\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout utf8");
+    assert!(stdout.starts_with("Export\n"));
+    assert!(stdout.contains("Usage            claw export"));
+    serde_json::from_str::<Value>(&stdout).expect_err("text help should remain plaintext");
+}
+
+#[test]
 fn version_emits_json_when_requested() {
     let root = unique_temp_dir("version-json");
     fs::create_dir_all(&root).expect("temp dir should exist");
