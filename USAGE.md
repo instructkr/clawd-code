@@ -308,6 +308,147 @@ The OpenAI-compatible backend also serves as the gateway for **OpenRouter**, **O
 
 **Model-name prefix routing:** If a model name starts with `openai/`, `gpt-`, `qwen/`, or `qwen-`, the provider is selected by the prefix regardless of which env vars are set. This prevents accidental misrouting to Anthropic when multiple credentials exist in the environment.
 
+### Configured compatible providers
+
+If you use several compatible providers, define named provider profiles in `settings.json` instead of changing `OPENAI_BASE_URL` before every run. Each profile gets its own protocol, base URL, credential env var, and model allow-list.
+
+Run `claw login` or `/login` to create these profiles interactively for Z.AI, MiniMax, OpenAI, Kimi, Moonshot, or a custom compatible endpoint. The wizard can store a pasted local token in `~/.claw/settings.json`, but `apiKeyEnv` is preferred when you can keep the secret in your shell environment:
+
+```json
+{
+  "model": "zai/glm-5.1",
+  "modelProviders": {
+    "zai": {
+      "type": "openai-compatible",
+      "baseUrl": "https://api.z.ai/api/paas/v4",
+      "apiKeyEnv": "Z_AI_API_KEY",
+      "models": [
+        "glm-5.1",
+        "glm-5",
+        "glm-5-turbo",
+        "glm-4.7",
+        "glm-4.7-flashx",
+        "glm-4.7-flash",
+        "glm-4.6",
+        "glm-4.5",
+        "glm-4.5-x",
+        "glm-4.5-air",
+        "glm-4.5-airx",
+        "glm-4.5-flash",
+        "glm-4-32b-0414-128k"
+      ],
+      "defaultModel": "glm-5.1"
+    },
+    "zai-coding-plan": {
+      "type": "openai-compatible",
+      "baseUrl": "https://api.z.ai/api/coding/paas/v4",
+      "apiKeyEnv": "Z_AI_API_KEY",
+      "models": [
+        "glm-4.5-air",
+        "glm-4.7",
+        "glm-5-turbo",
+        "glm-5.1",
+        "glm-5v-turbo"
+      ],
+      "defaultModel": "glm-5.1"
+    },
+    "minimax-coding-plan": {
+      "type": "anthropic-compatible",
+      "baseUrl": "https://api.minimax.io/anthropic/v1",
+      "apiKeyEnv": "MINIMAX_API_KEY",
+      "models": [
+        "MiniMax-M2",
+        "MiniMax-M2.1",
+        "MiniMax-M2.5",
+        "MiniMax-M2.5-highspeed",
+        "MiniMax-M2.7",
+        "MiniMax-M2.7-highspeed"
+      ],
+      "defaultModel": "MiniMax-M2.7-highspeed"
+    },
+    "openai": {
+      "type": "openai-compatible",
+      "baseUrl": "https://api.openai.com/v1",
+      "apiKeyEnv": "OPENAI_API_KEY",
+      "models": [
+        "gpt-5-codex",
+        "gpt-5.1-codex",
+        "gpt-5.1-codex-max",
+        "gpt-5.1-codex-mini",
+        "gpt-5.2",
+        "gpt-5.2-codex",
+        "gpt-5.3-codex",
+        "gpt-5.3-codex-spark",
+        "gpt-5.4",
+        "gpt-5.4-fast",
+        "gpt-5.4-mini",
+        "gpt-5.4-mini-fast",
+        "gpt-5.5",
+        "gpt-5.5-fast",
+        "gpt-5.5-pro"
+      ],
+      "defaultModel": "gpt-5.5"
+    },
+    "kimi-for-coding": {
+      "type": "anthropic-compatible",
+      "baseUrl": "https://api.kimi.com/coding/v1",
+      "apiKeyEnv": "KIMI_API_KEY",
+      "models": [
+        "k2p5",
+        "k2p6",
+        "kimi-k2-thinking"
+      ],
+      "defaultModel": "k2p6"
+    },
+    "moonshot": {
+      "type": "openai-compatible",
+      "baseUrl": "https://api.moonshot.ai/v1",
+      "apiKeyEnv": "MOONSHOT_API_KEY",
+      "models": [
+        "kimi-k2.6",
+        "kimi-k2.5",
+        "kimi-k2-0905-preview",
+        "kimi-k2-0711-preview",
+        "kimi-k2-turbo-preview",
+        "kimi-k2-thinking",
+        "kimi-k2-thinking-turbo",
+        "moonshot-v1-8k",
+        "moonshot-v1-32k",
+        "moonshot-v1-128k",
+        "moonshot-v1-8k-vision-preview",
+        "moonshot-v1-32k-vision-preview",
+        "moonshot-v1-128k-vision-preview"
+      ],
+      "defaultModel": "kimi-k2.6"
+    }
+  }
+}
+```
+
+Use `/model provider/model` in the REPL to switch without restarting:
+
+```text
+/model zai/glm-5.1
+/model zai-coding-plan/glm-5.1
+/model minimax-coding-plan/MiniMax-M2.7-highspeed
+/model openai/gpt-5.5
+/model kimi-for-coding/k2p6
+/model moonshot/kimi-k2.6
+```
+
+You can also use the provider name alone when it has `defaultModel` configured:
+
+```text
+/model zai
+/model zai-coding-plan
+/model minimax-coding-plan
+/model openai
+/model kimi-for-coding
+/model moonshot
+```
+
+Prefer `apiKeyEnv` so secrets stay out of source-controlled project settings. `apiKey` is supported for local-only files when an environment variable is not practical.
+
 ### Tested models and aliases
 
 These are the models registered in the built-in alias table with known token limits:

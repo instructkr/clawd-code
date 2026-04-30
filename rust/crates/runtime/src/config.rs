@@ -64,7 +64,19 @@ pub struct RuntimeFeatureConfig {
     permission_rules: RuntimePermissionRuleConfig,
     sandbox: SandboxConfig,
     provider_fallbacks: ProviderFallbackConfig,
+    model_providers: BTreeMap<String, ModelProviderConfig>,
     trusted_roots: Vec<String>,
+}
+
+/// User-configured model provider profile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelProviderConfig {
+    provider_type: String,
+    base_url: String,
+    api_key_env: Option<String>,
+    api_key: Option<String>,
+    models: Vec<String>,
+    default_model: Option<String>,
 }
 
 /// Ordered chain of fallback model identifiers used when the primary
@@ -314,6 +326,7 @@ impl ConfigLoader {
             permission_rules: parse_optional_permission_rules(&merged_value)?,
             sandbox: parse_optional_sandbox_config(&merged_value)?,
             provider_fallbacks: parse_optional_provider_fallbacks(&merged_value)?,
+            model_providers: parse_optional_model_providers(&merged_value)?,
             trusted_roots: parse_optional_trusted_roots(&merged_value)?,
         };
 
@@ -411,6 +424,11 @@ impl RuntimeConfig {
     }
 
     #[must_use]
+    pub fn model_providers(&self) -> &BTreeMap<String, ModelProviderConfig> {
+        &self.feature_config.model_providers
+    }
+
+    #[must_use]
     pub fn trusted_roots(&self) -> &[String] {
         &self.feature_config.trusted_roots
     }
@@ -480,8 +498,64 @@ impl RuntimeFeatureConfig {
     }
 
     #[must_use]
+    pub fn model_providers(&self) -> &BTreeMap<String, ModelProviderConfig> {
+        &self.model_providers
+    }
+
+    #[must_use]
     pub fn trusted_roots(&self) -> &[String] {
         &self.trusted_roots
+    }
+}
+
+impl ModelProviderConfig {
+    #[must_use]
+    pub fn new(
+        provider_type: String,
+        base_url: String,
+        api_key_env: Option<String>,
+        api_key: Option<String>,
+        models: Vec<String>,
+        default_model: Option<String>,
+    ) -> Self {
+        Self {
+            provider_type,
+            base_url,
+            api_key_env,
+            api_key,
+            models,
+            default_model,
+        }
+    }
+
+    #[must_use]
+    pub fn provider_type(&self) -> &str {
+        &self.provider_type
+    }
+
+    #[must_use]
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    #[must_use]
+    pub fn api_key_env(&self) -> Option<&str> {
+        self.api_key_env.as_deref()
+    }
+
+    #[must_use]
+    pub fn api_key(&self) -> Option<&str> {
+        self.api_key.as_deref()
+    }
+
+    #[must_use]
+    pub fn models(&self) -> &[String] {
+        &self.models
+    }
+
+    #[must_use]
+    pub fn default_model(&self) -> Option<&str> {
+        self.default_model.as_deref()
     }
 }
 
@@ -902,6 +976,64 @@ fn parse_optional_provider_fallbacks(
     let fallbacks = optional_string_array(entry, "fallbacks", "merged settings.providerFallbacks")?
         .unwrap_or_default();
     Ok(ProviderFallbackConfig { primary, fallbacks })
+}
+
+fn parse_optional_model_providers(
+    root: &JsonValue,
+) -> Result<BTreeMap<String, ModelProviderConfig>, ConfigError> {
+    let Some(object) = root.as_object() else {
+        return Ok(BTreeMap::new());
+    };
+    let Some(value) = object.get("modelProviders") else {
+        return Ok(BTreeMap::new());
+    };
+    let providers = expect_object(value, "merged settings.modelProviders")?;
+    let mut parsed = BTreeMap::new();
+    for (name, value) in providers {
+        let context = format!("merged settings.modelProviders.{name}");
+        let provider = expect_object(value, &context)?;
+        let provider_type = optional_string(provider, "type", &context)?
+            .unwrap_or("openai-compatible")
+            .to_string();
+        if !matches!(
+            provider_type.as_str(),
+            "openai-compatible" | "openai" | "anthropic-compatible" | "anthropic"
+        ) {
+            return Err(ConfigError::Parse(format!(
+                "{context}: unsupported provider type {provider_type}"
+            )));
+        }
+        let base_url = expect_string(provider, "baseUrl", &context)?.to_string();
+        let api_key_env = optional_string(provider, "apiKeyEnv", &context)?.map(str::to_string);
+        let api_key = optional_string(provider, "apiKey", &context)?.map(str::to_string);
+        let models = optional_string_array(provider, "models", &context)?.unwrap_or_default();
+        let default_model =
+            optional_string(provider, "defaultModel", &context)?.map(str::to_string);
+        if models.is_empty() && default_model.is_none() {
+            return Err(ConfigError::Parse(format!(
+                "{context}: expected at least one model in models or defaultModel"
+            )));
+        }
+        if let Some(default_model) = &default_model {
+            if !models.is_empty() && !models.iter().any(|model| model == default_model) {
+                return Err(ConfigError::Parse(format!(
+                    "{context}: defaultModel must be listed in models"
+                )));
+            }
+        }
+        parsed.insert(
+            name.clone(),
+            ModelProviderConfig::new(
+                provider_type,
+                base_url,
+                api_key_env,
+                api_key,
+                models,
+                default_model,
+            ),
+        );
+    }
+    Ok(parsed)
 }
 
 fn parse_optional_trusted_roots(root: &JsonValue) -> Result<Vec<String>, ConfigError> {
@@ -1807,6 +1939,51 @@ mod tests {
         assert_eq!(
             aliases.get("cheap").map(String::as_str),
             Some("grok-3-mini")
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn parses_model_provider_profiles_from_settings() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            home.join("settings.json"),
+            r#"{
+                "model": "zai/glm-5.1",
+                "modelProviders": {
+                    "zai": {
+                        "type": "openai-compatible",
+                        "baseUrl": "https://api.z.ai/api/paas/v4",
+                        "apiKeyEnv": "Z_AI_API_KEY",
+                        "models": ["glm-5.1", "glm-4.6"],
+                        "defaultModel": "glm-5.1"
+                    }
+                }
+            }"#,
+        )
+        .expect("write settings");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+        let provider = loaded
+            .model_providers()
+            .get("zai")
+            .expect("zai provider should parse");
+
+        assert_eq!(loaded.model(), Some("zai/glm-5.1"));
+        assert_eq!(provider.provider_type(), "openai-compatible");
+        assert_eq!(provider.base_url(), "https://api.z.ai/api/paas/v4");
+        assert_eq!(provider.api_key_env(), Some("Z_AI_API_KEY"));
+        assert_eq!(provider.default_model(), Some("glm-5.1"));
+        assert_eq!(
+            provider.models(),
+            &["glm-5.1".to_string(), "glm-4.6".to_string()]
         );
 
         fs::remove_dir_all(root).expect("cleanup temp dir");

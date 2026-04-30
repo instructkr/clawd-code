@@ -194,6 +194,10 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
         expected: FieldType::Object,
     },
     FieldSpec {
+        name: "modelProviders",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
         name: "trustedRoots",
         expected: FieldType::StringArray,
     },
@@ -307,6 +311,33 @@ const OAUTH_FIELDS: &[FieldSpec] = &[
     FieldSpec {
         name: "scopes",
         expected: FieldType::StringArray,
+    },
+];
+
+const MODEL_PROVIDER_FIELDS: &[FieldSpec] = &[
+    FieldSpec {
+        name: "type",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "baseUrl",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "apiKeyEnv",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "apiKey",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "models",
+        expected: FieldType::StringArray,
+    },
+    FieldSpec {
+        name: "defaultModel",
+        expected: FieldType::String,
     },
 ];
 
@@ -500,6 +531,19 @@ pub fn validate_config_file(
             source,
             &path_display,
         ));
+    }
+    if let Some(model_providers) = object.get("modelProviders").and_then(JsonValue::as_object) {
+        for (name, provider) in model_providers {
+            if let Some(provider) = provider.as_object() {
+                result.merge(validate_object_keys(
+                    provider,
+                    MODEL_PROVIDER_FIELDS,
+                    &format!("modelProviders.{name}"),
+                    source,
+                    &path_display,
+                ));
+            }
+        }
     }
 
     result
