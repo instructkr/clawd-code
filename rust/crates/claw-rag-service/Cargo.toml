@@ -1,0 +1,30 @@
+[package]
+name = "claw-rag-service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Workspace RAG service: SQLite index, OpenAI-compatible embeddings, query API."
+
+[dependencies]
+axum = "0.8"
+clap = { version = "4", features = ["derive", "env"] }
+dotenvy = "0.15"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json.workspace = true
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal"] }
+walkdir = "2"
+qdrant-client = { version = "1.17", optional = true }
+blake3 = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+default = []
+qdrant-index = ["dep:qdrant-client"]
+
+[lints]
+workspace = true

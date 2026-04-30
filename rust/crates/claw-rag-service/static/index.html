@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>claw-rag</title>
+  <style>
+    :root {
+      --bg: #12141a;
+      --surface: #1a1d26;
+      --border: #2a3140;
+      --text: #e8eaef;
+      --muted: #8b93a8;
+      --accent: #e8a035;
+      --ok: #6daf8a;
+      --err: #d97b7b;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: ui-sans-serif, system-ui, "Segoe UI", Roboto, sans-serif;
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+    }
+    header {
+      padding: 1rem 1.25rem;
+      border-bottom: 1px solid var(--border);
+      background: var(--surface);
+    }
+    header h1 {
+      margin: 0;
+      font-size: 1.1rem;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+    }
+    header p { margin: 0.35rem 0 0; font-size: 0.85rem; color: var(--muted); }
+    main { max-width: 52rem; margin: 0 auto; padding: 1.25rem; }
+    .stats {
+      display: flex;
+      gap: 1rem;
+      flex-wrap: wrap;
+      margin-bottom: 1.25rem;
+      font-size: 0.9rem;
+    }
+    .stats span { color: var(--muted); }
+    .stats strong { color: var(--accent); }
+    form {
+      display: grid;
+      gap: 0.75rem;
+      margin-bottom: 1.5rem;
+      padding: 1rem;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+    }
+    label { font-size: 0.8rem; color: var(--muted); }
+    textarea, input[type="number"] {
+      width: 100%;
+      padding: 0.5rem 0.65rem;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      background: var(--bg);
+      color: var(--text);
+      font: inherit;
+    }
+    textarea { min-height: 5rem; resize: vertical; }
+    .row { display: flex; gap: 1rem; align-items: end; flex-wrap: wrap; }
+    .row > div:first-child { flex: 1; min-width: 12rem; }
+    button {
+      padding: 0.55rem 1.1rem;
+      background: var(--accent);
+      color: #1a1206;
+      border: none;
+      border-radius: 4px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    button:not(:disabled):hover { filter: brightness(1.05); }
+    .status { font-size: 0.85rem; min-height: 1.25rem; }
+    .status.err { color: var(--err); }
+    .status.ok { color: var(--ok); }
+    .hits { display: flex; flex-direction: column; gap: 1rem; }
+    .hit {
+      padding: 0.85rem 1rem;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      border-left: 3px solid var(--accent);
+    }
+    .hit header {
+      padding: 0;
+      border: none;
+      background: transparent;
+      margin-bottom: 0.5rem;
+    }
+    .hit .path { font-family: ui-monospace, monospace; font-size: 0.85rem; color: var(--accent); }
+    .hit .score { font-size: 0.75rem; color: var(--muted); }
+    pre {
+      margin: 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-size: 0.82rem;
+      color: var(--muted);
+    }
+    footer {
+      margin-top: 2rem;
+      padding-top: 1rem;
+      border-top: 1px solid var(--border);
+      font-size: 0.75rem;
+      color: var(--muted);
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>claw-rag-service</h1>
+    <p>Local index · same-origin <code>/v1/*</code> API</p>
+  </header>
+  <main>
+    <div class="stats" id="stats">
+      <span>chunks: <strong id="chunks">—</strong></span>
+      <span>phase: <strong id="phase">—</strong></span>
+      <button type="button" id="refresh" style="margin-left:auto">Refresh stats</button>
+    </div>
+
+    <form id="qform">
+      <div>
+        <label for="query">Query</label>
+        <textarea id="query" name="query" placeholder="Natural language search…" required></textarea>
+      </div>
+      <div class="row">
+        <div>
+          <label for="top_k">top_k</label>
+          <input type="number" id="top_k" name="top_k" value="8" min="1" max="64" />
+        </div>
+        <button type="submit" id="submit">Search</button>
+      </div>
+    </form>
+
+    <div class="status" id="status"></div>
+    <div class="hits" id="hits"></div>
+
+    <footer>
+      Index is read-only here; run <code>claw-rag-service ingest</code> to (re)build. Phase 3 UI — no auth; bind to loopback only in production.
+    </footer>
+  </main>
+  <script>
+    async function loadStats() {
+      const elC = document.getElementById('chunks');
+      const elP = document.getElementById('phase');
+      try {
+        const r = await fetch('/v1/stats');
+        const j = await r.json();
+        elC.textContent = j.chunks ?? '?';
+        elP.textContent = j.phase ?? '?';
+      } catch (e) {
+        elC.textContent = '?';
+        elP.textContent = 'error';
+      }
+    }
+
+    function setStatus(msg, cls) {
+      const s = document.getElementById('status');
+      s.textContent = msg || '';
+      s.className = 'status' + (cls ? ' ' + cls : '');
+    }
+
+    function renderHits(data) {
+      const root = document.getElementById('hits');
+      root.innerHTML = '';
+      const hits = data.hits || [];
+      if (hits.length === 0) {
+        setStatus('No hits (phase: ' + (data.phase || '?') + ')', 'ok');
+        return;
+      }
+      setStatus(hits.length + ' hit(s) · phase: ' + (data.phase || '?'), 'ok');
+      for (const h of hits) {
+        const card = document.createElement('article');
+        card.className = 'hit';
+        const hdr = document.createElement('header');
+        const path = document.createElement('div');
+        path.className = 'path';
+        path.textContent = h.path || '';
+        hdr.appendChild(path);
+        if (h.score != null) {
+          const sc = document.createElement('div');
+          sc.className = 'score';
+          sc.textContent = 'score: ' + h.score;
+          hdr.appendChild(sc);
+        }
+        card.appendChild(hdr);
+        const pre = document.createElement('pre');
+        pre.textContent = h.snippet || '';
+        card.appendChild(pre);
+        root.appendChild(card);
+      }
+    }
+
+    document.getElementById('refresh').addEventListener('click', loadStats);
+    document.getElementById('qform').addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      const query = document.getElementById('query').value.trim();
+      const top_k = Math.min(64, Math.max(1, parseInt(document.getElementById('top_k').value, 10) || 8));
+      const btn = document.getElementById('submit');
+      btn.disabled = true;
+      setStatus('Searching…', '');
+      document.getElementById('hits').innerHTML = '';
+      try {
+        const r = await fetch('/v1/query', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ query, top_k }),
+        });
+        const text = await r.text();
+        if (!r.ok) {
+          setStatus('HTTP ' + r.status + ': ' + text, 'err');
+          return;
+        }
+        renderHits(JSON.parse(text));
+      } catch (e) {
+        setStatus(String(e), 'err');
+      } finally {
+        btn.disabled = false;
+      }
+    });
+
+    loadStats();
+  </script>
+</body>
+</html>
