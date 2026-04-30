@@ -308,6 +308,16 @@ The OpenAI-compatible backend also serves as the gateway for **OpenRouter**, **O
 
 **Model-name prefix routing:** If a model name starts with `openai/`, `gpt-`, `qwen/`, or `qwen-`, the provider is selected by the prefix regardless of which env vars are set. This prevents accidental misrouting to Anthropic when multiple credentials exist in the environment.
 
+### Updating claw-code
+
+Use `claw update` to install the latest `claw-code` from the canonical source repository. The command downloads a fresh temporary copy of `https://github.com/ultraworkers/claw-code`, installs `rust/crates/rusty-claude-cli`, and removes the temporary checkout. It does not merge the current branch or mutate your local fork.
+
+```bash
+claw update
+```
+
+During an interactive session, `claw` also checks the canonical source repository periodically and prints a notice when a newer commit is available. The checker is best-effort and never installs updates automatically. Set `CLAW_DISABLE_UPDATE_CHECK=1` to disable it, or `CLAW_UPDATE_CHECK_INTERVAL_SECONDS=<seconds>` to change the interval.
+
 ### Tested models and aliases
 
 These are the models registered in the built-in alias table with known token limits:
