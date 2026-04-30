@@ -9543,7 +9543,25 @@ mod tests {
         let previous = std::env::current_dir().expect("cwd should load");
         std::env::set_current_dir(cwd).expect("cwd should change");
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-        std::env::set_current_dir(previous).expect("cwd should restore");
+        if previous.exists() {
+            std::env::set_current_dir(previous).expect("cwd should restore");
+        } else {
+            std::env::set_current_dir(std::env::temp_dir()).expect("cwd should restore to temp");
+        }
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    fn with_config_home<T>(config_home: &Path, f: impl FnOnce() -> T) -> T {
+        let previous = std::env::var_os("CLAW_CONFIG_HOME");
+        std::env::set_var("CLAW_CONFIG_HOME", config_home);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        match previous {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
         match result {
             Ok(value) => value,
             Err(payload) => std::panic::resume_unwind(payload),
@@ -12163,15 +12181,11 @@ mod tests {
         fs::write(workspace.join(".claw/settings.json"), r#"{"model":"opus"}"#)
             .expect("write project settings");
 
-        let previous_config_home = std::env::var_os("CLAW_CONFIG_HOME");
-        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
-        let value = with_current_dir(&workspace, || {
-            render_config_json(None).expect("config json should render")
+        let value = with_config_home(&config_home, || {
+            with_current_dir(&workspace, || {
+                render_config_json(None).expect("config json should render")
+            })
         });
-        match previous_config_home {
-            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
-            None => std::env::remove_var("CLAW_CONFIG_HOME"),
-        }
 
         assert_eq!(value["kind"], "config");
         assert_eq!(value["status"], "ok");
@@ -12217,15 +12231,11 @@ mod tests {
         fs::write(workspace.join(".claw/settings.json"), "{not json")
             .expect("write invalid project settings");
 
-        let previous_config_home = std::env::var_os("CLAW_CONFIG_HOME");
-        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
-        let value = with_current_dir(&workspace, || {
-            render_config_json(None).expect("config json should render")
+        let value = with_config_home(&config_home, || {
+            with_current_dir(&workspace, || {
+                render_config_json(None).expect("config json should render")
+            })
         });
-        match previous_config_home {
-            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
-            None => std::env::remove_var("CLAW_CONFIG_HOME"),
-        }
 
         assert_eq!(value["status"], "error");
         assert!(value["load_error"].as_str().is_some());
