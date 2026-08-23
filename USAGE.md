@@ -522,21 +522,21 @@ cd rust
 `SKILL.md` or a standalone markdown file. This is useful when a companion
 repository ships a skill prompt that should be available through `/skills`.
 
-For example, install TweetClaw as an X/Twitter automation skill:
+For example, install the portable X Twitter Scraper Skill:
 
 ```bash
 # From a parent directory that contains claw-code
-git clone https://github.com/Xquik-dev/tweetclaw
+git clone --depth 1 https://github.com/Xquik-dev/x-twitter-scraper
 cd claw-code/rust
-./target/debug/claw skills install ../../tweetclaw/skills/tweetclaw
-./target/debug/claw skills show tweetclaw
-./target/debug/claw skills uninstall tweetclaw
+./target/debug/claw skills install ../../x-twitter-scraper/skills/x-twitter-scraper
+./target/debug/claw skills show x-twitter-scraper
+./target/debug/claw skills uninstall x-twitter-scraper
 ```
 
-TweetClaw gives `claw` users a local skill guide for OpenClaw/Xquik workflows
-such as tweet search, reply search, follower export, monitors, webhooks, and
-approval-gated posting. Configure any Xquik credentials outside the prompt and
-avoid pasting API keys into chat.
+The Skill gives `claw` portable instructions for X research and Xquik API
+workflows. Installing a Skill does not add a plugin or network transport.
+Verify required tools separately. Configure credentials outside the prompt,
+and never paste API keys into chat.
 
 ## Author a local agent
 

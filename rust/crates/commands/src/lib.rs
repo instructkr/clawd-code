@@ -4240,6 +4240,9 @@ fn parse_skill_frontmatter(contents: &str) -> (Option<String>, Option<String>) {
         if trimmed == "---" {
             break;
         }
+        if line.trim_start() != line {
+            continue;
+        }
         if let Some(value) = trimmed.strip_prefix("name:") {
             let value = unquote_frontmatter_value(value.trim());
             if !value.is_empty() {
@@ -4296,6 +4299,9 @@ fn parse_agent_frontmatter(
         let trimmed = line.trim();
         if trimmed == "---" {
             break;
+        }
+        if line.trim_start() != line {
+            continue;
         }
         if let Some(value) = trimmed.strip_prefix("name:") {
             let value = unquote_frontmatter_value(value.trim());
@@ -7027,6 +7033,18 @@ mod tests {
         let (name, description) = super::parse_skill_frontmatter(contents);
         assert_eq!(name.as_deref(), Some("hud"));
         assert_eq!(description.as_deref(), Some("Quoted description"));
+    }
+
+    #[test]
+    fn frontmatter_parsers_ignore_nested_metadata() {
+        let contents = "---\nname: root-name\ndescription: Root description\nmetadata:\n  name: nested-name\n  description: Nested description\n---\n";
+        let (skill_name, skill_description) = super::parse_skill_frontmatter(contents);
+        assert_eq!(skill_name.as_deref(), Some("root-name"));
+        assert_eq!(skill_description.as_deref(), Some("Root description"));
+
+        let (agent_name, agent_description, _, _) = super::parse_agent_frontmatter(contents);
+        assert_eq!(agent_name.as_deref(), Some("root-name"));
+        assert_eq!(agent_description.as_deref(), Some("Root description"));
     }
 
     #[test]
