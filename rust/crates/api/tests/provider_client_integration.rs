@@ -22,7 +22,9 @@ fn provider_client_reports_missing_xai_credentials_for_grok_models() {
         .expect_err("grok requests without XAI_API_KEY should fail fast");
 
     match error {
-        ApiError::MissingCredentials { provider, env_vars } => {
+        ApiError::MissingCredentials {
+            provider, env_vars, ..
+        } => {
             assert_eq!(provider, "xAI");
             assert_eq!(env_vars, &["XAI_API_KEY"]);
         }

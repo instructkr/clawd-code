@@ -78,10 +78,25 @@ def find_tools(query: str, limit: int = 20) -> list[PortingModule]:
     return matches[:limit]
 
 
-def execute_tool(name: str, payload: str = '') -> ToolExecution:
+def execute_tool(name: str, payload: str = '', permission_context: ToolPermissionContext | None = None) -> ToolExecution:
     module = get_tool(name)
     if module is None:
         return ToolExecution(name=name, source_hint='', payload=payload, handled=False, message=f'Unknown mirrored tool: {name}')
+    if permission_context and permission_context.blocks(module.name):
+        return ToolExecution(name=module.name, source_hint=module.source_hint, payload=payload, handled=False, message=f"Permission denied for mirrored tool '{module.name}'.")
+    if permission_context:
+        scope_decision = permission_context.validate_payload_scope(module.name, payload)
+        if not scope_decision.allowed:
+            return ToolExecution(
+                name=module.name,
+                source_hint=module.source_hint,
+                payload=payload,
+                handled=False,
+                message=(
+                    f"Permission denied for mirrored tool '{module.name}': {scope_decision.reason}"
+                    f" (candidate={scope_decision.candidate!r}, resolved={scope_decision.resolved!r})."
+                ),
+            )
     action = f"Mirrored tool '{module.name}' from {module.source_hint} would handle payload {payload!r}."
     return ToolExecution(name=module.name, source_hint=module.source_hint, payload=payload, handled=True, message=action)
 

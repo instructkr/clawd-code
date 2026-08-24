@@ -82,6 +82,7 @@ class QueryEnginePort:
             f'Matched commands: {", ".join(matched_commands) if matched_commands else "none"}',
             f'Matched tools: {", ".join(matched_tools) if matched_tools else "none"}',
             f'Permission denials: {len(denied_tools)}',
+            *(f'Permission denial: {denial.tool_name} status={denial.status} reason={denial.reason}' for denial in denied_tools),
         ]
         output = self._format_output(summary_lines)
         projected_usage = self.total_usage.add_turn(prompt, output)
@@ -116,7 +117,13 @@ class QueryEnginePort:
         if matched_tools:
             yield {'type': 'tool_match', 'tools': matched_tools}
         if denied_tools:
-            yield {'type': 'permission_denial', 'denials': [denial.tool_name for denial in denied_tools]}
+            yield {
+                'type': 'permission_denial',
+                'denials': [
+                    {'tool_name': denial.tool_name, 'reason': denial.reason, 'status': denial.status}
+                    for denial in denied_tools
+                ],
+            }
         result = self.submit_message(prompt, matched_commands, matched_tools, denied_tools)
         yield {'type': 'message_delta', 'text': result.output}
         yield {

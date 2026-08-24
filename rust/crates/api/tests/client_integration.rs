@@ -82,7 +82,7 @@ async fn send_message_posts_json_and_parses_response() {
     );
     assert_eq!(
         request.headers.get("user-agent").map(String::as_str),
-        Some("claude-code/0.1.0")
+        Some("claude-code/0.1.3")
     );
     assert_eq!(
         request.headers.get("anthropic-beta").map(String::as_str),
@@ -97,10 +97,62 @@ async fn send_message_posts_json_and_parses_response() {
     assert!(body.get("stream").is_none());
     assert_eq!(body["tools"][0]["name"], json!("get_weather"));
     assert_eq!(body["tool_choice"]["type"], json!("auto"));
-    assert_eq!(
-        body["betas"],
-        json!(["claude-code-20250219", "prompt-caching-scope-2026-01-05"])
+    assert!(
+        body.get("betas").is_none(),
+        "betas must travel via the anthropic-beta header, not the request body"
     );
+}
+
+#[tokio::test]
+async fn send_message_strips_anthropic_routing_prefix_on_wire() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let server = spawn_server(
+        state.clone(),
+        vec![
+            http_response("200 OK", "application/json", "{\"input_tokens\":1}"),
+            http_response(
+                "200 OK",
+                "application/json",
+                concat!(
+                    "{",
+                    "\"id\":\"msg_prefixed\",",
+                    "\"type\":\"message\",",
+                    "\"role\":\"assistant\",",
+                    "\"content\":[{\"type\":\"text\",\"text\":\"ok\"}],",
+                    "\"model\":\"claude-opus-4-6\",",
+                    "\"stop_reason\":\"end_turn\",",
+                    "\"stop_sequence\":null,",
+                    "\"usage\":{\"input_tokens\":1,\"output_tokens\":1}",
+                    "}"
+                ),
+            ),
+        ],
+    )
+    .await;
+
+    let client = AnthropicClient::new("test-key").with_base_url(server.base_url());
+    client
+        .send_message(&MessageRequest {
+            model: "anthropic/claude-opus-4-6".to_string(),
+            ..sample_request(false)
+        })
+        .await
+        .expect("request should succeed");
+
+    let captured = state.lock().await;
+    assert_eq!(
+        captured.len(),
+        2,
+        "count_tokens and messages requests should be captured"
+    );
+    let count_tokens_body: serde_json::Value =
+        serde_json::from_str(&captured[0].body).expect("count_tokens body should be json");
+    let messages_body: serde_json::Value =
+        serde_json::from_str(&captured[1].body).expect("request body should be json");
+    assert_eq!(captured[0].path, "/v1/messages/count_tokens");
+    assert_eq!(captured[1].path, "/v1/messages");
+    assert_eq!(count_tokens_body["model"], json!("claude-opus-4-6"));
+    assert_eq!(messages_body["model"], json!("claude-opus-4-6"));
 }
 
 #[tokio::test]
@@ -127,6 +179,7 @@ async fn send_message_blocks_oversized_requests_before_the_http_call() {
             tools: None,
             tool_choice: None,
             stream: false,
+            ..Default::default()
         })
         .await
         .expect_err("oversized request should fail local context-window preflight");
@@ -191,13 +244,9 @@ async fn send_message_applies_request_profile_and_records_telemetry() {
     let body: serde_json::Value =
         serde_json::from_str(&request.body).expect("request body should be json");
     assert_eq!(body["metadata"]["source"], json!("clawd-code"));
-    assert_eq!(
-        body["betas"],
-        json!([
-            "claude-code-20250219",
-            "prompt-caching-scope-2026-01-05",
-            "tools-2026-04-01"
-        ])
+    assert!(
+        body.get("betas").is_none(),
+        "betas must travel via the anthropic-beta header, not the request body"
     );
 
     let events = sink.events();
@@ -274,6 +323,44 @@ async fn send_message_parses_prompt_cache_token_usage_from_response() {
     assert_eq!(response.usage.cache_creation_input_tokens, 321);
     assert_eq!(response.usage.cache_read_input_tokens, 654);
     assert_eq!(response.usage.output_tokens, 4);
+}
+
+#[tokio::test]
+async fn given_empty_usage_object_when_send_message_parses_response_then_usage_defaults_to_zero() {
+    // given
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let body = concat!(
+        "{",
+        "\"id\":\"msg_empty_usage\",",
+        "\"type\":\"message\",",
+        "\"role\":\"assistant\",",
+        "\"content\":[{\"type\":\"text\",\"text\":\"Hello from Claude\"}],",
+        "\"model\":\"claude-3-7-sonnet-latest\",",
+        "\"stop_reason\":\"end_turn\",",
+        "\"stop_sequence\":null,",
+        "\"usage\":{}",
+        "}"
+    );
+    let server = spawn_server(
+        state,
+        vec![http_response("200 OK", "application/json", body)],
+    )
+    .await;
+    let client = AnthropicClient::new("test-key").with_base_url(server.base_url());
+
+    // when
+    let response = client
+        .send_message(&sample_request(false))
+        .await
+        .expect("response with empty usage object should still parse");
+
+    // then
+    assert_eq!(response.id, "msg_empty_usage");
+    assert_eq!(response.total_tokens(), 0);
+    assert_eq!(response.usage.input_tokens, 0);
+    assert_eq!(response.usage.cache_creation_input_tokens, 0);
+    assert_eq!(response.usage.cache_read_input_tokens, 0);
+    assert_eq!(response.usage.output_tokens, 0);
 }
 
 #[tokio::test]
@@ -512,6 +599,71 @@ async fn surfaces_retry_exhaustion_for_persistent_retryable_errors() {
 }
 
 #[tokio::test]
+async fn retries_multiple_retryable_failures_with_exponential_backoff_and_jitter() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let server = spawn_server(
+        state.clone(),
+        vec![
+            http_response(
+                "429 Too Many Requests",
+                "application/json",
+                "{\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"slow down\"}}",
+            ),
+            http_response(
+                "500 Internal Server Error",
+                "application/json",
+                "{\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"boom\"}}",
+            ),
+            http_response(
+                "503 Service Unavailable",
+                "application/json",
+                "{\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"busy\"}}",
+            ),
+            http_response(
+                "429 Too Many Requests",
+                "application/json",
+                "{\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"slow down again\"}}",
+            ),
+            http_response(
+                "503 Service Unavailable",
+                "application/json",
+                "{\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"still busy\"}}",
+            ),
+            http_response(
+                "200 OK",
+                "application/json",
+                "{\"id\":\"msg_exp_retry\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Recovered after 5\"}],\"model\":\"claude-3-7-sonnet-latest\",\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}",
+            ),
+        ],
+    )
+    .await;
+
+    let client = ApiClient::new("test-key")
+        .with_base_url(server.base_url())
+        .with_retry_policy(8, Duration::from_millis(1), Duration::from_millis(4));
+    let started_at = std::time::Instant::now();
+
+    let response = client
+        .send_message(&sample_request(false))
+        .await
+        .expect("8-retry policy should absorb 5 retryable failures");
+
+    let elapsed = started_at.elapsed();
+    assert_eq!(response.total_tokens(), 5);
+    assert_eq!(
+        state.lock().await.len(),
+        6,
+        "client should issue 1 original + 5 retry requests before the 200"
+    );
+    // Jittered sleeps are bounded by 2 * max_backoff per retry (base + jitter),
+    // so 5 sleeps fit comfortably below this upper bound with generous slack.
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "retries should complete promptly, took {elapsed:?}"
+    );
+}
+
+#[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn send_message_reuses_recent_completion_cache_entries() {
     let _guard = env_lock();
@@ -642,6 +794,7 @@ async fn live_stream_smoke_test() {
             tools: None,
             tool_choice: None,
             stream: false,
+            ..Default::default()
         })
         .await
         .expect("live stream should start");
@@ -822,5 +975,6 @@ fn sample_request(stream: bool) -> MessageRequest {
         }]),
         tool_choice: Some(ToolChoice::Auto),
         stream,
+        ..Default::default()
     }
 }

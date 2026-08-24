@@ -1,0 +1,81 @@
+{
+  "schemaVersion": "g004.contract.bundle.v1",
+  "laneEvents": [
+    {
+      "event": "lane.started",
+      "status": "running",
+      "emittedAt": "2026-05-14T00:00:00Z",
+      "metadata": {
+        "seq": 1,
+        "provenance": "live_lane",
+        "emitterIdentity": "worker-1",
+        "environmentLabel": "team-g004"
+      }
+    },
+    {
+      "event": "lane.finished",
+      "status": "completed",
+      "emittedAt": "2026-05-14T00:00:10Z",
+      "metadata": {
+        "seq": 2,
+        "provenance": "live_lane",
+        "emitterIdentity": "worker-1",
+        "environmentLabel": "team-g004",
+        "eventFingerprint": "terminal-fp-001"
+      }
+    }
+  ],
+  "reports": [
+    {
+      "schemaVersion": "g004.report.v1",
+      "reportId": "report-g004-fixture",
+      "identity": { "contentHash": "sha256:report-content" },
+      "projection": { "provenance": "runtime.event_projection.v1" },
+      "redaction": { "provenance": "runtime.redaction_policy.v1" },
+      "consumerCapabilities": ["facts", "field_deltas", "redaction_provenance"],
+      "findings": [
+        {
+          "kind": "fact",
+          "confidence": "high",
+          "statement": "lane event reached terminal state"
+        },
+        {
+          "kind": "hypothesis",
+          "confidence": "medium",
+          "statement": "consumer can reconcile the terminal fingerprint"
+        },
+        {
+          "kind": "negative_evidence",
+          "confidence": "high",
+          "statement": "no duplicate terminal event appears in this fixture"
+        }
+      ],
+      "fieldDeltas": [
+        {
+          "field": "/laneEvents/1/status",
+          "previousHash": "sha256:running",
+          "currentHash": "sha256:completed",
+          "attribution": "worker-1 terminal reconciliation"
+        }
+      ]
+    }
+  ],
+  "approvalTokens": [
+    {
+      "tokenId": "approval-token-fixture",
+      "owner": "leader-fixed",
+      "scope": "g004.contract.bundle.fixture",
+      "issuedAt": "2026-05-14T00:00:01Z",
+      "oneTimeUse": true,
+      "replayPreventionNonce": "nonce-fixture-001",
+      "delegationChain": [
+        {
+          "from": "leader-fixed",
+          "to": "worker-3",
+          "action": "validate-g004-contract-fixture",
+          "at": "2026-05-14T00:00:02Z"
+        }
+      ]
+    }
+  ]
+}

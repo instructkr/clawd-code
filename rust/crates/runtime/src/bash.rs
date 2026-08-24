@@ -4,10 +4,12 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use tokio::process::Command as TokioCommand;
 use tokio::runtime::Builder;
 use tokio::time::timeout;
 
+use crate::lane_events::{LaneEvent, ShipMergeMethod, ShipProvenance};
 use crate::sandbox::{
     build_linux_sandbox_command, resolve_sandbox_status_for_request, FilesystemIsolationMode,
     SandboxConfig, SandboxStatus,
@@ -102,35 +104,83 @@ pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
     runtime.block_on(execute_bash_async(input, sandbox_status, cwd))
 }
 
+/// Detect git push to main and emit ship provenance event
+fn detect_and_emit_ship_prepared(command: &str) {
+    let trimmed = command.trim();
+    // Simple detection: git push with main/master
+    if trimmed.contains("git push") && (trimmed.contains("main") || trimmed.contains("master")) {
+        // Emit ship.prepared event
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let provenance = ShipProvenance {
+            source_branch: get_current_branch().unwrap_or_else(|| "unknown".to_string()),
+            base_commit: get_head_commit().unwrap_or_default(),
+            commit_count: 0, // Would need to calculate from range
+            commit_range: "unknown..HEAD".to_string(),
+            merge_method: ShipMergeMethod::DirectPush,
+            actor: get_git_actor().unwrap_or_else(|| "unknown".to_string()),
+            pr_number: None,
+        };
+        let _event = LaneEvent::ship_prepared(format!("{now}"), &provenance);
+        // Log to stderr as interim routing before event stream integration
+        eprintln!(
+            "[ship.prepared] branch={} -> main, commits={}, actor={}",
+            provenance.source_branch, provenance.commit_count, provenance.actor
+        );
+    }
+}
+
+fn get_current_branch() -> Option<String> {
+    let output = Command::new("git")
+        .args(["branch", "--show-current"])
+        .output()
+        .ok()?;
+    if output.status.success() {
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        None
+    }
+}
+
+fn get_head_commit() -> Option<String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()?;
+    if output.status.success() {
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        None
+    }
+}
+
+fn get_git_actor() -> Option<String> {
+    let name = Command::new("git")
+        .args(["config", "user.name"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())?;
+    Some(name)
+}
+
 async fn execute_bash_async(
     input: BashCommandInput,
     sandbox_status: SandboxStatus,
     cwd: std::path::PathBuf,
 ) -> io::Result<BashCommandOutput> {
+    // Detect and emit ship provenance for git push operations
+    detect_and_emit_ship_prepared(&input.command);
+
     let mut command = prepare_tokio_command(&input.command, &cwd, &sandbox_status, true);
 
     let output_result = if let Some(timeout_ms) = input.timeout {
-        match timeout(Duration::from_millis(timeout_ms), command.output()).await {
-            Ok(result) => (result?, false),
-            Err(_) => {
-                return Ok(BashCommandOutput {
-                    stdout: String::new(),
-                    stderr: format!("Command exceeded timeout of {timeout_ms} ms"),
-                    raw_output_path: None,
-                    interrupted: true,
-                    is_image: None,
-                    background_task_id: None,
-                    backgrounded_by_user: None,
-                    assistant_auto_backgrounded: None,
-                    dangerously_disable_sandbox: input.dangerously_disable_sandbox,
-                    return_code_interpretation: Some(String::from("timeout")),
-                    no_output_expected: Some(true),
-                    structured_content: None,
-                    persisted_output_path: None,
-                    persisted_output_size: None,
-                    sandbox_status: Some(sandbox_status),
-                });
-            }
+        if let Ok(result) = timeout(Duration::from_millis(timeout_ms), command.output()).await {
+            (result?, false)
+        } else {
+            return Ok(timeout_output(&input, timeout_ms, sandbox_status));
         }
     } else {
         (command.output().await?, false)
@@ -164,6 +214,67 @@ async fn execute_bash_async(
         persisted_output_path: None,
         persisted_output_size: None,
         sandbox_status: Some(sandbox_status),
+    })
+}
+
+fn timeout_output(
+    input: &BashCommandInput,
+    timeout_ms: u64,
+    sandbox_status: SandboxStatus,
+) -> BashCommandOutput {
+    let is_test = is_test_command(&input.command);
+    let return_code_interpretation = if is_test { "test.hung" } else { "timeout" };
+    BashCommandOutput {
+        stdout: String::new(),
+        stderr: format!("Command exceeded timeout of {timeout_ms} ms"),
+        raw_output_path: None,
+        interrupted: true,
+        is_image: None,
+        background_task_id: None,
+        backgrounded_by_user: None,
+        assistant_auto_backgrounded: None,
+        dangerously_disable_sandbox: input.dangerously_disable_sandbox,
+        return_code_interpretation: Some(String::from(return_code_interpretation)),
+        no_output_expected: Some(true),
+        structured_content: Some(vec![test_timeout_provenance(
+            &input.command,
+            timeout_ms,
+            is_test,
+        )]),
+        persisted_output_path: None,
+        persisted_output_size: None,
+        sandbox_status: Some(sandbox_status),
+    }
+}
+
+fn is_test_command(command: &str) -> bool {
+    let normalized = command
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    normalized.contains("cargo test")
+        || normalized.contains("cargo nextest")
+        || normalized.contains("npm test")
+        || normalized.contains("pnpm test")
+        || normalized.contains("yarn test")
+        || normalized.contains("pytest")
+}
+
+fn test_timeout_provenance(
+    command: &str,
+    timeout_ms: u64,
+    classified_as_test_hang: bool,
+) -> serde_json::Value {
+    json!({
+        "event": if classified_as_test_hang { "test.hung" } else { "command.timeout" },
+        "failureClass": if classified_as_test_hang { "test_hang" } else { "timeout" },
+        "data": {
+            "command": command,
+            "timeoutMs": timeout_ms,
+            "provenance": "bash.timeout",
+            "classification": if classified_as_test_hang { "test.hung" } else { "timeout" }
+        }
     })
 }
 
@@ -219,20 +330,24 @@ fn prepare_tokio_command(
         prepare_sandbox_dirs(cwd);
     }
 
-    if let Some(launcher) = build_linux_sandbox_command(command, cwd, sandbox_status) {
-        let mut prepared = TokioCommand::new(launcher.program);
-        prepared.args(launcher.args);
-        prepared.current_dir(cwd);
-        prepared.envs(launcher.env);
-        return prepared;
-    }
+    let mut prepared =
+        if let Some(launcher) = build_linux_sandbox_command(command, cwd, sandbox_status) {
+            let mut cmd = TokioCommand::new(launcher.program);
+            cmd.args(launcher.args);
+            cmd.envs(launcher.env);
+            cmd
+        } else {
+            let mut cmd = TokioCommand::new("sh");
+            cmd.arg("-lc").arg(command);
+            if sandbox_status.filesystem_active {
+                cmd.env("HOME", cwd.join(".sandbox-home"));
+                cmd.env("TMPDIR", cwd.join(".sandbox-tmp"));
+            }
+            cmd
+        };
 
-    let mut prepared = TokioCommand::new("sh");
-    prepared.arg("-lc").arg(command).current_dir(cwd);
-    if sandbox_status.filesystem_active {
-        prepared.env("HOME", cwd.join(".sandbox-home"));
-        prepared.env("TMPDIR", cwd.join(".sandbox-tmp"));
-    }
+    prepared.current_dir(cwd);
+    prepared.stdin(Stdio::null());
     prepared
 }
 
@@ -282,6 +397,52 @@ mod tests {
         .expect("bash command should execute");
 
         assert!(!output.sandbox_status.expect("sandbox status").enabled);
+    }
+
+    #[test]
+    fn timed_out_test_command_is_classified_as_hung_test_with_provenance() {
+        let output = execute_bash(BashCommandInput {
+            command: String::from("sleep 1 # cargo test slow_case"),
+            timeout: Some(1),
+            description: None,
+            run_in_background: Some(false),
+            dangerously_disable_sandbox: Some(false),
+            namespace_restrictions: Some(false),
+            isolate_network: Some(false),
+            filesystem_mode: Some(FilesystemIsolationMode::WorkspaceOnly),
+            allowed_mounts: None,
+        })
+        .expect("bash command should return structured timeout");
+
+        assert!(output.interrupted);
+        assert_eq!(
+            output.return_code_interpretation.as_deref(),
+            Some("test.hung")
+        );
+        let structured = output.structured_content.expect("structured content");
+        assert_eq!(structured[0]["event"], "test.hung");
+        assert_eq!(structured[0]["data"]["provenance"], "bash.timeout");
+    }
+
+    #[test]
+    fn prevents_stdin_hangs_by_redirecting_to_null() {
+        let output = execute_bash(BashCommandInput {
+            command: String::from("cat"),
+            timeout: Some(2_000),
+            description: None,
+            run_in_background: Some(false),
+            dangerously_disable_sandbox: Some(true),
+            namespace_restrictions: None,
+            isolate_network: None,
+            filesystem_mode: None,
+            allowed_mounts: None,
+        })
+        .expect("bash command should execute cleanly");
+
+        assert!(
+            !output.interrupted,
+            "Command hung and was cut off by the timeout!"
+        );
     }
 }
 

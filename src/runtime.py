@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .commands import PORTED_COMMANDS
+from .commands import PORTED_COMMANDS, get_command
 from .context import PortContext, build_port_context, render_context
 from .history import HistoryLog
 from .models import PermissionDenial, PortingModule
@@ -88,6 +88,7 @@ class RuntimeSession:
 
 class PortRuntime:
     def route_prompt(self, prompt: str, limit: int = 5) -> list[RoutedMatch]:
+        explicit_command = self._explicit_command_match(prompt)
         tokens = {token.lower() for token in prompt.replace('/', ' ').replace('-', ' ').split() if token}
         by_kind = {
             'command': self._collect_matches(tokens, PORTED_COMMANDS, 'command'),
@@ -95,6 +96,16 @@ class PortRuntime:
         }
 
         selected: list[RoutedMatch] = []
+        if explicit_command is not None:
+            selected.append(explicit_command)
+            by_kind['command'] = [
+                match
+                for match in by_kind['command']
+                if not (
+                    match.name == explicit_command.name
+                    and match.source_hint == explicit_command.source_hint
+                )
+            ]
         for kind in ('command', 'tool'):
             if by_kind[kind]:
                 selected.append(by_kind[kind].pop(0))
@@ -105,6 +116,22 @@ class PortRuntime:
         )
         selected.extend(leftovers[: max(0, limit - len(selected))])
         return selected[:limit]
+
+    @staticmethod
+    def _explicit_command_match(prompt: str) -> RoutedMatch | None:
+        first_token = prompt.strip().split(maxsplit=1)[0] if prompt.strip() else ''
+        command_name = first_token.removeprefix('/')
+        if not command_name:
+            return None
+        module = get_command(command_name)
+        if module is None:
+            return None
+        return RoutedMatch(
+            kind='command',
+            name=module.name,
+            source_hint=module.source_hint,
+            score=100,
+        )
 
     def bootstrap_session(self, prompt: str, limit: int = 5) -> RuntimeSession:
         context = build_port_context()

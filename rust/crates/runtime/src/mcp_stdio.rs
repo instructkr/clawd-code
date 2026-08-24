@@ -230,6 +230,7 @@ pub struct ManagedMcpTool {
 pub struct UnsupportedMcpServer {
     pub server_name: String,
     pub transport: McpTransport,
+    pub required: bool,
     pub reason: String,
 }
 
@@ -237,6 +238,7 @@ pub struct UnsupportedMcpServer {
 pub struct McpDiscoveryFailure {
     pub server_name: String,
     pub phase: McpLifecyclePhase,
+    pub required: bool,
     pub error: String,
     pub recoverable: bool,
     pub context: BTreeMap<String, String>,
@@ -366,7 +368,7 @@ impl McpServerManagerError {
         ) && matches!(self, Self::Transport { .. } | Self::Timeout { .. })
     }
 
-    fn discovery_failure(&self, server_name: &str) -> McpDiscoveryFailure {
+    fn discovery_failure(&self, server_name: &str, required: bool) -> McpDiscoveryFailure {
         let phase = self.lifecycle_phase();
         let recoverable = self.recoverable();
         let context = self.error_context();
@@ -374,6 +376,7 @@ impl McpServerManagerError {
         McpDiscoveryFailure {
             server_name: server_name.to_string(),
             phase,
+            required,
             error: self.to_string(),
             recoverable,
             context,
@@ -447,7 +450,10 @@ fn unsupported_server_failed_server(server: &UnsupportedMcpServer) -> McpFailedS
             McpLifecyclePhase::ServerRegistration,
             Some(server.server_name.clone()),
             server.reason.clone(),
-            BTreeMap::from([("transport".to_string(), format!("{:?}", server.transport))]),
+            BTreeMap::from([
+                ("transport".to_string(), format!("{:?}", server.transport)),
+                ("required".to_string(), server.required.to_string()),
+            ]),
             false,
         ),
     }
@@ -464,14 +470,16 @@ struct ManagedMcpServer {
     bootstrap: McpClientBootstrap,
     process: Option<McpStdioProcess>,
     initialized: bool,
+    required: bool,
 }
 
 impl ManagedMcpServer {
-    fn new(bootstrap: McpClientBootstrap) -> Self {
+    fn new(bootstrap: McpClientBootstrap, required: bool) -> Self {
         Self {
             bootstrap,
             process: None,
             initialized: false,
+            required,
         }
     }
 }
@@ -498,11 +506,15 @@ impl McpServerManager {
         for (server_name, server_config) in servers {
             if server_config.transport() == McpTransport::Stdio {
                 let bootstrap = McpClientBootstrap::from_scoped_config(server_name, server_config);
-                managed_servers.insert(server_name.clone(), ManagedMcpServer::new(bootstrap));
+                managed_servers.insert(
+                    server_name.clone(),
+                    ManagedMcpServer::new(bootstrap, server_config.required),
+                );
             } else {
                 unsupported_servers.push(UnsupportedMcpServer {
                     server_name: server_name.clone(),
                     transport: server_config.transport(),
+                    required: server_config.required,
                     reason: format!(
                         "transport {:?} is not supported by McpServerManager",
                         server_config.transport()
@@ -576,7 +588,11 @@ impl McpServerManager {
                 }
                 Err(error) => {
                     self.clear_routes_for_server(&server_name);
-                    failed_servers.push(error.discovery_failure(&server_name));
+                    let required = self
+                        .servers
+                        .get(&server_name)
+                        .is_some_and(|server| server.required);
+                    failed_servers.push(error.discovery_failure(&server_name, required));
                 }
             }
         }
@@ -590,7 +606,11 @@ impl McpServerManager {
                     failure.phase,
                     Some(failure.server_name.clone()),
                     failure.error.clone(),
-                    failure.context.clone(),
+                    {
+                        let mut context = failure.context.clone();
+                        context.insert("required".to_string(), failure.required.to_string());
+                        context
+                    },
                     failure.recoverable,
                 ),
             })
@@ -1765,6 +1785,7 @@ mod tests {
 
     fn sample_bootstrap(script_path: &Path) -> McpClientBootstrap {
         let config = ScopedMcpServerConfig {
+            required: false,
             scope: ConfigSource::Local,
             config: McpServerConfig::Stdio(McpStdioServerConfig {
                 command: "/bin/sh".to_string(),
@@ -1832,6 +1853,7 @@ mod tests {
         ]);
         env.extend(extra_env);
         ScopedMcpServerConfig {
+            required: false,
             scope: ConfigSource::Local,
             config: McpServerConfig::Stdio(McpStdioServerConfig {
                 command: "python3".to_string(),
@@ -1874,6 +1896,7 @@ mod tests {
     #[test]
     fn rejects_non_stdio_bootstrap() {
         let config = ScopedMcpServerConfig {
+            required: false,
             scope: ConfigSource::Local,
             config: McpServerConfig::Sdk(crate::config::McpSdkServerConfig {
                 name: "sdk-server".to_string(),
@@ -2310,6 +2333,7 @@ mod tests {
             let servers = BTreeMap::from([(
                 "slow".to_string(),
                 ScopedMcpServerConfig {
+                    required: false,
                     scope: ConfigSource::Local,
                     config: McpServerConfig::Stdio(McpStdioServerConfig {
                         command: "python3".to_string(),
@@ -2363,6 +2387,7 @@ mod tests {
             let servers = BTreeMap::from([(
                 "broken".to_string(),
                 ScopedMcpServerConfig {
+                    required: false,
                     scope: ConfigSource::Local,
                     config: McpServerConfig::Stdio(McpStdioServerConfig {
                         command: "python3".to_string(),
@@ -2701,6 +2726,7 @@ mod tests {
                 (
                     "broken".to_string(),
                     ScopedMcpServerConfig {
+                        required: true,
                         scope: ConfigSource::Local,
                         config: McpServerConfig::Stdio(McpStdioServerConfig {
                             command: broken_script_path.display().to_string(),
@@ -2722,6 +2748,7 @@ mod tests {
             );
             assert_eq!(report.failed_servers.len(), 1);
             assert_eq!(report.failed_servers[0].server_name, "broken");
+            assert!(report.failed_servers[0].required);
             assert_eq!(
                 report.failed_servers[0].phase,
                 McpLifecyclePhase::InitializeHandshake
@@ -2742,6 +2769,14 @@ mod tests {
             assert_eq!(degraded.working_servers, vec!["alpha".to_string()]);
             assert_eq!(degraded.failed_servers.len(), 1);
             assert_eq!(degraded.failed_servers[0].server_name, "broken");
+            assert_eq!(
+                degraded.failed_servers[0]
+                    .error
+                    .context
+                    .get("required")
+                    .map(String::as_str),
+                Some("true")
+            );
             assert_eq!(
                 degraded.failed_servers[0].phase,
                 McpLifecyclePhase::InitializeHandshake
@@ -2777,6 +2812,7 @@ mod tests {
             (
                 "http".to_string(),
                 ScopedMcpServerConfig {
+                    required: true,
                     scope: ConfigSource::Local,
                     config: McpServerConfig::Http(McpRemoteServerConfig {
                         url: "https://example.test/mcp".to_string(),
@@ -2789,6 +2825,7 @@ mod tests {
             (
                 "sdk".to_string(),
                 ScopedMcpServerConfig {
+                    required: false,
                     scope: ConfigSource::Local,
                     config: McpServerConfig::Sdk(McpSdkServerConfig {
                         name: "sdk-server".to_string(),
@@ -2798,6 +2835,7 @@ mod tests {
             (
                 "ws".to_string(),
                 ScopedMcpServerConfig {
+                    required: false,
                     scope: ConfigSource::Local,
                     config: McpServerConfig::Ws(McpWebSocketServerConfig {
                         url: "wss://example.test/mcp".to_string(),
@@ -2813,11 +2851,14 @@ mod tests {
 
         assert_eq!(unsupported.len(), 3);
         assert_eq!(unsupported[0].server_name, "http");
+        assert!(unsupported[0].required);
         assert_eq!(unsupported[1].server_name, "sdk");
         assert_eq!(unsupported[2].server_name, "ws");
+        let failed = unsupported_server_failed_server(&unsupported[0]);
+        assert_eq!(failed.phase, McpLifecyclePhase::ServerRegistration);
         assert_eq!(
-            unsupported_server_failed_server(&unsupported[0]).phase,
-            McpLifecyclePhase::ServerRegistration
+            failed.error.context.get("required").map(String::as_str),
+            Some("true")
         );
     }
 

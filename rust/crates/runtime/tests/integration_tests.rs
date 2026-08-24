@@ -22,7 +22,7 @@ fn stale_branch_detection_flows_into_policy_engine() {
     let stale_context = LaneContext::new(
         "stale-lane",
         0,
-        Duration::from_secs(2 * 60 * 60), // 2 hours stale
+        Duration::from_hours(2), // 2 hours stale
         LaneBlocker::None,
         ReviewStatus::Pending,
         DiffScope::Full,
@@ -49,7 +49,7 @@ fn fresh_branch_does_not_trigger_stale_policy() {
     let fresh_context = LaneContext::new(
         "fresh-lane",
         0,
-        Duration::from_secs(30 * 60), // 30 min stale — under 1 hour threshold
+        Duration::from_mins(30), // 30 min stale — under 1 hour threshold
         LaneBlocker::None,
         ReviewStatus::Pending,
         DiffScope::Full,
@@ -96,9 +96,7 @@ fn green_contract_unsatisfied_blocks_merge() {
         false,
     );
 
-    // This is a conceptual test — we need a way to express "requires workspace green"
-    // Currently LaneContext has raw green_level: u8, not a contract
-    // For now we just verify the policy condition works
+    // The context has a test level but lacks the full green contract, so merge stays blocked.
     let engine = PolicyEngine::new(vec![PolicyRule::new(
         "workspace-green-required",
         PolicyCondition::GreenAt { level: 3 }, // GreenLevel::Workspace
@@ -212,8 +210,8 @@ fn end_to_end_stale_lane_gets_merge_forward_action() {
     // when: build context and evaluate policy
     let context = LaneContext::new(
         "lane-9411",
-        3,                                // Workspace green
-        Duration::from_secs(5 * 60 * 60), // 5 hours stale, definitely over threshold
+        3,                       // Workspace green
+        Duration::from_hours(5), // 5 hours stale, definitely over threshold
         LaneBlocker::None,
         ReviewStatus::Approved,
         DiffScope::Scoped,
@@ -261,13 +259,14 @@ fn end_to_end_stale_lane_gets_merge_forward_action() {
 fn fresh_approved_lane_gets_merge_action() {
     let context = LaneContext::new(
         "fresh-approved-lane",
-        3,                            // Workspace green
-        Duration::from_secs(30 * 60), // 30 min — under 1 hour threshold = fresh
+        3,                       // Workspace green
+        Duration::from_mins(30), // 30 min — under 1 hour threshold = fresh
         LaneBlocker::None,
         ReviewStatus::Approved,
         DiffScope::Scoped,
         false,
-    );
+    )
+    .with_green_contract_satisfied(true);
 
     let engine = PolicyEngine::new(vec![PolicyRule::new(
         "merge-if-green-approved-not-stale",
@@ -304,7 +303,7 @@ fn worker_provider_failure_flows_through_recovery_to_policy() {
         .observe(&worker.worker_id, "Ready for your input\n>")
         .expect("ready observe should succeed");
     registry
-        .send_prompt(&worker.worker_id, Some("Run analysis"))
+        .send_prompt(&worker.worker_id, Some("Run analysis"), None)
         .expect("prompt send should succeed");
 
     // Session completes with provider failure (finish="unknown", tokens=0)
@@ -347,7 +346,7 @@ fn worker_provider_failure_flows_through_recovery_to_policy() {
     // (Simulating the policy check that would happen after successful recovery)
     let recovery_success = matches!(result, RecoveryResult::Recovered { .. });
     let green_level = 3; // Workspace green
-    let not_stale = Duration::from_secs(30 * 60); // 30 min — fresh
+    let not_stale = Duration::from_mins(30); // 30 min — fresh
 
     let post_recovery_context = LaneContext::new(
         "recovered-lane",
@@ -357,7 +356,8 @@ fn worker_provider_failure_flows_through_recovery_to_policy() {
         ReviewStatus::Approved,
         DiffScope::Scoped,
         false,
-    );
+    )
+    .with_green_contract_satisfied(true);
 
     let policy_engine = PolicyEngine::new(vec![
         // Rule: if recovered from failure + green + approved -> merge

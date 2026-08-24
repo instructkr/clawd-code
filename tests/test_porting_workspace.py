@@ -159,6 +159,87 @@ class PortingWorkspaceTests(unittest.TestCase):
         self.assertIn('Command entries:', command_result.stdout)
         self.assertIn('Tool entries:', tool_result.stdout)
 
+    def test_plugin_command_filter_excludes_plugin_sources(self) -> None:
+        from src.commands import get_commands
+
+        all_commands = get_commands()
+        filtered_commands = get_commands(include_plugin_commands=False)
+
+        self.assertGreater(len(all_commands), len(filtered_commands))
+        self.assertFalse(
+            any('plugin' in command.source_hint.lower() for command in filtered_commands)
+        )
+
+    def test_plugin_command_aliases_execute_as_local_commands(self) -> None:
+        for alias in ('plugin', 'plugins', 'marketplace'):
+            with self.subTest(alias=alias):
+                result = subprocess.run(
+                    [sys.executable, '-m', 'src.main', 'exec-command', alias, f'{alias} list'],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+
+                self.assertIn("Mirrored command 'plugin'", result.stdout)
+                self.assertNotIn('Unknown mirrored command', result.stdout)
+
+    def test_command_lookup_normalizes_user_input_whitespace(self) -> None:
+        from src.commands import execute_command, find_commands, get_command
+
+        self.assertEqual('plugin', get_command('  PLUGINS  ').name)
+        self.assertEqual('review', find_commands('  review  ', limit=1)[0].name)
+        self.assertIn("Mirrored command 'plugin'", execute_command('  marketplace  ', 'browse').message)
+
+    def test_route_plugin_slash_commands_match_commands(self) -> None:
+        prompts = ('/plugin list', '/plugins list', '/marketplace browse', '/reload-plugins')
+        for prompt in prompts:
+            with self.subTest(prompt=prompt):
+                result = subprocess.run(
+                    [sys.executable, '-m', 'src.main', 'route', prompt, '--limit', '5'],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+
+                first_line = result.stdout.splitlines()[0]
+                self.assertTrue(first_line.startswith('command\t'), result.stdout)
+                self.assertRegex(first_line, r'\t(plugin|reload-plugins)\t')
+
+    def test_plugin_command_stream_emits_command_match(self) -> None:
+        from src.runtime import PortRuntime
+
+        for prompt in ('/plugin list', '/plugins list', '/marketplace browse', '/reload-plugins'):
+            with self.subTest(prompt=prompt):
+                session = PortRuntime().bootstrap_session(prompt, limit=5)
+                command_events = [
+                    event for event in session.stream_events if event['type'] == 'command_match'
+                ]
+
+                self.assertTrue(command_events, session.as_markdown())
+                self.assertNotIn('Matched commands: none', session.turn_result.output)
+
+    def test_turn_loop_plugin_commands_are_not_prompt_only(self) -> None:
+        for prompt in ('/plugin list', '/plugins list', '/marketplace browse', '/reload-plugins'):
+            with self.subTest(prompt=prompt):
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        '-m',
+                        'src.main',
+                        'turn-loop',
+                        prompt,
+                        '--max-turns',
+                        '1',
+                        '--structured-output',
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+
+                self.assertIn('"Matched commands:', result.stdout)
+                self.assertNotIn('Matched commands: none', result.stdout)
+
     def test_load_session_cli_runs(self) -> None:
         from src.runtime import PortRuntime
 

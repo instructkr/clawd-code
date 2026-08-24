@@ -8,12 +8,17 @@ publish.workspace = true
 [dependencies]
 api = { path = "../api" }
 commands = { path = "../commands" }
+flate2 = "1"
 plugins = { path = "../plugins" }
 runtime = { path = "../runtime" }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread"] }
+aspect-core = "0.1"
+aspect-macros = "0.1"
+aspect-std = "0.1"
+log = "0.4"
 
 [lints]
 workspace = true

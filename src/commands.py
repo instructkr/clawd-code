@@ -35,6 +35,11 @@ def load_command_snapshot() -> tuple[PortingModule, ...]:
 
 PORTED_COMMANDS = load_command_snapshot()
 
+COMMAND_ALIASES = {
+    'plugins': 'plugin',
+    'marketplace': 'plugin',
+}
+
 
 @lru_cache(maxsize=1)
 def built_in_command_names() -> frozenset[str]:
@@ -50,7 +55,8 @@ def command_names() -> list[str]:
 
 
 def get_command(name: str) -> PortingModule | None:
-    needle = name.lower()
+    normalized = name.strip().lower()
+    needle = COMMAND_ALIASES.get(normalized, normalized)
     for module in PORTED_COMMANDS:
         if module.name.lower() == needle:
             return module
@@ -67,8 +73,15 @@ def get_commands(cwd: str | None = None, include_plugin_commands: bool = True, i
 
 
 def find_commands(query: str, limit: int = 20) -> list[PortingModule]:
-    needle = query.lower()
+    needle = query.strip().lower()
     matches = [module for module in PORTED_COMMANDS if needle in module.name.lower() or needle in module.source_hint.lower()]
+    matches.sort(
+        key=lambda module: (
+            module.name.lower() != needle,
+            not module.name.lower().startswith(needle),
+            needle not in module.name.lower(),
+        )
+    )
     return matches[:limit]
 
 

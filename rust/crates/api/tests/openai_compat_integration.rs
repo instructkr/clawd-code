@@ -2,12 +2,13 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::sync::Arc;
 use std::sync::{Mutex as StdMutex, OnceLock};
+use std::time::Duration;
 
 use api::{
-    ApiError, ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent,
-    ContentBlockStopEvent, InputContentBlock, InputMessage, MessageDeltaEvent, MessageRequest,
-    OpenAiCompatClient, OpenAiCompatConfig, OutputContentBlock, ProviderClient, StreamEvent,
-    ToolChoice, ToolDefinition,
+    build_http_client_with, ApiError, ContentBlockDelta, ContentBlockDeltaEvent,
+    ContentBlockStartEvent, ContentBlockStopEvent, InputContentBlock, InputMessage,
+    MessageDeltaEvent, MessageRequest, OpenAiCompatClient, OpenAiCompatConfig, OutputContentBlock,
+    ProviderClient, ProxyConfig, StreamEvent, ToolChoice, ToolDefinition,
 };
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -25,7 +26,7 @@ async fn send_message_uses_openai_compatible_endpoint_and_auth() {
         "\"message\":{\"role\":\"assistant\",\"content\":\"Hello from Grok\",\"tool_calls\":[]},",
         "\"finish_reason\":\"stop\"",
         "}],",
-        "\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":5}",
+        "\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":5,\"prompt_tokens_details\":{\"cached_tokens\":3}}",
         "}"
     );
     let server = spawn_server(
@@ -42,6 +43,9 @@ async fn send_message_uses_openai_compatible_endpoint_and_auth() {
         .expect("request should succeed");
 
     assert_eq!(response.model, "grok-3");
+    assert_eq!(response.usage.input_tokens, 8);
+    assert_eq!(response.usage.cache_read_input_tokens, 3);
+    assert_eq!(response.usage.output_tokens, 5);
     assert_eq!(response.total_tokens(), 16);
     assert_eq!(
         response.content,
@@ -61,6 +65,207 @@ async fn send_message_uses_openai_compatible_endpoint_and_auth() {
     assert_eq!(body["model"], json!("grok-3"));
     assert_eq!(body["messages"][0]["role"], json!("system"));
     assert_eq!(body["tools"][0]["type"], json!("function"));
+}
+
+#[tokio::test]
+async fn send_message_passes_optional_openai_compatible_parameters_on_wire() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let body = concat!(
+        "{",
+        "\"id\":\"chatcmpl_params\",",
+        "\"model\":\"gpt-4o\",",
+        "\"choices\":[{",
+        "\"message\":{\"role\":\"assistant\",\"content\":\"Parameters preserved\",\"tool_calls\":[]},",
+        "\"finish_reason\":\"stop\"",
+        "}],",
+        "\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2}",
+        "}"
+    );
+    let server = spawn_server(
+        state.clone(),
+        vec![http_response("200 OK", "application/json", body)],
+    )
+    .await;
+
+    let client = OpenAiCompatClient::new("openai-test-key", OpenAiCompatConfig::openai())
+        .with_base_url(server.base_url());
+    let response = client
+        .send_message(&MessageRequest {
+            model: "gpt-4o".to_string(),
+            temperature: Some(0.2),
+            top_p: Some(0.8),
+            frequency_penalty: Some(0.15),
+            presence_penalty: Some(0.25),
+            stop: Some(vec!["END".to_string()]),
+            reasoning_effort: Some("low".to_string()),
+            ..sample_request(false)
+        })
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.total_tokens(), 5);
+
+    let captured = state.lock().await;
+    let request = captured.first().expect("server should capture request");
+    let body: serde_json::Value = serde_json::from_str(&request.body).expect("json body");
+    assert_eq!(body["model"], json!("gpt-4o"));
+    assert_eq!(body["temperature"], json!(0.2));
+    assert_eq!(body["top_p"], json!(0.8));
+    assert_eq!(body["frequency_penalty"], json!(0.15));
+    assert_eq!(body["presence_penalty"], json!(0.25));
+    assert_eq!(body["stop"], json!(["END"]));
+    assert_eq!(body["reasoning_effort"], json!("low"));
+}
+
+#[tokio::test]
+async fn send_message_preserves_deepseek_reasoning_content_before_text() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let body = concat!(
+        "{",
+        "\"id\":\"chatcmpl_deepseek_reasoning\",",
+        "\"model\":\"deepseek-v4-pro\",",
+        "\"choices\":[{",
+        "\"message\":{\"role\":\"assistant\",\"reasoning_content\":\"Think first\",\"content\":\"Answer second\",\"tool_calls\":[]},",
+        "\"finish_reason\":\"stop\"",
+        "}],",
+        "\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":5}",
+        "}"
+    );
+    let server = spawn_server(
+        state.clone(),
+        vec![http_response("200 OK", "application/json", body)],
+    )
+    .await;
+
+    let client = OpenAiCompatClient::new("openai-test-key", OpenAiCompatConfig::openai())
+        .with_base_url(server.base_url());
+    let response = client
+        .send_message(&MessageRequest {
+            model: "openai/deepseek-v4-pro".to_string(),
+            ..sample_request(false)
+        })
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(
+        response.content,
+        vec![
+            OutputContentBlock::Thinking {
+                thinking: "Think first".to_string(),
+                signature: None,
+            },
+            OutputContentBlock::Text {
+                text: "Answer second".to_string(),
+            },
+        ]
+    );
+
+    let captured = state.lock().await;
+    let request = captured.first().expect("server should capture request");
+    let body: serde_json::Value = serde_json::from_str(&request.body).expect("json body");
+    assert_eq!(body["thinking"], json!({"type": "enabled"}));
+}
+
+#[tokio::test]
+async fn send_message_preserves_ollama_reasoning_before_text() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let body = concat!(
+        "{",
+        "\"id\":\"chatcmpl_ollama_reasoning\",",
+        "\"model\":\"qwen3:latest\",",
+        "\"choices\":[{",
+        "\"message\":{\"role\":\"assistant\",\"reasoning\":\"Think locally\",\"content\":\"Answer locally\",\"tool_calls\":[]},",
+        "\"finish_reason\":\"stop\"",
+        "}],",
+        "\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":5}",
+        "}"
+    );
+    let server = spawn_server(
+        state.clone(),
+        vec![http_response("200 OK", "application/json", body)],
+    )
+    .await;
+
+    let client = OpenAiCompatClient::new("ollama-test-key", OpenAiCompatConfig::openai())
+        .with_base_url(server.base_url());
+    let response = client
+        .send_message(&MessageRequest {
+            model: "openai/qwen3:latest".to_string(),
+            ..sample_request(false)
+        })
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(
+        response.content,
+        vec![
+            OutputContentBlock::Thinking {
+                thinking: "Think locally".to_string(),
+                signature: None,
+            },
+            OutputContentBlock::Text {
+                text: "Answer locally".to_string(),
+            },
+        ]
+    );
+
+    let captured = state.lock().await;
+    let request = captured.first().expect("server should capture request");
+    let body: serde_json::Value = serde_json::from_str(&request.body).expect("json body");
+    assert_eq!(body["model"], json!("qwen3:latest"));
+}
+
+#[tokio::test]
+async fn local_openai_gateway_strips_routing_prefix_and_preserves_extra_body_params() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let body = concat!(
+        "{",
+        "\"id\":\"chatcmpl_slash_model\",",
+        "\"model\":\"openai/gpt-4.1-mini\",",
+        "\"choices\":[{",
+        "\"message\":{\"role\":\"assistant\",\"content\":\"Gateway accepted slug\",\"tool_calls\":[]},",
+        "\"finish_reason\":\"stop\"",
+        "}],",
+        "\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2}",
+        "}"
+    );
+    let server = spawn_server(
+        state.clone(),
+        vec![http_response("200 OK", "application/json", body)],
+    )
+    .await;
+
+    let mut extra_body = std::collections::BTreeMap::new();
+    extra_body.insert(
+        "web_search_options".to_string(),
+        json!({"search_context_size": "low"}),
+    );
+    extra_body.insert("parallel_tool_calls".to_string(), json!(false));
+    extra_body.insert("model".to_string(), json!("malicious-override"));
+
+    let client = OpenAiCompatClient::new("openai-test-key", OpenAiCompatConfig::openai())
+        .with_base_url(server.base_url());
+    let response = client
+        .send_message(&MessageRequest {
+            model: "openai/gpt-4.1-mini".to_string(),
+            extra_body,
+            ..sample_request(false)
+        })
+        .await
+        .expect("gateway request should succeed");
+
+    assert_eq!(response.model, "openai/gpt-4.1-mini");
+    assert_eq!(response.total_tokens(), 5);
+
+    let captured = state.lock().await;
+    let request = captured.first().expect("captured request");
+    let body: serde_json::Value = serde_json::from_str(&request.body).expect("json body");
+    assert_eq!(body["model"], json!("gpt-4.1-mini"));
+    assert_eq!(
+        body["web_search_options"],
+        json!({"search_context_size": "low"})
+    );
+    assert_eq!(body["parallel_tool_calls"], json!(false));
 }
 
 #[tokio::test]
@@ -88,6 +293,7 @@ async fn send_message_blocks_oversized_xai_requests_before_the_http_call() {
             tools: None,
             tool_choice: None,
             stream: false,
+            ..Default::default()
         })
         .await
         .expect_err("oversized request should fail local context-window preflight");
@@ -232,6 +438,142 @@ async fn stream_message_normalizes_text_and_multiple_tool_calls() {
     assert!(request.body.contains("\"stream\":true"));
 }
 
+#[tokio::test]
+async fn stream_message_preserves_ollama_reasoning_before_text() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let sse = concat!(
+        "data: {\"id\":\"chatcmpl_stream_ollama_reasoning\",\"model\":\"qwen3:latest\",\"choices\":[{\"delta\":{\"reasoning\":\"Think\"}}]}\n\n",
+        "data: {\"id\":\"chatcmpl_stream_ollama_reasoning\",\"choices\":[{\"delta\":{\"content\":\" answer\"},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let server = spawn_server(
+        state.clone(),
+        vec![http_response_with_headers(
+            "200 OK",
+            "text/event-stream",
+            sse,
+            &[("x-request-id", "req_ollama_reasoning_stream")],
+        )],
+    )
+    .await;
+
+    let client = OpenAiCompatClient::new("ollama-test-key", OpenAiCompatConfig::openai())
+        .with_base_url(server.base_url());
+    let mut stream = client
+        .stream_message(&MessageRequest {
+            model: "openai/qwen3:latest".to_string(),
+            ..sample_request(false)
+        })
+        .await
+        .expect("stream should start");
+
+    assert_eq!(stream.request_id(), Some("req_ollama_reasoning_stream"));
+
+    let mut events = Vec::new();
+    while let Some(event) = stream.next_event().await.expect("event should parse") {
+        events.push(event);
+    }
+
+    assert!(matches!(events[0], StreamEvent::MessageStart(_)));
+    assert!(matches!(
+        events[1],
+        StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+            index: 0,
+            content_block: OutputContentBlock::Thinking { .. },
+        })
+    ));
+    assert!(matches!(
+        events[2],
+        StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+            index: 0,
+            delta: ContentBlockDelta::ThinkingDelta { .. },
+        })
+    ));
+    assert!(matches!(
+        events[3],
+        StreamEvent::ContentBlockStop(ContentBlockStopEvent { index: 0 })
+    ));
+    assert!(matches!(
+        events[4],
+        StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+            index: 1,
+            content_block: OutputContentBlock::Text { .. },
+        })
+    ));
+    assert!(matches!(
+        events[5],
+        StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+            index: 1,
+            delta: ContentBlockDelta::TextDelta { .. },
+        })
+    ));
+
+    let captured = state.lock().await;
+    let request = captured.first().expect("captured request");
+    let body: serde_json::Value = serde_json::from_str(&request.body).expect("json body");
+    assert_eq!(body["model"], json!("qwen3:latest"));
+    assert_eq!(body["stream"], json!(true));
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn stream_message_retries_retryable_sse_handshake_failures() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let sse = concat!(
+        "data: {\"id\":\"chatcmpl_stream_retry\",\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"content\":\"Recovered\"}}]}\n\n",
+        "data: {\"id\":\"chatcmpl_stream_retry\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let server = spawn_server(
+        state.clone(),
+        vec![
+            http_response(
+                "500 Internal Server Error",
+                "application/json",
+                "{\"error\":{\"message\":\"try again\",\"type\":\"server_error\",\"code\":500}}",
+            ),
+            http_response_with_headers(
+                "200 OK",
+                "text/event-stream",
+                sse,
+                &[("x-request-id", "req_stream_retry")],
+            ),
+        ],
+    )
+    .await;
+
+    let client = OpenAiCompatClient::new("openai-test-key", OpenAiCompatConfig::openai())
+        .with_base_url(server.base_url())
+        .with_retry_policy(1, Duration::ZERO, Duration::ZERO);
+    let mut stream = client
+        .stream_message(&MessageRequest {
+            model: "gpt-4o".to_string(),
+            ..sample_request(false)
+        })
+        .await
+        .expect("stream should retry once then start");
+
+    assert_eq!(stream.request_id(), Some("req_stream_retry"));
+    let mut events = Vec::new();
+    while let Some(event) = stream.next_event().await.expect("event should parse") {
+        events.push(event);
+    }
+    assert!(events.iter().any(|event| matches!(
+        event,
+        StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+            delta: ContentBlockDelta::TextDelta { text },
+            ..
+        }) if text == "Recovered"
+    )));
+
+    let captured = state.lock().await;
+    assert_eq!(captured.len(), 2, "one original request plus one retry");
+    for request in captured.iter() {
+        let body: serde_json::Value = serde_json::from_str(&request.body).expect("json body");
+        assert_eq!(body["stream"], json!(true));
+    }
+}
+
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn openai_streaming_requests_opt_into_usage_chunks() {
@@ -239,7 +581,7 @@ async fn openai_streaming_requests_opt_into_usage_chunks() {
     let sse = concat!(
         "data: {\"id\":\"chatcmpl_openai_stream\",\"model\":\"gpt-5\",\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n",
         "data: {\"id\":\"chatcmpl_openai_stream\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
-        "data: {\"id\":\"chatcmpl_openai_stream\",\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":4}}\n\n",
+        "data: {\"id\":\"chatcmpl_openai_stream\",\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":4,\"prompt_tokens_details\":{\"cached_tokens\":2}}}\n\n",
         "data: [DONE]\n\n"
     );
     let server = spawn_server(
@@ -294,8 +636,10 @@ async fn openai_streaming_requests_opt_into_usage_chunks() {
 
     match &events[4] {
         StreamEvent::MessageDelta(MessageDeltaEvent { usage, .. }) => {
-            assert_eq!(usage.input_tokens, 9);
+            assert_eq!(usage.input_tokens, 7);
+            assert_eq!(usage.cache_read_input_tokens, 2);
             assert_eq!(usage.output_tokens, 4);
+            assert_eq!(usage.total_tokens(), 13);
         }
         other => panic!("expected message delta, got {other:?}"),
     }
@@ -306,6 +650,47 @@ async fn openai_streaming_requests_opt_into_usage_chunks() {
     let body: serde_json::Value = serde_json::from_str(&request.body).expect("json body");
     assert_eq!(body["stream"], json!(true));
     assert_eq!(body["stream_options"], json!({"include_usage": true}));
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn openai_compatible_client_honors_http_proxy_for_requests() {
+    let _lock = env_lock();
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let proxy = spawn_server(
+        state.clone(),
+        vec![http_response(
+            "200 OK",
+            "application/json",
+            "{\"id\":\"chatcmpl_proxy\",\"model\":\"gpt-4o\",\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"Via proxy\",\"tool_calls\":[]},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":3}}",
+        )],
+    )
+    .await;
+    let proxied_http = build_http_client_with(&ProxyConfig::from_proxy_url(proxy.base_url()))
+        .expect("proxy client should build");
+
+    let client = OpenAiCompatClient::new("openai-test-key", OpenAiCompatConfig::openai())
+        .with_http_client(proxied_http)
+        .with_base_url("http://origin.invalid/v1");
+    let response = client
+        .send_message(&MessageRequest {
+            model: "openai/gpt-4.1-mini".to_string(),
+            ..sample_request(false)
+        })
+        .await
+        .expect("proxy should return the OpenAI-compatible response");
+
+    assert_eq!(response.model, "openai/gpt-4.1-mini");
+    assert_eq!(response.total_tokens(), 7);
+    let captured = state.lock().await;
+    let request = captured.first().expect("proxy should capture request");
+    assert_eq!(request.path, "http://origin.invalid/v1/chat/completions");
+    assert_eq!(
+        request.headers.get("authorization").map(String::as_str),
+        Some("Bearer openai-test-key")
+    );
+    let body: serde_json::Value = serde_json::from_str(&request.body).expect("json body");
+    assert_eq!(body["model"], json!("openai/gpt-4.1-mini"));
 }
 
 #[allow(clippy::await_holding_lock)]
@@ -496,6 +881,7 @@ fn sample_request(stream: bool) -> MessageRequest {
         }]),
         tool_choice: Some(ToolChoice::Auto),
         stream,
+        ..Default::default()
     }
 }
 

@@ -1,0 +1,644 @@
+G010 final leader verification started 2026-05-15T02:17:45Z
+== artifact checklist ==
+PASS docs/g010-clone-disambiguation-metadata.md exists
+PASS docs/g010-session-hygiene-verification-map.md exists
+.gitignore:.claw/sessions/
+rust/.gitignore:.claw/sessions/
+.claw/sessions/example.jsonl
+rust/.claw/sessions/example.jsonl
+.claude/sessions/example.json
+== fmt ==
+== runtime session_control ==
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.14s
+     Running unittests src/lib.rs (rust/target/debug/deps/runtime-0e7d3d46ae40aa07)
+
+running 15 tests
+test session_control::tests::latest_session_prefers_semantic_updated_at_over_file_mtime ... ok
+test session_control::tests::session_store_from_cwd_canonicalizes_equivalent_paths ... ok
+
+thread 'session_control::tests::session_store_fork_stays_in_same_namespace' (403821665) panicked at crates/runtime/src/session_control.rs:775:14:
+session should persist: Io(Os { code: 2, kind: NotFound, message: "No such file or directory" })
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test session_control::tests::session_exists_and_delete_are_scoped_to_workspace_store ... ok
+test session_control::tests::forks_session_into_managed_storage_with_lineage ... ok
+test session_control::tests::creates_and_lists_managed_sessions ... ok
+test session_control::tests::session_store_from_cwd_isolates_sessions_by_workspace ... ok
+test session_control::tests::session_store_latest_and_resolve_reference ... ok
+test session_control::tests::session_store_loads_safe_legacy_session_from_same_workspace ... ok
+test session_control::tests::workspace_fingerprint_is_deterministic_and_differs_per_path ... ok
+test session_control::tests::session_store_create_and_load_round_trip ... ok
+test session_control::tests::session_store_fork_stays_in_same_namespace ... FAILED
+test session_control::tests::session_store_loads_unbound_legacy_session_from_same_workspace ... ok
+test session_control::tests::session_store_from_data_dir_namespaces_by_workspace ... ok
+test session_control::tests::session_store_rejects_legacy_session_from_other_workspace ... ok
+test session_control::tests::resolves_latest_alias_and_loads_session_from_workspace_root ... ok
+
+failures:
+
+failures:
+    session_control::tests::session_store_fork_stays_in_same_namespace
+
+test result: FAILED. 14 passed; 1 failed; 0 ignored; 0 measured; 542 filtered out; finished in 0.03s
+
+error: test failed, to rerun pass `-p runtime --lib`
+== runtime jsonl safeguards ==
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.13s
+     Running unittests src/lib.rs (rust/target/debug/deps/runtime-0e7d3d46ae40aa07)
+
+running 1 test
+test session::tests::jsonl_persistence_redacts_and_truncates_oversized_payload_fields ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 556 filtered out; finished in 0.02s
+
+     Running tests/g004_conformance.rs (rust/target/debug/deps/g004_conformance-90f36d1f871b6313)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/integration_tests.rs (rust/target/debug/deps/integration_tests-526d4f853fc590de)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s
+
+== runtime compact ==
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.13s
+     Running unittests src/lib.rs (rust/target/debug/deps/runtime-0e7d3d46ae40aa07)
+
+running 17 tests
+test compact::tests::formats_compact_summary_like_upstream ... ok
+test compact::tests::truncates_long_blocks_in_summary ... ok
+test compact::tests::ignores_existing_compacted_summary_when_deciding_to_recompact ... ok
+test compact::tests::infers_pending_work_from_recent_messages ... ok
+test compact::tests::compaction_does_not_split_tool_use_tool_result_pair ... ok
+test compact::tests::leaves_small_sessions_unchanged ... ok
+test conversation::tests::auto_compaction_threshold_defaults_and_parses_values ... ok
+test compact::tests::extracts_key_files_from_message_content ... ok
+test compact::tests::compacts_older_messages_into_a_system_summary ... ok
+test prompt::tests::displays_context_paths_compactly ... ok
+test conversation::tests::skips_auto_compaction_below_threshold ... ok
+test conversation::tests::compaction_health_probe_skips_empty_compacted_session ... ok
+test conversation::tests::compacts_session_after_turns ... ok
+test conversation::tests::compaction_health_probe_blocks_turn_when_tool_executor_is_broken ... ok
+test conversation::tests::auto_compacts_when_cumulative_input_threshold_is_crossed ... ok
+test compact::tests::keeps_previous_compacted_context_when_compacting_again ... ok
+test session::tests::persists_compaction_metadata ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 540 filtered out; finished in 0.01s
+
+     Running tests/g004_conformance.rs (rust/target/debug/deps/g004_conformance-90f36d1f871b6313)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/integration_tests.rs (rust/target/debug/deps/integration_tests-526d4f853fc590de)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s
+
+== commands session/compact slash ==
+error: unexpected argument 'compacts_sessions_via_slash_command' found
+
+Usage: cargo test [OPTIONS] [TESTNAME] [-- [ARGS]...]
+
+For more information, try '--help'.
+== cli session json contracts ==
+warning: enum `ProviderWireProtocol` is never used
+  --> crates/api/src/providers/mod.rs:54:10
+   |
+54 | pub enum ProviderWireProtocol {
+   |          ^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: enum `ProviderFeatureSupport` is never used
+  --> crates/api/src/providers/mod.rs:61:10
+   |
+61 | pub enum ProviderFeatureSupport {
+   |          ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `ProviderCapabilityReport` is never constructed
+  --> crates/api/src/providers/mod.rs:68:12
+   |
+68 | pub struct ProviderCapabilityReport {
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: enum `ProviderDiagnosticSeverity` is never used
+  --> crates/api/src/providers/mod.rs:88:10
+   |
+88 | pub enum ProviderDiagnosticSeverity {
+   |          ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `ProviderDiagnostic` is never constructed
+  --> crates/api/src/providers/mod.rs:94:12
+   |
+94 | pub struct ProviderDiagnostic {
+   |            ^^^^^^^^^^^^^^^^^^
+
+warning: function `provider_capabilities_for_model` is never used
+   --> crates/api/src/providers/mod.rs:384:8
+    |
+384 | pub fn provider_capabilities_for_model(model: &str) -> ProviderCapabilityReport {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `provider_diagnostics_for_request` is never used
+   --> crates/api/src/providers/mod.rs:452:8
+    |
+452 | pub fn provider_diagnostics_for_request(request: &MessageRequest) -> Vec<ProviderDiagnostic> {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `metadata_for_provider_kind` is never used
+   --> crates/api/src/providers/mod.rs:517:4
+    |
+517 | fn metadata_for_provider_kind(provider: ProviderKind) -> ProviderMetadata {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `provider_label` is never used
+   --> crates/api/src/providers/mod.rs:541:10
+    |
+541 | const fn provider_label(provider: ProviderKind) -> &'static str {
+    |          ^^^^^^^^^^^^^^
+
+warning: function `has_openai_tuning_parameters` is never used
+   --> crates/api/src/providers/mod.rs:550:4
+    |
+550 | fn has_openai_tuning_parameters(request: &MessageRequest) -> bool {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `declares_tool` is never used
+   --> crates/api/src/providers/mod.rs:558:4
+    |
+558 | fn declares_tool(request: &MessageRequest, tool_name: &str) -> bool {
+    |    ^^^^^^^^^^^^^
+
+warning: function `web_passthrough_diagnostic` is never used
+   --> crates/api/src/providers/mod.rs:567:4
+    |
+567 | fn web_passthrough_diagnostic(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `strip_routing_prefix` is never used
+   --> crates/api/src/providers/openai_compat.rs:901:4
+    |
+901 | fn strip_routing_prefix(model: &str) -> &str {
+    |    ^^^^^^^^^^^^^^^^^^^^
+
+warning: `api` (lib) generated 13 warnings
+   Compiling rusty-claude-cli v0.1.0 (/Users/bellman/Documents/Workspace/claw-code/rust/crates/rusty-claude-cli)
+error[E0004]: non-exhaustive patterns: `&SlashCommand::Session { action: Some(_), target: None }` not covered
+    --> crates/rusty-claude-cli/src/main.rs:3823:11
+     |
+3823 |     match command {
+     |           ^^^^^^^ pattern `&SlashCommand::Session { action: Some(_), target: None }` not covered
+     |
+note: `SlashCommand` defined here
+    --> crates/commands/src/lib.rs:1040:1
+     |
+1040 | pub enum SlashCommand {
+     | ^^^^^^^^^^^^^^^^^^^^^
+...
+1089 |     Session {
+     |     ------- not covered
+     = note: the matched value is of type `&SlashCommand`
+help: ensure that all possible cases are being handled by adding a match arm with a wildcard pattern or an explicit pattern as shown
+     |
+4200 ~         | SlashCommand::AddDir { .. } => Err("unsupported resumed slash command".into()),
+4201 ~         &SlashCommand::Session { action: Some(_), target: None } => todo!(),
+     |
+
+For more information about this error, try `rustc --explain E0004`.
+error: could not compile `rusty-claude-cli` (bin "claw" test) due to 1 previous error
+warning: enum `ProviderWireProtocol` is never used
+  --> crates/api/src/providers/mod.rs:54:10
+   |
+54 | pub enum ProviderWireProtocol {
+   |          ^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: enum `ProviderFeatureSupport` is never used
+  --> crates/api/src/providers/mod.rs:61:10
+   |
+61 | pub enum ProviderFeatureSupport {
+   |          ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `ProviderCapabilityReport` is never constructed
+  --> crates/api/src/providers/mod.rs:68:12
+   |
+68 | pub struct ProviderCapabilityReport {
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: enum `ProviderDiagnosticSeverity` is never used
+  --> crates/api/src/providers/mod.rs:88:10
+   |
+88 | pub enum ProviderDiagnosticSeverity {
+   |          ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `ProviderDiagnostic` is never constructed
+  --> crates/api/src/providers/mod.rs:94:12
+   |
+94 | pub struct ProviderDiagnostic {
+   |            ^^^^^^^^^^^^^^^^^^
+
+warning: function `provider_capabilities_for_model` is never used
+   --> crates/api/src/providers/mod.rs:384:8
+    |
+384 | pub fn provider_capabilities_for_model(model: &str) -> ProviderCapabilityReport {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `provider_diagnostics_for_request` is never used
+   --> crates/api/src/providers/mod.rs:452:8
+    |
+452 | pub fn provider_diagnostics_for_request(request: &MessageRequest) -> Vec<ProviderDiagnostic> {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `metadata_for_provider_kind` is never used
+   --> crates/api/src/providers/mod.rs:517:4
+    |
+517 | fn metadata_for_provider_kind(provider: ProviderKind) -> ProviderMetadata {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `provider_label` is never used
+   --> crates/api/src/providers/mod.rs:541:10
+    |
+541 | const fn provider_label(provider: ProviderKind) -> &'static str {
+    |          ^^^^^^^^^^^^^^
+
+warning: function `has_openai_tuning_parameters` is never used
+   --> crates/api/src/providers/mod.rs:550:4
+    |
+550 | fn has_openai_tuning_parameters(request: &MessageRequest) -> bool {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `declares_tool` is never used
+   --> crates/api/src/providers/mod.rs:558:4
+    |
+558 | fn declares_tool(request: &MessageRequest, tool_name: &str) -> bool {
+    |    ^^^^^^^^^^^^^
+
+warning: function `web_passthrough_diagnostic` is never used
+   --> crates/api/src/providers/mod.rs:567:4
+    |
+567 | fn web_passthrough_diagnostic(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `strip_routing_prefix` is never used
+   --> crates/api/src/providers/openai_compat.rs:901:4
+    |
+901 | fn strip_routing_prefix(model: &str) -> &str {
+    |    ^^^^^^^^^^^^^^^^^^^^
+
+warning: `api` (lib) generated 13 warnings
+   Compiling rusty-claude-cli v0.1.0 (/Users/bellman/Documents/Workspace/claw-code/rust/crates/rusty-claude-cli)
+error[E0004]: non-exhaustive patterns: `&SlashCommand::Session { action: Some(_), target: None }` not covered
+    --> crates/rusty-claude-cli/src/main.rs:3823:11
+     |
+3823 |     match command {
+     |           ^^^^^^^ pattern `&SlashCommand::Session { action: Some(_), target: None }` not covered
+     |
+note: `SlashCommand` defined here
+    --> crates/commands/src/lib.rs:1040:1
+     |
+1040 | pub enum SlashCommand {
+     | ^^^^^^^^^^^^^^^^^^^^^
+...
+1089 |     Session {
+     |     ------- not covered
+     = note: the matched value is of type `&SlashCommand`
+help: ensure that all possible cases are being handled by adding a match arm with a wildcard pattern or an explicit pattern as shown
+     |
+4200 ~         | SlashCommand::AddDir { .. } => Err("unsupported resumed slash command".into()),
+4201 ~         &SlashCommand::Session { action: Some(_), target: None } => todo!(),
+     |
+
+For more information about this error, try `rustc --explain E0004`.
+error: could not compile `rusty-claude-cli` (bin "claw" test) due to 1 previous error
+== cli resume slash commands ==
+warning: enum `ProviderWireProtocol` is never used
+  --> crates/api/src/providers/mod.rs:54:10
+   |
+54 | pub enum ProviderWireProtocol {
+   |          ^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: enum `ProviderFeatureSupport` is never used
+  --> crates/api/src/providers/mod.rs:61:10
+   |
+61 | pub enum ProviderFeatureSupport {
+   |          ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `ProviderCapabilityReport` is never constructed
+  --> crates/api/src/providers/mod.rs:68:12
+   |
+68 | pub struct ProviderCapabilityReport {
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: enum `ProviderDiagnosticSeverity` is never used
+  --> crates/api/src/providers/mod.rs:88:10
+   |
+88 | pub enum ProviderDiagnosticSeverity {
+   |          ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `ProviderDiagnostic` is never constructed
+  --> crates/api/src/providers/mod.rs:94:12
+   |
+94 | pub struct ProviderDiagnostic {
+   |            ^^^^^^^^^^^^^^^^^^
+
+warning: function `provider_capabilities_for_model` is never used
+   --> crates/api/src/providers/mod.rs:384:8
+    |
+384 | pub fn provider_capabilities_for_model(model: &str) -> ProviderCapabilityReport {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `provider_diagnostics_for_request` is never used
+   --> crates/api/src/providers/mod.rs:452:8
+    |
+452 | pub fn provider_diagnostics_for_request(request: &MessageRequest) -> Vec<ProviderDiagnostic> {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `metadata_for_provider_kind` is never used
+   --> crates/api/src/providers/mod.rs:517:4
+    |
+517 | fn metadata_for_provider_kind(provider: ProviderKind) -> ProviderMetadata {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `provider_label` is never used
+   --> crates/api/src/providers/mod.rs:541:10
+    |
+541 | const fn provider_label(provider: ProviderKind) -> &'static str {
+    |          ^^^^^^^^^^^^^^
+
+warning: function `has_openai_tuning_parameters` is never used
+   --> crates/api/src/providers/mod.rs:550:4
+    |
+550 | fn has_openai_tuning_parameters(request: &MessageRequest) -> bool {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `declares_tool` is never used
+   --> crates/api/src/providers/mod.rs:558:4
+    |
+558 | fn declares_tool(request: &MessageRequest, tool_name: &str) -> bool {
+    |    ^^^^^^^^^^^^^
+
+warning: function `web_passthrough_diagnostic` is never used
+   --> crates/api/src/providers/mod.rs:567:4
+    |
+567 | fn web_passthrough_diagnostic(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `strip_routing_prefix` is never used
+   --> crates/api/src/providers/openai_compat.rs:901:4
+    |
+901 | fn strip_routing_prefix(model: &str) -> &str {
+    |    ^^^^^^^^^^^^^^^^^^^^
+
+warning: `api` (lib) generated 13 warnings
+   Compiling rusty-claude-cli v0.1.0 (/Users/bellman/Documents/Workspace/claw-code/rust/crates/rusty-claude-cli)
+error[E0004]: non-exhaustive patterns: `&SlashCommand::Session { action: Some(_), target: None }` not covered
+    --> crates/rusty-claude-cli/src/main.rs:3823:11
+     |
+3823 |     match command {
+     |           ^^^^^^^ pattern `&SlashCommand::Session { action: Some(_), target: None }` not covered
+     |
+note: `SlashCommand` defined here
+    --> crates/commands/src/lib.rs:1040:1
+     |
+1040 | pub enum SlashCommand {
+     | ^^^^^^^^^^^^^^^^^^^^^
+...
+1089 |     Session {
+     |     ------- not covered
+     = note: the matched value is of type `&SlashCommand`
+help: ensure that all possible cases are being handled by adding a match arm with a wildcard pattern or an explicit pattern as shown
+     |
+4200 ~         | SlashCommand::AddDir { .. } => Err("unsupported resumed slash command".into()),
+4201 ~         &SlashCommand::Session { action: Some(_), target: None } => todo!(),
+     |
+
+For more information about this error, try `rustc --explain E0004`.
+error: could not compile `rusty-claude-cli` (bin "claw") due to 1 previous error
+== cli compact output ==
+warning: enum `ProviderWireProtocol` is never used
+  --> crates/api/src/providers/mod.rs:54:10
+   |
+54 | pub enum ProviderWireProtocol {
+   |          ^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: enum `ProviderFeatureSupport` is never used
+  --> crates/api/src/providers/mod.rs:61:10
+   |
+61 | pub enum ProviderFeatureSupport {
+   |          ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `ProviderCapabilityReport` is never constructed
+  --> crates/api/src/providers/mod.rs:68:12
+   |
+68 | pub struct ProviderCapabilityReport {
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: enum `ProviderDiagnosticSeverity` is never used
+  --> crates/api/src/providers/mod.rs:88:10
+   |
+88 | pub enum ProviderDiagnosticSeverity {
+   |          ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `ProviderDiagnostic` is never constructed
+  --> crates/api/src/providers/mod.rs:94:12
+   |
+94 | pub struct ProviderDiagnostic {
+   |            ^^^^^^^^^^^^^^^^^^
+
+warning: function `provider_capabilities_for_model` is never used
+   --> crates/api/src/providers/mod.rs:384:8
+    |
+384 | pub fn provider_capabilities_for_model(model: &str) -> ProviderCapabilityReport {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `provider_diagnostics_for_request` is never used
+   --> crates/api/src/providers/mod.rs:452:8
+    |
+452 | pub fn provider_diagnostics_for_request(request: &MessageRequest) -> Vec<ProviderDiagnostic> {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `metadata_for_provider_kind` is never used
+   --> crates/api/src/providers/mod.rs:517:4
+    |
+517 | fn metadata_for_provider_kind(provider: ProviderKind) -> ProviderMetadata {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `provider_label` is never used
+   --> crates/api/src/providers/mod.rs:541:10
+    |
+541 | const fn provider_label(provider: ProviderKind) -> &'static str {
+    |          ^^^^^^^^^^^^^^
+
+warning: function `has_openai_tuning_parameters` is never used
+   --> crates/api/src/providers/mod.rs:550:4
+    |
+550 | fn has_openai_tuning_parameters(request: &MessageRequest) -> bool {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `declares_tool` is never used
+   --> crates/api/src/providers/mod.rs:558:4
+    |
+558 | fn declares_tool(request: &MessageRequest, tool_name: &str) -> bool {
+    |    ^^^^^^^^^^^^^
+
+warning: function `web_passthrough_diagnostic` is never used
+   --> crates/api/src/providers/mod.rs:567:4
+    |
+567 | fn web_passthrough_diagnostic(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `strip_routing_prefix` is never used
+   --> crates/api/src/providers/openai_compat.rs:901:4
+    |
+901 | fn strip_routing_prefix(model: &str) -> &str {
+    |    ^^^^^^^^^^^^^^^^^^^^
+
+warning: `api` (lib) generated 13 warnings
+   Compiling rusty-claude-cli v0.1.0 (/Users/bellman/Documents/Workspace/claw-code/rust/crates/rusty-claude-cli)
+error[E0004]: non-exhaustive patterns: `&SlashCommand::Session { action: Some(_), target: None }` not covered
+    --> crates/rusty-claude-cli/src/main.rs:3823:11
+     |
+3823 |     match command {
+     |           ^^^^^^^ pattern `&SlashCommand::Session { action: Some(_), target: None }` not covered
+     |
+note: `SlashCommand` defined here
+    --> crates/commands/src/lib.rs:1040:1
+     |
+1040 | pub enum SlashCommand {
+     | ^^^^^^^^^^^^^^^^^^^^^
+...
+1089 |     Session {
+     |     ------- not covered
+     = note: the matched value is of type `&SlashCommand`
+help: ensure that all possible cases are being handled by adding a match arm with a wildcard pattern or an explicit pattern as shown
+     |
+4200 ~         | SlashCommand::AddDir { .. } => Err("unsupported resumed slash command".into()),
+4201 ~         &SlashCommand::Session { action: Some(_), target: None } => todo!(),
+     |
+
+For more information about this error, try `rustc --explain E0004`.
+error: could not compile `rusty-claude-cli` (bin "claw") due to 1 previous error
+== workspace check ==
+    Checking runtime v0.1.0 (/Users/bellman/Documents/Workspace/claw-code/rust/crates/runtime)
+   Compiling rusty-claude-cli v0.1.0 (/Users/bellman/Documents/Workspace/claw-code/rust/crates/rusty-claude-cli)
+    Checking api v0.1.0 (/Users/bellman/Documents/Workspace/claw-code/rust/crates/api)
+    Checking commands v0.1.0 (/Users/bellman/Documents/Workspace/claw-code/rust/crates/commands)
+warning: enum `ProviderWireProtocol` is never used
+  --> crates/api/src/providers/mod.rs:54:10
+   |
+54 | pub enum ProviderWireProtocol {
+   |          ^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: enum `ProviderFeatureSupport` is never used
+  --> crates/api/src/providers/mod.rs:61:10
+   |
+61 | pub enum ProviderFeatureSupport {
+   |          ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `ProviderCapabilityReport` is never constructed
+  --> crates/api/src/providers/mod.rs:68:12
+   |
+68 | pub struct ProviderCapabilityReport {
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: enum `ProviderDiagnosticSeverity` is never used
+  --> crates/api/src/providers/mod.rs:88:10
+   |
+88 | pub enum ProviderDiagnosticSeverity {
+   |          ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `ProviderDiagnostic` is never constructed
+  --> crates/api/src/providers/mod.rs:94:12
+   |
+94 | pub struct ProviderDiagnostic {
+   |            ^^^^^^^^^^^^^^^^^^
+
+warning: function `provider_capabilities_for_model` is never used
+   --> crates/api/src/providers/mod.rs:384:8
+    |
+384 | pub fn provider_capabilities_for_model(model: &str) -> ProviderCapabilityReport {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `provider_diagnostics_for_request` is never used
+   --> crates/api/src/providers/mod.rs:452:8
+    |
+452 | pub fn provider_diagnostics_for_request(request: &MessageRequest) -> Vec<ProviderDiagnostic> {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `metadata_for_provider_kind` is never used
+   --> crates/api/src/providers/mod.rs:517:4
+    |
+517 | fn metadata_for_provider_kind(provider: ProviderKind) -> ProviderMetadata {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `provider_label` is never used
+   --> crates/api/src/providers/mod.rs:541:10
+    |
+541 | const fn provider_label(provider: ProviderKind) -> &'static str {
+    |          ^^^^^^^^^^^^^^
+
+warning: function `has_openai_tuning_parameters` is never used
+   --> crates/api/src/providers/mod.rs:550:4
+    |
+550 | fn has_openai_tuning_parameters(request: &MessageRequest) -> bool {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `declares_tool` is never used
+   --> crates/api/src/providers/mod.rs:558:4
+    |
+558 | fn declares_tool(request: &MessageRequest, tool_name: &str) -> bool {
+    |    ^^^^^^^^^^^^^
+
+warning: function `web_passthrough_diagnostic` is never used
+   --> crates/api/src/providers/mod.rs:567:4
+    |
+567 | fn web_passthrough_diagnostic(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `strip_routing_prefix` is never used
+   --> crates/api/src/providers/openai_compat.rs:901:4
+    |
+901 | fn strip_routing_prefix(model: &str) -> &str {
+    |    ^^^^^^^^^^^^^^^^^^^^
+
+warning: `api` (lib) generated 13 warnings
+    Checking tools v0.1.0 (/Users/bellman/Documents/Workspace/claw-code/rust/crates/tools)
+    Checking mock-anthropic-service v0.1.0 (/Users/bellman/Documents/Workspace/claw-code/rust/crates/mock-anthropic-service)
+    Checking compat-harness v0.1.0 (/Users/bellman/Documents/Workspace/claw-code/rust/crates/compat-harness)
+error[E0004]: non-exhaustive patterns: `&SlashCommand::Session { action: Some(_), target: None }` not covered
+    --> crates/rusty-claude-cli/src/main.rs:3823:11
+     |
+3823 |     match command {
+     |           ^^^^^^^ pattern `&SlashCommand::Session { action: Some(_), target: None }` not covered
+     |
+note: `SlashCommand` defined here
+    --> crates/commands/src/lib.rs:1040:1
+     |
+1040 | pub enum SlashCommand {
+     | ^^^^^^^^^^^^^^^^^^^^^
+...
+1089 |     Session {
+     |     ------- not covered
+     = note: the matched value is of type `&SlashCommand`
+help: ensure that all possible cases are being handled by adding a match arm with a wildcard pattern or an explicit pattern as shown
+     |
+4200 ~         | SlashCommand::AddDir { .. } => Err("unsupported resumed slash command".into()),
+4201 ~         &SlashCommand::Session { action: Some(_), target: None } => todo!(),
+     |
+
+For more information about this error, try `rustc --explain E0004`.
+error: could not compile `rusty-claude-cli` (bin "claw") due to 1 previous error
+== diff check ==
+G010 final leader verification completed 2026-05-15T02:18:11Z

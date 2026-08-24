@@ -4,6 +4,8 @@ use crate::types::StreamEvent;
 #[derive(Debug, Default)]
 pub struct SseParser {
     buffer: Vec<u8>,
+    provider: Option<String>,
+    model: Option<String>,
 }
 
 impl SseParser {
@@ -12,12 +14,23 @@ impl SseParser {
         Self::default()
     }
 
+    /// Attach the provider name and model to this parser so that JSON
+    /// deserialization failures within streamed frames carry enough context
+    /// for callers to understand which upstream produced the unparseable
+    /// payload.
+    #[must_use]
+    pub fn with_context(mut self, provider: impl Into<String>, model: impl Into<String>) -> Self {
+        self.provider = Some(provider.into());
+        self.model = Some(model.into());
+        self
+    }
+
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<StreamEvent>, ApiError> {
         self.buffer.extend_from_slice(chunk);
         let mut events = Vec::new();
 
         while let Some(frame) = self.next_frame() {
-            if let Some(event) = parse_frame(&frame)? {
+            if let Some(event) = self.parse_frame_with_context(&frame)? {
                 events.push(event);
             }
         }
@@ -31,10 +44,16 @@ impl SseParser {
         }
 
         let trailing = std::mem::take(&mut self.buffer);
-        match parse_frame(&String::from_utf8_lossy(&trailing))? {
+        match self.parse_frame_with_context(&String::from_utf8_lossy(&trailing))? {
             Some(event) => Ok(vec![event]),
             None => Ok(Vec::new()),
         }
+    }
+
+    fn parse_frame_with_context(&self, frame: &str) -> Result<Option<StreamEvent>, ApiError> {
+        let provider = self.provider.as_deref().unwrap_or("unknown");
+        let model = self.model.as_deref().unwrap_or("unknown");
+        parse_frame_with_provider(frame, provider, model)
     }
 
     fn next_frame(&mut self) -> Option<String> {
@@ -61,6 +80,14 @@ impl SseParser {
 }
 
 pub fn parse_frame(frame: &str) -> Result<Option<StreamEvent>, ApiError> {
+    parse_frame_with_provider(frame, "unknown", "unknown")
+}
+
+pub(crate) fn parse_frame_with_provider(
+    frame: &str,
+    provider: &str,
+    model: &str,
+) -> Result<Option<StreamEvent>, ApiError> {
     let trimmed = frame.trim();
     if trimmed.is_empty() {
         return Ok(None);
@@ -97,7 +124,7 @@ pub fn parse_frame(frame: &str) -> Result<Option<StreamEvent>, ApiError> {
 
     serde_json::from_str::<StreamEvent>(&payload)
         .map(Some)
-        .map_err(ApiError::from)
+        .map_err(|error| ApiError::json_deserialize(provider, model, &payload, error))
 }
 
 #[cfg(test)]
@@ -274,6 +301,30 @@ mod tests {
                     },
                 }
             ))
+        );
+    }
+
+    #[test]
+    fn given_message_delta_frame_with_empty_usage_when_parsed_then_usage_defaults_to_zero() {
+        // given
+        let frame = concat!(
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{}}\n\n"
+        );
+
+        // when
+        let event = parse_frame(frame).expect("frame should parse");
+
+        // then
+        assert_eq!(
+            event,
+            Some(StreamEvent::MessageDelta(crate::types::MessageDeltaEvent {
+                delta: MessageDelta {
+                    stop_reason: Some("end_turn".to_string()),
+                    stop_sequence: None,
+                },
+                usage: Usage::default(),
+            }))
         );
     }
 }

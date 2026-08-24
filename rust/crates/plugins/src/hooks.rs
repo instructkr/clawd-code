@@ -337,7 +337,28 @@ impl CommandWithStdin {
         let mut child = self.command.spawn()?;
         if let Some(mut child_stdin) = child.stdin.take() {
             use std::io::Write as _;
-            child_stdin.write_all(stdin)?;
+            // Tolerate BrokenPipe: a hook script that runs to completion
+            // (or exits early without reading stdin) closes its stdin
+            // before the parent finishes writing the JSON payload, and
+            // the kernel raises EPIPE on the parent's write_all. That is
+            // not a hook failure — the child still exited cleanly and we
+            // still need to wait_with_output() to capture stdout/stderr
+            // and the real exit code. Other write errors (e.g. EIO,
+            // permission, OOM) still propagate.
+            //
+            // This was the root cause of the Linux CI flake on
+            // hooks::tests::collects_and_runs_hooks_from_enabled_plugins
+            // (ROADMAP #25, runs 24120271422 / 24120538408 / 24121392171
+            // / 24121776826): the test hook scripts run in microseconds
+            // and the parent's stdin write races against child exit.
+            // macOS pipes happen to buffer the small payload before the
+            // child exits; Linux pipes do not, so the race shows up
+            // deterministically on ubuntu runners.
+            match child_stdin.write_all(stdin) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
+                Err(error) => return Err(error),
+            }
         }
         child.wait_with_output()
     }
@@ -359,6 +380,18 @@ mod tests {
         std::env::temp_dir().join(format!("plugins-hook-runner-{label}-{nanos}"))
     }
 
+    fn make_executable(path: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = fs::Permissions::from_mode(0o755);
+            fs::set_permissions(path, perms)
+                .unwrap_or_else(|e| panic!("chmod +x {}: {e}", path.display()));
+        }
+        #[cfg(not(unix))]
+        let _ = path;
+    }
+
     fn write_hook_plugin(
         root: &Path,
         name: &str,
@@ -368,21 +401,30 @@ mod tests {
     ) {
         fs::create_dir_all(root.join(".claude-plugin")).expect("manifest dir");
         fs::create_dir_all(root.join("hooks")).expect("hooks dir");
+
+        let pre_path = root.join("hooks").join("pre.sh");
         fs::write(
-            root.join("hooks").join("pre.sh"),
+            &pre_path,
             format!("#!/bin/sh\nprintf '%s\\n' '{pre_message}'\n"),
         )
         .expect("write pre hook");
+        make_executable(&pre_path);
+
+        let post_path = root.join("hooks").join("post.sh");
         fs::write(
-            root.join("hooks").join("post.sh"),
+            &post_path,
             format!("#!/bin/sh\nprintf '%s\\n' '{post_message}'\n"),
         )
         .expect("write post hook");
+        make_executable(&post_path);
+
+        let failure_path = root.join("hooks").join("failure.sh");
         fs::write(
-            root.join("hooks").join("failure.sh"),
+            &failure_path,
             format!("#!/bin/sh\nprintf '%s\\n' '{failure_message}'\n"),
         )
         .expect("write failure hook");
+        make_executable(&failure_path);
         fs::write(
             root.join(".claude-plugin").join("plugin.json"),
             format!(
@@ -495,5 +537,28 @@ mod tests {
             .messages()
             .iter()
             .any(|message| message == "later plugin hook"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn generated_hook_scripts_are_executable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // given
+        let root = temp_dir("exec-guard");
+        write_hook_plugin(&root, "exec-check", "pre", "post", "fail");
+
+        // then
+        for script in ["pre.sh", "post.sh", "failure.sh"] {
+            let path = root.join("hooks").join(script);
+            let mode = fs::metadata(&path)
+                .unwrap_or_else(|e| panic!("{script} metadata: {e}"))
+                .permissions()
+                .mode();
+            assert!(
+                mode & 0o111 != 0,
+                "{script} must have at least one execute bit set, got mode {mode:#o}"
+            );
+        }
     }
 }

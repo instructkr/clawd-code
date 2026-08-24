@@ -32,6 +32,10 @@ jobs:
             os: macos-14
             bin: claw
             artifact_name: claw-macos-arm64
+          - name: windows-x64
+            os: windows-latest
+            bin: claw.exe
+            artifact_name: claw-windows-x64.exe
     defaults:
       run:
         working-directory: rust
@@ -47,22 +51,27 @@ jobs:
       - name: Build release binary
         run: cargo build --release -p rusty-claude-cli
 
-      - name: Package artifact
+      - name: Package artifact and checksum
         shell: bash
         run: |
           mkdir -p dist
           cp "target/release/${{ matrix.bin }}" "dist/${{ matrix.artifact_name }}"
           chmod +x "dist/${{ matrix.artifact_name }}"
+          (cd dist && sha256sum "${{ matrix.artifact_name }}" > "${{ matrix.artifact_name }}.sha256")
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
-          path: rust/dist/${{ matrix.artifact_name }}
+          path: |
+            rust/dist/${{ matrix.artifact_name }}
+            rust/dist/${{ matrix.artifact_name }}.sha256
 
       - name: Upload release asset
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: rust/dist/${{ matrix.artifact_name }}
+          files: |
+            rust/dist/${{ matrix.artifact_name }}
+            rust/dist/${{ matrix.artifact_name }}.sha256
           fail_on_unmatched_files: true

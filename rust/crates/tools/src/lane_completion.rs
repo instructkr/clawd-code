@@ -56,12 +56,18 @@ pub(crate) fn detect_lane_completion(
     Some(LaneContext {
         lane_id: output.agent_id.clone(),
         green_level: 3, // Workspace green
+        green_contract_satisfied: true,
         branch_freshness: std::time::Duration::from_secs(0),
         blocker: LaneBlocker::None,
         review_status: ReviewStatus::Approved,
         diff_scope: runtime::DiffScope::Scoped,
         completed: true,
         reconciled: false,
+        retry_count: 0,
+        retry_limit: 1,
+        rebase_required: false,
+        stale_cleanup_required: false,
+        approval_token: None,
     })
 }
 
@@ -165,12 +171,18 @@ mod tests {
         let context = LaneContext {
             lane_id: "completed-lane".to_string(),
             green_level: 3,
+            green_contract_satisfied: true,
             branch_freshness: std::time::Duration::from_secs(0),
             blocker: LaneBlocker::None,
             review_status: ReviewStatus::Approved,
             diff_scope: DiffScope::Scoped,
             completed: true,
             reconciled: false,
+            retry_count: 0,
+            retry_limit: 1,
+            rebase_required: false,
+            stale_cleanup_required: false,
+            approval_token: None,
         };
 
         let actions = evaluate_completed_lane(&context);

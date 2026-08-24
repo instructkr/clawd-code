@@ -22,6 +22,8 @@ The harness runs these scripted scenarios against a fresh workspace and isolated
 8. `bash_permission_prompt_approved`
 9. `bash_permission_prompt_denied`
 10. `plugin_tool_roundtrip`
+11. `auto_compact_triggered`
+12. `token_cost_reporting`
 
 ## Run
 
@@ -37,7 +39,7 @@ cd rust/
 python3 scripts/run_mock_parity_diff.py
 ```
 
-Scenario-to-PARITY mappings live in `mock_parity_scenarios.json`.
+Scenario-to-PARITY mappings live in `mock_parity_scenarios.json`; keep this manifest aligned with `rust/crates/rusty-claude-cli/tests/mock_parity_harness.rs` and `PARITY.md` via `python3 scripts/run_mock_parity_diff.py --no-run`.
 
 ## Manual mock server
 

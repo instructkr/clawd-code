@@ -18,6 +18,12 @@ impl UpstreamPaths {
         }
     }
 
+    /// Returns the repository root path.
+    #[must_use]
+    pub fn repo_root(&self) -> &Path {
+        &self.repo_root
+    }
+
     #[must_use]
     pub fn from_workspace_dir(workspace_dir: impl AsRef<Path>) -> Self {
         let workspace_dir = workspace_dir

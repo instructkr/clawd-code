@@ -62,6 +62,25 @@ pub enum PluginState {
 
 impl PluginState {
     #[must_use]
+    pub fn startup_event(&self) -> Option<PluginLifecycleEvent> {
+        match self {
+            Self::Healthy => Some(PluginLifecycleEvent::StartupHealthy),
+            Self::Degraded { .. } => Some(PluginLifecycleEvent::StartupDegraded),
+            Self::Failed { .. } => Some(PluginLifecycleEvent::StartupFailed),
+            Self::Unconfigured
+            | Self::Validated
+            | Self::Starting
+            | Self::ShuttingDown
+            | Self::Stopped => None,
+        }
+    }
+
+    #[must_use]
+    pub fn is_startup_terminal(&self) -> bool {
+        self.startup_event().is_some()
+    }
+
+    #[must_use]
     pub fn from_servers(servers: &[ServerHealth]) -> Self {
         if servers.is_empty() {
             return Self::Failed {
@@ -122,6 +141,11 @@ pub struct PluginHealthcheck {
 }
 
 impl PluginHealthcheck {
+    #[must_use]
+    pub fn startup_event(&self) -> Option<PluginLifecycleEvent> {
+        self.state.startup_event()
+    }
+
     #[must_use]
     pub fn new(plugin_name: impl Into<String>, servers: Vec<ServerHealth>) -> Self {
         let state = PluginState::from_servers(&servers);
@@ -341,6 +365,41 @@ mod tests {
             description: Some(format!("{name} resource")),
             mime_type: Some("application/json".to_string()),
         }
+    }
+
+    #[test]
+    fn startup_event_maps_terminal_health_states() {
+        // given
+        let healthy =
+            PluginHealthcheck::new("healthy-plugin", vec![healthy_server("alpha", &["search"])]);
+        let degraded = PluginHealthcheck::new(
+            "degraded-plugin",
+            vec![
+                healthy_server("alpha", &["search"]),
+                failed_server("beta", &["write"], "connection refused"),
+            ],
+        );
+        let failed = PluginHealthcheck::new(
+            "failed-plugin",
+            vec![failed_server("beta", &["write"], "connection refused")],
+        );
+
+        // then
+        assert_eq!(
+            healthy.startup_event(),
+            Some(PluginLifecycleEvent::StartupHealthy)
+        );
+        assert_eq!(
+            degraded.startup_event(),
+            Some(PluginLifecycleEvent::StartupDegraded)
+        );
+        assert_eq!(
+            failed.startup_event(),
+            Some(PluginLifecycleEvent::StartupFailed)
+        );
+        assert!(healthy.state.is_startup_terminal());
+        assert_eq!(PluginState::Starting.startup_event(), None);
+        assert!(!PluginState::Starting.is_startup_terminal());
     }
 
     #[test]

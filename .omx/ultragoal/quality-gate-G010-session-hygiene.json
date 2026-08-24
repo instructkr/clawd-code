@@ -1,0 +1,32 @@
+{
+  "goal_id": "G010-session-hygiene",
+  "status": "passed",
+  "team": "g010-session-hygiene-e61d2271",
+  "team_phase": "complete",
+  "tasks": {"completed": 7, "failed": 0, "blocked": 0, "pending": 0, "in_progress": 0},
+  "evidence": [
+    ".omx/ultragoal/g010-final-quality-gate-rerun.log",
+    "docs/g010-clone-disambiguation-metadata.md",
+    "docs/g010-session-hygiene-verification-map.md",
+    ".omx/ultragoal/goals.json",
+    ".omx/ultragoal/ledger.jsonl"
+  ],
+  "verification_passed": [
+    "cargo fmt --manifest-path rust/Cargo.toml --all -- --check",
+    "cargo test --manifest-path rust/Cargo.toml -p runtime session_control -- --nocapture",
+    "cargo test --manifest-path rust/Cargo.toml -p runtime jsonl_persistence_redacts_and_truncates_oversized_payload_fields -- --nocapture",
+    "cargo test --manifest-path rust/Cargo.toml -p runtime compact -- --nocapture",
+    "cargo test --manifest-path rust/Cargo.toml -p commands parses_supported_slash_commands -- --nocapture",
+    "cargo test --manifest-path rust/Cargo.toml -p commands compacts_sessions_via_slash_command -- --nocapture",
+    "cargo test --manifest-path rust/Cargo.toml -p rusty-claude-cli --bin claw session_exists_resume_command_reports_json_contract -- --nocapture",
+    "cargo test --manifest-path rust/Cargo.toml -p rusty-claude-cli --bin claw resumed_session_exists_and_delete_have_json_contracts -- --nocapture",
+    "cargo test --manifest-path rust/Cargo.toml -p rusty-claude-cli --test resume_slash_commands -- --nocapture",
+    "cargo test --manifest-path rust/Cargo.toml -p rusty-claude-cli --test compact_output -- --nocapture",
+    "cargo check --manifest-path rust/Cargo.toml --workspace",
+    "git diff --check"
+  ],
+  "known_gaps": [
+    "full cargo test --workspace not run for G010",
+    "clippy -D warnings remains blocked by pre-existing unrelated lint debt noted in task 5/task 7 results"
+  ]
+}

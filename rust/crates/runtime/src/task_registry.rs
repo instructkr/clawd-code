@@ -14,6 +14,7 @@ use crate::{validate_packet, TaskPacket, TaskPacketValidationError};
 pub enum TaskStatus {
     Created,
     Running,
+    Blocked,
     Completed,
     Failed,
     Stopped,
@@ -24,6 +25,7 @@ impl std::fmt::Display for TaskStatus {
         match self {
             Self::Created => write!(f, "created"),
             Self::Running => write!(f, "running"),
+            Self::Blocked => write!(f, "blocked"),
             Self::Completed => write!(f, "completed"),
             Self::Failed => write!(f, "failed"),
             Self::Stopped => write!(f, "stopped"),
@@ -43,6 +45,54 @@ pub struct Task {
     pub messages: Vec<TaskMessage>,
     pub output: String,
     pub team_id: Option<String>,
+    pub heartbeat: Option<LaneHeartbeat>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LaneFreshness {
+    Healthy,
+    Stalled,
+    TransportDead,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaneHeartbeat {
+    pub observed_at: u64,
+    pub transport_alive: bool,
+    pub status: String,
+}
+
+impl LaneHeartbeat {
+    #[must_use]
+    pub fn freshness_at(&self, now: u64, stalled_after_secs: u64) -> LaneFreshness {
+        if !self.transport_alive {
+            return LaneFreshness::TransportDead;
+        }
+        if now.saturating_sub(self.observed_at) > stalled_after_secs {
+            return LaneFreshness::Stalled;
+        }
+        LaneFreshness::Healthy
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaneBoardEntry {
+    pub task_id: String,
+    pub prompt: String,
+    pub status: TaskStatus,
+    pub team_id: Option<String>,
+    pub heartbeat: Option<LaneHeartbeat>,
+    pub freshness: LaneFreshness,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaneBoard {
+    pub generated_at: u64,
+    pub active: Vec<LaneBoardEntry>,
+    pub blocked: Vec<LaneBoardEntry>,
+    pub finished: Vec<LaneBoardEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,11 +135,12 @@ impl TaskRegistry {
         packet: TaskPacket,
     ) -> Result<Task, TaskPacketValidationError> {
         let packet = validate_packet(packet)?.into_inner();
-        Ok(self.create_task(
-            packet.objective.clone(),
-            Some(packet.scope.clone()),
-            Some(packet),
-        ))
+        // Use scope_path as description if available, otherwise use scope as string
+        let description = packet
+            .scope_path
+            .clone()
+            .or_else(|| Some(packet.scope.to_string()));
+        Ok(self.create_task(packet.objective.clone(), description, Some(packet)))
     }
 
     fn create_task(
@@ -113,6 +164,7 @@ impl TaskRegistry {
             messages: Vec::new(),
             output: String::new(),
             team_id: None,
+            heartbeat: None,
         };
         inner.tasks.insert(task_id, task.clone());
         task
@@ -131,6 +183,67 @@ impl TaskRegistry {
             .filter(|t| status_filter.map_or(true, |s| t.status == s))
             .cloned()
             .collect()
+    }
+
+    pub fn update_heartbeat(&self, task_id: &str, heartbeat: LaneHeartbeat) -> Result<(), String> {
+        let mut inner = self.inner.lock().expect("registry lock poisoned");
+        let task = inner
+            .tasks
+            .get_mut(task_id)
+            .ok_or_else(|| format!("task not found: {task_id}"))?;
+        task.heartbeat = Some(heartbeat);
+        task.updated_at = now_secs();
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn lane_board(&self, stalled_after_secs: u64) -> LaneBoard {
+        let now = now_secs();
+        self.lane_board_at(now, stalled_after_secs)
+    }
+
+    #[must_use]
+    pub fn lane_board_at(&self, now: u64, stalled_after_secs: u64) -> LaneBoard {
+        let inner = self.inner.lock().expect("registry lock poisoned");
+        let mut board = LaneBoard {
+            generated_at: now,
+            active: Vec::new(),
+            blocked: Vec::new(),
+            finished: Vec::new(),
+        };
+
+        for task in inner.tasks.values() {
+            let freshness = task
+                .heartbeat
+                .as_ref()
+                .map_or(LaneFreshness::Unknown, |heartbeat| {
+                    heartbeat.freshness_at(now, stalled_after_secs)
+                });
+            let entry = LaneBoardEntry {
+                task_id: task.task_id.clone(),
+                prompt: task.prompt.clone(),
+                status: task.status,
+                team_id: task.team_id.clone(),
+                heartbeat: task.heartbeat.clone(),
+                freshness,
+            };
+
+            match task.status {
+                TaskStatus::Running | TaskStatus::Created => board.active.push(entry),
+                TaskStatus::Blocked => board.blocked.push(entry),
+                TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Stopped => {
+                    board.finished.push(entry);
+                }
+            }
+        }
+
+        board
+    }
+
+    #[must_use]
+    pub fn lane_status_json_at(&self, now: u64, stalled_after_secs: u64) -> serde_json::Value {
+        serde_json::to_value(self.lane_board_at(now, stalled_after_secs))
+            .expect("lane board should serialize")
     }
 
     pub fn stop(&self, task_id: &str) -> Result<Task, String> {
@@ -249,16 +362,30 @@ mod tests {
 
     #[test]
     fn creates_task_from_packet() {
+        use crate::task_packet::TaskScope;
         let registry = TaskRegistry::new();
         let packet = TaskPacket {
             objective: "Ship task packet support".to_string(),
-            scope: "runtime/task system".to_string(),
+            scope: TaskScope::Module,
+            scope_path: Some("runtime/task system".to_string()),
+            worktree: Some("/tmp/wt-task".to_string()),
             repo: "claw-code-parity".to_string(),
             branch_policy: "origin/main only".to_string(),
             acceptance_tests: vec!["cargo test --workspace".to_string()],
+            acceptance_criteria: vec!["task is inspectable".to_string()],
+            resources: vec![crate::TaskResource {
+                kind: "module".to_string(),
+                value: "runtime/task system".to_string(),
+            }],
+            model: Some("gpt-5.5".to_string()),
+            provider: Some("openai".to_string()),
+            permission_profile: Some("workspace-write".to_string()),
             commit_policy: "single commit".to_string(),
             reporting_contract: "print commit sha".to_string(),
+            reporting_targets: vec!["leader".to_string()],
             escalation_policy: "manual escalation".to_string(),
+            recovery_policy: Some("retry once".to_string()),
+            verification_plan: vec!["cargo test --workspace".to_string()],
         };
 
         let task = registry
@@ -337,6 +464,68 @@ mod tests {
     }
 
     #[test]
+    fn lane_board_groups_active_blocked_finished_and_reports_freshness() {
+        let registry = TaskRegistry::new();
+        let active = registry.create("active", None);
+        let blocked = registry.create("blocked", None);
+        let finished = registry.create("finished", None);
+
+        registry
+            .set_status(&active.task_id, TaskStatus::Running)
+            .expect("running status");
+        registry
+            .set_status(&blocked.task_id, TaskStatus::Blocked)
+            .expect("blocked status");
+        registry
+            .set_status(&finished.task_id, TaskStatus::Completed)
+            .expect("completed status");
+        registry
+            .update_heartbeat(
+                &active.task_id,
+                LaneHeartbeat {
+                    observed_at: 100,
+                    transport_alive: true,
+                    status: "running".to_string(),
+                },
+            )
+            .expect("heartbeat");
+        registry
+            .update_heartbeat(
+                &blocked.task_id,
+                LaneHeartbeat {
+                    observed_at: 10,
+                    transport_alive: true,
+                    status: "waiting".to_string(),
+                },
+            )
+            .expect("heartbeat");
+        registry
+            .update_heartbeat(
+                &finished.task_id,
+                LaneHeartbeat {
+                    observed_at: 100,
+                    transport_alive: false,
+                    status: "done".to_string(),
+                },
+            )
+            .expect("heartbeat");
+
+        let board = registry.lane_board_at(110, 30);
+
+        assert_eq!(board.active.len(), 1);
+        assert_eq!(board.active[0].freshness, LaneFreshness::Healthy);
+        assert_eq!(board.blocked.len(), 1);
+        assert_eq!(board.blocked[0].freshness, LaneFreshness::Stalled);
+        assert_eq!(board.finished.len(), 1);
+        assert_eq!(board.finished[0].freshness, LaneFreshness::TransportDead);
+
+        let json = registry.lane_status_json_at(110, 30);
+        assert_eq!(json["active"][0]["status"], "running");
+        assert_eq!(json["blocked"][0]["freshness"], "stalled");
+        assert_eq!(json["finished"][0]["freshness"], "transport_dead");
+    }
+
+    #[test]
     fn assigns_team_and_removes_task() {
         let registry = TaskRegistry::new();
         let task = registry.create("Team task", None);
@@ -371,6 +560,7 @@ mod tests {
         let cases = [
             (TaskStatus::Created, "created"),
             (TaskStatus::Running, "running"),
+            (TaskStatus::Blocked, "blocked"),
             (TaskStatus::Completed, "completed"),
             (TaskStatus::Failed, "failed"),
             (TaskStatus::Stopped, "stopped"),
@@ -388,6 +578,7 @@ mod tests {
             vec![
                 ("created".to_string(), "created"),
                 ("running".to_string(), "running"),
+                ("blocked".to_string(), "blocked"),
                 ("completed".to_string(), "completed"),
                 ("failed".to_string(), "failed"),
                 ("stopped".to_string(), "stopped"),
@@ -474,6 +665,7 @@ mod tests {
         assert!(task.messages.is_empty());
         assert!(task.output.is_empty());
         assert_eq!(task.team_id, None);
+        assert_eq!(task.heartbeat, None);
     }
 
     #[test]

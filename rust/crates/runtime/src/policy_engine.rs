@@ -1,8 +1,10 @@
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 pub type GreenLevel = u8;
 
-const STALE_BRANCH_THRESHOLD: Duration = Duration::from_secs(60 * 60);
+const STALE_BRANCH_THRESHOLD: Duration = Duration::from_hours(1);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyRule {
@@ -46,6 +48,11 @@ pub enum PolicyCondition {
     ReviewPassed,
     ScopedDiff,
     TimedOut { duration: Duration },
+    RetryAvailable,
+    RebaseRequired,
+    StaleCleanupRequired,
+    ApprovalTokenPresent,
+    ApprovalTokenMissing,
 }
 
 impl PolicyCondition {
@@ -58,7 +65,9 @@ impl PolicyCondition {
             Self::Or(conditions) => conditions
                 .iter()
                 .any(|condition| condition.matches(context)),
-            Self::GreenAt { level } => context.green_level >= *level,
+            Self::GreenAt { level } => {
+                context.green_contract_satisfied && context.green_level >= *level
+            }
             Self::StaleBranch => context.branch_freshness >= STALE_BRANCH_THRESHOLD,
             Self::StartupBlocked => context.blocker == LaneBlocker::Startup,
             Self::LaneCompleted => context.completed,
@@ -66,6 +75,11 @@ impl PolicyCondition {
             Self::ReviewPassed => context.review_status == ReviewStatus::Approved,
             Self::ScopedDiff => context.diff_scope == DiffScope::Scoped,
             Self::TimedOut { duration } => context.branch_freshness >= *duration,
+            Self::RetryAvailable => context.retry_count < context.retry_limit,
+            Self::RebaseRequired => context.rebase_required,
+            Self::StaleCleanupRequired => context.stale_cleanup_required,
+            Self::ApprovalTokenPresent => context.approval_token.is_some(),
+            Self::ApprovalTokenMissing => context.approval_token.is_none(),
         }
     }
 }
@@ -75,11 +89,15 @@ pub enum PolicyAction {
     MergeToDev,
     MergeForward,
     RecoverOnce,
+    Retry { reason: String },
+    Rebase { reason: String },
     Escalate { reason: String },
     CloseoutLane,
     CleanupSession,
+    CleanupStale { reason: String },
     Reconcile { reason: ReconcileReason },
     Notify { channel: String },
+    RequireApprovalToken { operation: String },
     Block { reason: String },
     Chain(Vec<PolicyAction>),
 }
@@ -130,16 +148,61 @@ pub enum DiffScope {
     Scoped,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalToken {
+    pub token_id: String,
+    pub operation: String,
+    pub granted_by: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyDecisionKind {
+    Retry,
+    Rebase,
+    Merge,
+    Escalate,
+    StaleCleanup,
+    ApprovalRequired,
+    Notify,
+    Block,
+    Closeout,
+    Reconcile,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyDecisionEvent {
+    pub lane_id: String,
+    pub rule_name: String,
+    pub priority: u32,
+    pub kind: PolicyDecisionKind,
+    pub explanation: String,
+    pub approval_token_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyEvaluation {
+    pub actions: Vec<PolicyAction>,
+    pub events: Vec<PolicyDecisionEvent>,
+}
+
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaneContext {
     pub lane_id: String,
     pub green_level: GreenLevel,
+    pub green_contract_satisfied: bool,
     pub branch_freshness: Duration,
     pub blocker: LaneBlocker,
     pub review_status: ReviewStatus,
     pub diff_scope: DiffScope,
     pub completed: bool,
     pub reconciled: bool,
+    pub retry_count: u32,
+    pub retry_limit: u32,
+    pub rebase_required: bool,
+    pub stale_cleanup_required: bool,
+    pub approval_token: Option<ApprovalToken>,
 }
 
 impl LaneContext {
@@ -156,12 +219,18 @@ impl LaneContext {
         Self {
             lane_id: lane_id.into(),
             green_level,
+            green_contract_satisfied: false,
             branch_freshness,
             blocker,
             review_status,
             diff_scope,
             completed,
             reconciled: false,
+            retry_count: 0,
+            retry_limit: 1,
+            rebase_required: false,
+            stale_cleanup_required: false,
+            approval_token: None,
         }
     }
 
@@ -171,13 +240,50 @@ impl LaneContext {
         Self {
             lane_id: lane_id.into(),
             green_level: 0,
+            green_contract_satisfied: false,
             branch_freshness: Duration::from_secs(0),
             blocker: LaneBlocker::None,
             review_status: ReviewStatus::Pending,
             diff_scope: DiffScope::Full,
             completed: true,
             reconciled: true,
+            retry_count: 0,
+            retry_limit: 1,
+            rebase_required: false,
+            stale_cleanup_required: false,
+            approval_token: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_green_contract_satisfied(mut self, satisfied: bool) -> Self {
+        self.green_contract_satisfied = satisfied;
+        self
+    }
+
+    #[must_use]
+    pub fn with_retry_state(mut self, retry_count: u32, retry_limit: u32) -> Self {
+        self.retry_count = retry_count;
+        self.retry_limit = retry_limit;
+        self
+    }
+
+    #[must_use]
+    pub fn with_rebase_required(mut self, required: bool) -> Self {
+        self.rebase_required = required;
+        self
+    }
+
+    #[must_use]
+    pub fn with_stale_cleanup_required(mut self, required: bool) -> Self {
+        self.stale_cleanup_required = required;
+        self
+    }
+
+    #[must_use]
+    pub fn with_approval_token(mut self, token: ApprovalToken) -> Self {
+        self.approval_token = Some(token);
+        self
     }
 }
 
@@ -202,17 +308,119 @@ impl PolicyEngine {
     pub fn evaluate(&self, context: &LaneContext) -> Vec<PolicyAction> {
         evaluate(self, context)
     }
+
+    #[must_use]
+    pub fn evaluate_with_events(&self, context: &LaneContext) -> PolicyEvaluation {
+        evaluate_with_events(self, context)
+    }
 }
 
 #[must_use]
 pub fn evaluate(engine: &PolicyEngine, context: &LaneContext) -> Vec<PolicyAction> {
+    evaluate_with_events(engine, context).actions
+}
+
+#[must_use]
+pub fn evaluate_with_events(engine: &PolicyEngine, context: &LaneContext) -> PolicyEvaluation {
     let mut actions = Vec::new();
+    let mut events = Vec::new();
     for rule in &engine.rules {
         if rule.matches(context) {
+            let before = actions.len();
             rule.action.flatten_into(&mut actions);
+            for action in &actions[before..] {
+                events.push(decision_event(rule, context, action));
+            }
         }
     }
-    actions
+    PolicyEvaluation { actions, events }
+}
+
+fn decision_event(
+    rule: &PolicyRule,
+    context: &LaneContext,
+    action: &PolicyAction,
+) -> PolicyDecisionEvent {
+    let (kind, explanation) = match action {
+        PolicyAction::MergeToDev | PolicyAction::MergeForward => (
+            PolicyDecisionKind::Merge,
+            format!(
+                "rule '{}' allows merge action for lane {}",
+                rule.name, context.lane_id
+            ),
+        ),
+        PolicyAction::RecoverOnce | PolicyAction::Retry { reason: _ } => (
+            PolicyDecisionKind::Retry,
+            format!(
+                "rule '{}' allows retry {}/{} for lane {}",
+                rule.name, context.retry_count, context.retry_limit, context.lane_id
+            ),
+        ),
+        PolicyAction::Rebase { reason } => (
+            PolicyDecisionKind::Rebase,
+            format!("rule '{}' requires rebase: {reason}", rule.name),
+        ),
+        PolicyAction::Escalate { reason } => (
+            PolicyDecisionKind::Escalate,
+            format!(
+                "rule '{}' escalates lane {}: {reason}",
+                rule.name, context.lane_id
+            ),
+        ),
+        PolicyAction::CleanupStale { reason } => (
+            PolicyDecisionKind::StaleCleanup,
+            format!("rule '{}' requests cleanup: {reason}", rule.name),
+        ),
+        PolicyAction::CleanupSession => (
+            PolicyDecisionKind::StaleCleanup,
+            format!("rule '{}' requests session cleanup", rule.name),
+        ),
+        PolicyAction::CloseoutLane => (
+            PolicyDecisionKind::Closeout,
+            format!("rule '{}' closes out lane {}", rule.name, context.lane_id),
+        ),
+        PolicyAction::Reconcile { reason } => (
+            PolicyDecisionKind::Reconcile,
+            format!(
+                "rule '{}' reconciles lane {}: {reason:?}",
+                rule.name, context.lane_id
+            ),
+        ),
+        PolicyAction::Notify { channel } => (
+            PolicyDecisionKind::Notify,
+            format!("rule '{}' notifies {channel}", rule.name),
+        ),
+        PolicyAction::RequireApprovalToken { operation } => (
+            PolicyDecisionKind::ApprovalRequired,
+            format!(
+                "rule '{}' requires approval token for {operation}",
+                rule.name
+            ),
+        ),
+        PolicyAction::Block { reason } => (
+            PolicyDecisionKind::Block,
+            format!(
+                "rule '{}' blocks lane {}: {reason}",
+                rule.name, context.lane_id
+            ),
+        ),
+        PolicyAction::Chain(_) => (
+            PolicyDecisionKind::Notify,
+            format!("rule '{}' expanded a chained action", rule.name),
+        ),
+    };
+
+    PolicyDecisionEvent {
+        lane_id: context.lane_id.clone(),
+        rule_name: rule.name.clone(),
+        priority: rule.priority,
+        kind,
+        explanation,
+        approval_token_id: context
+            .approval_token
+            .as_ref()
+            .map(|token| token.token_id.clone()),
+    }
 }
 
 #[cfg(test)]
@@ -220,8 +428,9 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        evaluate, DiffScope, LaneBlocker, LaneContext, PolicyAction, PolicyCondition, PolicyEngine,
-        PolicyRule, ReconcileReason, ReviewStatus, STALE_BRANCH_THRESHOLD,
+        evaluate, ApprovalToken, DiffScope, LaneBlocker, LaneContext, PolicyAction,
+        PolicyCondition, PolicyDecisionKind, PolicyEngine, PolicyRule, ReconcileReason,
+        ReviewStatus, STALE_BRANCH_THRESHOLD,
     };
 
     fn default_context() -> LaneContext {
@@ -257,13 +466,44 @@ mod tests {
             ReviewStatus::Approved,
             DiffScope::Scoped,
             false,
-        );
+        )
+        .with_green_contract_satisfied(true);
 
         // when
         let actions = engine.evaluate(&context);
 
         // then
         assert_eq!(actions, vec![PolicyAction::MergeToDev]);
+    }
+
+    #[test]
+    fn merge_rule_blocks_when_green_tests_lack_contract_provenance() {
+        // given
+        let engine = PolicyEngine::new(vec![PolicyRule::new(
+            "merge-to-dev",
+            PolicyCondition::And(vec![
+                PolicyCondition::GreenAt { level: 2 },
+                PolicyCondition::ScopedDiff,
+                PolicyCondition::ReviewPassed,
+            ]),
+            PolicyAction::MergeToDev,
+            20,
+        )]);
+        let context = LaneContext::new(
+            "lane-7",
+            3,
+            Duration::from_secs(5),
+            LaneBlocker::None,
+            ReviewStatus::Approved,
+            DiffScope::Scoped,
+            false,
+        );
+
+        // when
+        let actions = engine.evaluate(&context);
+
+        // then
+        assert!(actions.is_empty());
     }
 
     #[test]
@@ -468,7 +708,8 @@ mod tests {
             ReviewStatus::Pending,
             DiffScope::Full,
             false,
-        );
+        )
+        .with_green_contract_satisfied(true);
 
         // when
         let actions = engine.evaluate(&context);
@@ -486,6 +727,121 @@ mod tests {
                 PolicyAction::MergeForward,
                 PolicyAction::CleanupSession,
             ]
+        );
+    }
+
+    #[test]
+    #[allow(clippy::duration_suboptimal_units, clippy::too_many_lines)]
+    fn executable_decision_table_emits_retry_rebase_merge_escalate_cleanup_and_approval_events() {
+        let engine = PolicyEngine::new(vec![
+            PolicyRule::new(
+                "retry-available",
+                PolicyCondition::RetryAvailable,
+                PolicyAction::Retry {
+                    reason: "transient failure".to_string(),
+                },
+                1,
+            ),
+            PolicyRule::new(
+                "rebase-required",
+                PolicyCondition::RebaseRequired,
+                PolicyAction::Rebase {
+                    reason: "base branch moved".to_string(),
+                },
+                2,
+            ),
+            PolicyRule::new(
+                "stale-cleanup",
+                PolicyCondition::StaleCleanupRequired,
+                PolicyAction::CleanupStale {
+                    reason: "lease expired".to_string(),
+                },
+                3,
+            ),
+            PolicyRule::new(
+                "approval-required",
+                PolicyCondition::ApprovalTokenMissing,
+                PolicyAction::RequireApprovalToken {
+                    operation: "merge".to_string(),
+                },
+                4,
+            ),
+            PolicyRule::new(
+                "merge-approved",
+                PolicyCondition::And(vec![
+                    PolicyCondition::ApprovalTokenPresent,
+                    PolicyCondition::GreenAt { level: 2 },
+                    PolicyCondition::ScopedDiff,
+                    PolicyCondition::ReviewPassed,
+                ]),
+                PolicyAction::MergeToDev,
+                5,
+            ),
+            PolicyRule::new(
+                "retry-exhausted",
+                PolicyCondition::TimedOut {
+                    duration: Duration::from_secs(60),
+                },
+                PolicyAction::Escalate {
+                    reason: "lane timed out".to_string(),
+                },
+                6,
+            ),
+        ]);
+
+        let missing_token_context = LaneContext::new(
+            "lane-cc2",
+            2,
+            Duration::from_secs(90),
+            LaneBlocker::None,
+            ReviewStatus::Approved,
+            DiffScope::Scoped,
+            false,
+        )
+        .with_green_contract_satisfied(true)
+        .with_retry_state(0, 1)
+        .with_rebase_required(true)
+        .with_stale_cleanup_required(true);
+
+        let missing = engine.evaluate_with_events(&missing_token_context);
+        assert!(missing.actions.contains(&PolicyAction::Retry {
+            reason: "transient failure".to_string()
+        }));
+        assert!(missing.actions.contains(&PolicyAction::Rebase {
+            reason: "base branch moved".to_string()
+        }));
+        assert!(missing.actions.contains(&PolicyAction::CleanupStale {
+            reason: "lease expired".to_string()
+        }));
+        assert!(missing
+            .actions
+            .contains(&PolicyAction::RequireApprovalToken {
+                operation: "merge".to_string()
+            }));
+        assert!(missing.actions.contains(&PolicyAction::Escalate {
+            reason: "lane timed out".to_string()
+        }));
+        assert!(missing
+            .events
+            .iter()
+            .any(|event| event.kind == PolicyDecisionKind::ApprovalRequired
+                && event.explanation.contains("approval token")));
+
+        let approved_context = missing_token_context.with_approval_token(ApprovalToken {
+            token_id: "approval-123".to_string(),
+            operation: "merge".to_string(),
+            granted_by: "leader".to_string(),
+        });
+        let approved = engine.evaluate_with_events(&approved_context);
+        assert!(approved.actions.contains(&PolicyAction::MergeToDev));
+        let merge_event = approved
+            .events
+            .iter()
+            .find(|event| event.kind == PolicyDecisionKind::Merge)
+            .expect("merge event should be emitted");
+        assert_eq!(
+            merge_event.approval_token_id.as_deref(),
+            Some("approval-123")
         );
     }
 

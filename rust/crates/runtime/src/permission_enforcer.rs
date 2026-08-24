@@ -65,6 +65,40 @@ impl PermissionEnforcer {
         matches!(self.check(tool_name, input), EnforcementResult::Allowed)
     }
 
+    /// Check permission with an explicitly provided required mode.
+    /// Used when the required mode is determined dynamically (e.g., bash command classification).
+    pub fn check_with_required_mode(
+        &self,
+        tool_name: &str,
+        input: &str,
+        required_mode: PermissionMode,
+    ) -> EnforcementResult {
+        // When the active mode is Prompt, defer to the caller's interactive
+        // prompt flow rather than hard-denying.
+        if self.policy.active_mode() == PermissionMode::Prompt {
+            return EnforcementResult::Allowed;
+        }
+
+        let active_mode = self.policy.active_mode();
+
+        // Check if active mode meets the dynamically determined required mode
+        if active_mode >= required_mode {
+            return EnforcementResult::Allowed;
+        }
+
+        // Permission denied - active mode is insufficient
+        EnforcementResult::Denied {
+            tool: tool_name.to_owned(),
+            active_mode: active_mode.as_str().to_owned(),
+            required_mode: required_mode.as_str().to_owned(),
+            reason: format!(
+                "'{tool_name}' with input '{input}' requires '{}' permission, but current mode is '{}'",
+                required_mode.as_str(),
+                active_mode.as_str()
+            ),
+        }
+    }
+
     #[must_use]
     pub fn active_mode(&self) -> PermissionMode {
         self.policy.active_mode()
@@ -139,32 +173,112 @@ impl PermissionEnforcer {
     }
 }
 
-/// Simple workspace boundary check via string prefix.
+/// Workspace boundary check.
+///
+/// Resolves `.` and `..` components lexically *before* comparing against the
+/// workspace root, so that traversal sequences like `/workspace/../../etc`
+/// cannot escape the sandbox via a naive string prefix match. Normalization is
+/// lexical (it does not touch the filesystem) because the target path may not
+/// exist yet on a write, and we must not depend on CWD.
 fn is_within_workspace(path: &str, workspace_root: &str) -> bool {
-    let normalized = if path.starts_with('/') {
+    let combined = if path.starts_with('/') {
         path.to_owned()
     } else {
         format!("{workspace_root}/{path}")
     };
 
-    let root = if workspace_root.ends_with('/') {
-        workspace_root.to_owned()
+    let normalized = lexically_normalize(&combined);
+    let root = lexically_normalize(workspace_root);
+    let root_with_slash = if root.ends_with('/') {
+        root.clone()
     } else {
-        format!("{workspace_root}/")
+        format!("{root}/")
     };
 
-    normalized.starts_with(&root) || normalized == workspace_root.trim_end_matches('/')
+    normalized == root || normalized.starts_with(&root_with_slash)
+}
+
+/// Collapse `.` and `..` segments without consulting the filesystem.
+/// `..` that would climb above an absolute root is clamped at `/`, so the
+/// result can never be a prefix-match for a deeper workspace root.
+fn lexically_normalize(path: &str) -> String {
+    let is_absolute = path.starts_with('/');
+    let mut stack: Vec<&str> = Vec::new();
+    for component in path.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                stack.pop();
+            }
+            other => stack.push(other),
+        }
+    }
+    let joined = stack.join("/");
+    if is_absolute {
+        format!("/{joined}")
+    } else {
+        joined
+    }
 }
 
 /// Conservative heuristic: is this bash command read-only?
+///
+/// Hardening notes:
+/// - Any shell metacharacter that could chain, substitute, pipe, or redirect
+///   into a state-changing command rejects the whole line. This blocks
+///   `cat x; rm -rf y`, `cat x | sh`, `$(...)`, backticks, redirects, and
+///   subshells regardless of the leading token.
+/// - Language interpreters (`python`, `node`, `ruby`) and build drivers
+///   (`cargo`, `rustc`) are NOT read-only: they execute arbitrary code, so they
+///   are excluded from the allow-list.
+/// - `git` is allowed only for a known set of non-mutating subcommands.
+/// - `find` is rejected when it carries an action that can execute or delete.
+///
+/// Residual known gaps (documented, not yet closed): `sed`'s `w`/`e` script
+/// commands and `awk`'s `system()` can still mutate — these require quoting or
+/// metacharacters that the checks above usually catch, but a dedicated parser
+/// would be more robust. Tracked as follow-up.
 fn is_read_only_command(command: &str) -> bool {
-    let first_token = command
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .rsplit('/')
-        .next()
-        .unwrap_or("");
+    // Shell metacharacters that enable command chaining, substitution,
+    // piping, redirection, or subshells. Presence of any of these means we
+    // cannot reason about the command from its leading token alone.
+    const SHELL_METACHARS: &[char] = &[';', '|', '&', '$', '`', '>', '<', '(', ')', '{', '}', '\n'];
+    if command.contains(SHELL_METACHARS) {
+        return false;
+    }
+
+    let mut tokens = command.split_whitespace();
+    let first_token = tokens.next().unwrap_or("").rsplit('/').next().unwrap_or("");
+
+    // `git` is only read-only for a curated set of subcommands.
+    if first_token == "git" {
+        let subcommand = tokens.next().unwrap_or("");
+        return matches!(
+            subcommand,
+            "status"
+                | "log"
+                | "diff"
+                | "show"
+                | "branch"
+                | "rev-parse"
+                | "ls-files"
+                | "blame"
+                | "describe"
+                | "tag"
+                | "remote"
+        );
+    }
+
+    // `find` can execute or delete via actions; reject those forms.
+    if first_token == "find"
+        && (command.contains("-exec")
+            || command.contains("-execdir")
+            || command.contains("-delete")
+            || command.contains("-ok")
+            || command.contains("-fprintf"))
+    {
+        return false;
+    }
 
     matches!(
         first_token,
@@ -203,8 +317,6 @@ fn is_read_only_command(command: &str) -> bool {
             | "tr"
             | "cut"
             | "paste"
-            | "tee"
-            | "xargs"
             | "test"
             | "true"
             | "false"
@@ -223,18 +335,8 @@ fn is_read_only_command(command: &str) -> bool {
             | "tree"
             | "jq"
             | "yq"
-            | "python3"
-            | "python"
-            | "node"
-            | "ruby"
-            | "cargo"
-            | "rustc"
-            | "git"
-            | "gh"
     ) && !command.contains("-i ")
         && !command.contains("--in-place")
-        && !command.contains(" > ")
-        && !command.contains(" >> ")
 }
 
 #[cfg(test)]
@@ -339,6 +441,91 @@ mod tests {
         assert!(!is_read_only_command("rm file.txt"));
         assert!(!is_read_only_command("echo test > file.txt"));
         assert!(!is_read_only_command("sed -i 's/a/b/' file"));
+    }
+
+    // --- Hardening regression tests (#2: read-only bypasses) ---
+
+    #[test]
+    fn read_only_rejects_command_chaining() {
+        // A leading read-only token must not launder a trailing destructive one.
+        assert!(!is_read_only_command("cat foo; rm -rf bar"));
+        assert!(!is_read_only_command("cat foo && rm -rf bar"));
+        assert!(!is_read_only_command("ls || rm bar"));
+        assert!(!is_read_only_command("cat foo | sh"));
+        assert!(!is_read_only_command("echo `rm bar`"));
+        assert!(!is_read_only_command("echo $(rm bar)"));
+        assert!(!is_read_only_command("echo x>file")); // redirect without spaces
+    }
+
+    #[test]
+    fn read_only_rejects_interpreters_and_build_drivers() {
+        // These execute arbitrary code and are no longer read-only.
+        assert!(!is_read_only_command(
+            "python3 -c \"import os; os.system('rm -rf .')\""
+        ));
+        assert!(!is_read_only_command("python script.py"));
+        assert!(!is_read_only_command("node app.js"));
+        assert!(!is_read_only_command("ruby x.rb"));
+        assert!(!is_read_only_command("cargo run"));
+        assert!(!is_read_only_command("rustc evil.rs"));
+    }
+
+    #[test]
+    fn read_only_gates_git_subcommands() {
+        // Read-only git subcommands remain allowed...
+        assert!(is_read_only_command("git status"));
+        assert!(is_read_only_command("git diff HEAD~1"));
+        assert!(is_read_only_command("git show abc123"));
+        // ...but mutating/exfiltrating ones are rejected.
+        assert!(!is_read_only_command("git commit -m x"));
+        assert!(!is_read_only_command("git push origin main"));
+        assert!(!is_read_only_command("git reset --hard"));
+        assert!(!is_read_only_command("git clean -fd"));
+        assert!(!is_read_only_command("git config user.email a@b.c"));
+    }
+
+    #[test]
+    fn read_only_rejects_find_actions() {
+        assert!(is_read_only_command("find . -name Cargo.toml"));
+        assert!(!is_read_only_command("find . -delete"));
+        // -exec uses braces/semicolon which also trip the metachar guard,
+        // but the explicit action check is the primary defense.
+        assert!(!is_read_only_command("find . -execdir rm rf"));
+    }
+
+    // --- Hardening regression tests (#1: workspace path traversal) ---
+
+    #[test]
+    fn workspace_rejects_parent_traversal() {
+        assert!(!is_within_workspace(
+            "/workspace/../etc/passwd",
+            "/workspace"
+        ));
+        assert!(!is_within_workspace(
+            "/workspace/../../etc/crontab",
+            "/workspace"
+        ));
+        assert!(!is_within_workspace("../etc/passwd", "/workspace"));
+        assert!(!is_within_workspace(
+            "/workspace/sub/../../outside",
+            "/workspace"
+        ));
+        // Legitimate paths still resolve inside.
+        assert!(is_within_workspace(
+            "/workspace/./src/main.rs",
+            "/workspace"
+        ));
+        assert!(is_within_workspace(
+            "/workspace/src/../src/main.rs",
+            "/workspace"
+        ));
+    }
+
+    #[test]
+    fn workspace_write_denies_traversal_escape() {
+        let enforcer = make_enforcer(PermissionMode::WorkspaceWrite);
+        let result = enforcer.check_file_write("/workspace/../../etc/crontab", "/workspace");
+        assert!(matches!(result, EnforcementResult::Denied { .. }));
     }
 
     #[test]

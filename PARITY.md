@@ -8,7 +8,7 @@ Last updated: 2026-04-03
 - Requested 9-lane checkpoint: **All 9 lanes merged on `main`.**
 - Current `main` HEAD: `ee31e00` (stub implementations replaced with real AskUserQuestion + RemoteTrigger).
 - Repository stats at this checkpoint: **292 commits on `main` / 293 across all branches**, **9 crates**, **48,599 tracked Rust LOC**, **2,568 test LOC**, **3 authors**, date range **2026-03-31 → 2026-04-03**.
-- Mock parity harness stats: **10 scripted scenarios**, **19 captured `/v1/messages` requests** in `rust/crates/rusty-claude-cli/tests/mock_parity_harness.rs`.
+- Mock parity harness stats: **12 scripted scenarios**, **21 captured `/v1/messages` requests** in `rust/crates/rusty-claude-cli/tests/mock_parity_harness.rs`.
 
 ## Mock parity harness — milestone 1
 
@@ -23,6 +23,8 @@ Last updated: 2026-04-03
 - [x] Scripted permission prompt coverage: `bash_permission_prompt_approved`, `bash_permission_prompt_denied`
 - [x] Scripted plugin-path coverage: `plugin_tool_roundtrip`
 - [x] Behavioral diff/checklist runner: `rust/scripts/run_mock_parity_diff.py`
+- [x] Scripted session-compaction metadata coverage: `auto_compact_triggered`
+- [x] Scripted token/cost JSON coverage: `token_cost_reporting`
 
 ## Harness v2 behavioral checklist
 
@@ -172,8 +174,9 @@ Canonical scenario map: `rust/mock_parity_scenarios.json`
 
 - [ ] End-to-end MCP runtime lifecycle beyond the registry bridge now on `main`
 - [x] Output truncation (large stdout/file content)
-- [ ] Session compaction behavior matching
-- [ ] Token counting / cost tracking accuracy
+- [x] Session compaction behavior matching
+  - auto_compaction threshold from env
+- [x] Token counting / cost tracking accuracy
 - [x] Bash validation lane merged onto `main`
 - [ ] CI green on every commit
 

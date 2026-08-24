@@ -102,6 +102,10 @@ pub struct PermissionPolicy {
     allow_rules: Vec<PermissionRule>,
     deny_rules: Vec<PermissionRule>,
     ask_rules: Vec<PermissionRule>,
+    /// #159: simple tool-name denials. Tools in this list are unconditionally
+    /// denied regardless of permission mode, checked before the rule-based
+    /// deny/allow/ask evaluation.
+    denied_tools: Vec<String>,
 }
 
 impl PermissionPolicy {
@@ -113,6 +117,7 @@ impl PermissionPolicy {
             allow_rules: Vec::new(),
             deny_rules: Vec::new(),
             ask_rules: Vec::new(),
+            denied_tools: Vec::new(),
         }
     }
 
@@ -143,6 +148,12 @@ impl PermissionPolicy {
             .ask()
             .iter()
             .map(|rule| PermissionRule::parse(rule))
+            .collect();
+        // #94: normalize denied tool names to lowercase to match runtime convention
+        self.denied_tools = config
+            .denied_tools()
+            .iter()
+            .map(|t| t.to_lowercase())
             .collect();
         self
     }
@@ -179,6 +190,15 @@ impl PermissionPolicy {
         context: &PermissionContext,
         prompter: Option<&mut dyn PermissionPrompter>,
     ) -> PermissionOutcome {
+        // #159: check denied_tools before rule-based evaluation. Tools listed
+        // in the denied_tools config are unconditionally denied regardless of
+        // permission mode.
+        if self.denied_tools.iter().any(|t| t == tool_name) {
+            return PermissionOutcome::Deny {
+                reason: format!("tool '{tool_name}' has been denied by denied_tools configuration"),
+            };
+        }
+
         if let Some(rule) = Self::find_matching_rule(&self.deny_rules, tool_name, input) {
             return PermissionOutcome::Deny {
                 reason: format!(
@@ -360,7 +380,8 @@ impl PermissionRule {
                     let matcher = parse_rule_matcher(content);
                     return Self {
                         raw: trimmed.to_string(),
-                        tool_name: tool_name.to_string(),
+                        // #94: normalize tool name to lowercase to match runtime convention
+                        tool_name: tool_name.to_lowercase(),
                         matcher,
                     };
                 }
@@ -369,7 +390,8 @@ impl PermissionRule {
 
         Self {
             raw: trimmed.to_string(),
-            tool_name: trimmed.to_string(),
+            // #94: normalize tool name to lowercase to match runtime convention
+            tool_name: trimmed.to_lowercase(),
             matcher: PermissionRuleMatcher::Any,
         }
     }
@@ -571,6 +593,7 @@ mod tests {
             vec!["bash(git:*)".to_string()],
             vec!["bash(rm -rf:*)".to_string()],
             Vec::new(),
+            Vec::new(),
         );
         let policy = PermissionPolicy::new(PermissionMode::ReadOnly)
             .with_tool_requirement("bash", PermissionMode::DangerFullAccess)
@@ -587,11 +610,38 @@ mod tests {
     }
 
     #[test]
+    fn denied_tools_denies_listed_tools_unconditionally() {
+        let rules = RuntimePermissionRuleConfig::new(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec!["bash".to_string(), "write_file".to_string()],
+        );
+        let policy = PermissionPolicy::new(PermissionMode::Allow).with_permission_rules(&rules);
+
+        let result = policy.authorize("bash", "echo hello", None);
+        assert!(matches!(
+            result,
+            PermissionOutcome::Deny { reason } if reason.contains("denied_tools")
+        ));
+
+        let result = policy.authorize("write_file", "{}", None);
+        assert!(matches!(
+            result,
+            PermissionOutcome::Deny { reason } if reason.contains("denied_tools")
+        ));
+
+        let result = policy.authorize("read_file", "{}", None);
+        assert_eq!(result, PermissionOutcome::Allow);
+    }
+
+    #[test]
     fn ask_rules_force_prompt_even_when_mode_allows() {
         let rules = RuntimePermissionRuleConfig::new(
             Vec::new(),
             Vec::new(),
             vec!["bash(git:*)".to_string()],
+            Vec::new(),
         );
         let policy = PermissionPolicy::new(PermissionMode::DangerFullAccess)
             .with_tool_requirement("bash", PermissionMode::DangerFullAccess)
@@ -617,6 +667,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             vec!["bash(git:*)".to_string()],
+            Vec::new(),
         );
         let policy = PermissionPolicy::new(PermissionMode::ReadOnly)
             .with_tool_requirement("bash", PermissionMode::DangerFullAccess)

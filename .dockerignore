@@ -1,0 +1,17 @@
+# Keep docker build context small (Windows-friendly).
+.git
+.github
+**/target
+**/.claw-rag
+**/.claw
+**/.claude
+**/.cursor
+**/node_modules
+**/dist
+**/build
+**/*.log
+**/*.tmp
+**/*.sqlite
+**/*.sqlite-wal
+**/*.sqlite-shm
+**/.DS_Store

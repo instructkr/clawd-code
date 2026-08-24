@@ -9,12 +9,20 @@ on:
     paths:
       - .github/workflows/rust-ci.yml
       - .github/scripts/check_doc_source_of_truth.py
+      - .github/scripts/check_release_readiness.py
       - .github/FUNDING.yml
+      - CODE_OF_CONDUCT.md
+      - CONTRIBUTING.md
+      - LICENSE
       - README.md
+      - SECURITY.md
+      - SUPPORT.md
       - USAGE.md
       - PARITY.md
       - PHILOSOPHY.md
       - ROADMAP.md
+      - scripts/roadmap-*.sh
+      - tests/test_roadmap_helpers.py
       - docs/**
       - rust/**
   pull_request:
@@ -23,12 +31,20 @@ on:
     paths:
       - .github/workflows/rust-ci.yml
       - .github/scripts/check_doc_source_of_truth.py
+      - .github/scripts/check_release_readiness.py
       - .github/FUNDING.yml
+      - CODE_OF_CONDUCT.md
+      - CONTRIBUTING.md
+      - LICENSE
       - README.md
+      - SECURITY.md
+      - SUPPORT.md
       - USAGE.md
       - PARITY.md
       - PHILOSOPHY.md
       - ROADMAP.md
+      - scripts/roadmap-*.sh
+      - tests/test_roadmap_helpers.py
       - docs/**
       - rust/**
   workflow_dispatch:
@@ -58,6 +74,12 @@ jobs:
           python-version: "3.x"
       - name: Check docs and metadata for stale branding
         run: python .github/scripts/check_doc_source_of_truth.py
+      - name: Check release policy docs and local links
+        run: python .github/scripts/check_release_readiness.py
+      - name: Check ROADMAP ids
+        run: scripts/roadmap-check-ids.sh
+      - name: Check ROADMAP helper behavior
+        run: python -m unittest discover -s tests -p test_roadmap_helpers.py
 
   fmt:
     name: cargo fmt
@@ -98,3 +120,42 @@ jobs:
           workspaces: rust -> target
       - name: Run workspace clippy
         run: cargo clippy --workspace
+
+  windows-smoke:
+    name: windows PowerShell smoke
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: rust
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust -> target
+      - name: Build CLI for Windows smoke
+        run: cargo build -p rusty-claude-cli
+      - name: Smoke local commands without live credentials
+        env:
+          ANTHROPIC_API_KEY: ""
+          ANTHROPIC_AUTH_TOKEN: ""
+          OPENAI_API_KEY: ""
+          XAI_API_KEY: ""
+          DASHSCOPE_API_KEY: ""
+        run: |
+          $ErrorActionPreference = "Stop"
+          $env:CLAW_CONFIG_HOME = Join-Path $env:RUNNER_TEMP "claw config home"
+          New-Item -ItemType Directory -Force -Path $env:CLAW_CONFIG_HOME | Out-Null
+          $workspace = Join-Path $env:RUNNER_TEMP "claw path smoke"
+          New-Item -ItemType Directory -Force -Path $workspace | Out-Null
+          $claw = Join-Path $env:GITHUB_WORKSPACE "rust\target\debug\claw.exe"
+          Push-Location $workspace
+          try {
+            & $claw help
+            & $claw status
+            & $claw config env
+            & $claw doctor
+          } finally {
+            Pop-Location
+          }

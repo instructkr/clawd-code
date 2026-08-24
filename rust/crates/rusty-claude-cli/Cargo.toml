@@ -12,7 +12,6 @@ path = "src/main.rs"
 [dependencies]
 api = { path = "../api" }
 commands = { path = "../commands" }
-compat-harness = { path = "../compat-harness" }
 crossterm = "0.28"
 pulldown-cmark = "0.13"
 rustyline = "15"
@@ -23,6 +22,8 @@ serde_json.workspace = true
 syntect = "5"
 tokio = { version = "1", features = ["rt-multi-thread", "signal", "time"] }
 tools = { path = "../tools" }
+log = "0.4"
+
 
 [lints]
 workspace = true

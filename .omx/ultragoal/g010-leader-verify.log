@@ -1,0 +1,321 @@
+== fmt ==
+== runtime session_control ==
+   Compiling runtime v0.1.0 (/Users/bellman/Documents/Workspace/claw-code/rust/crates/runtime)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 10.29s
+     Running unittests src/lib.rs (rust/target/debug/deps/runtime-0e7d3d46ae40aa07)
+
+running 15 tests
+test session_control::tests::latest_session_prefers_semantic_updated_at_over_file_mtime ... ok
+test session_control::tests::session_store_from_cwd_canonicalizes_equivalent_paths ... ok
+test session_control::tests::session_store_create_and_load_round_trip ... ok
+test session_control::tests::session_exists_and_delete_are_scoped_to_workspace_store ... ok
+test session_control::tests::forks_session_into_managed_storage_with_lineage ... ok
+test session_control::tests::workspace_fingerprint_is_deterministic_and_differs_per_path ... ok
+test session_control::tests::session_store_from_cwd_isolates_sessions_by_workspace ... ok
+test session_control::tests::creates_and_lists_managed_sessions ... ok
+test session_control::tests::session_store_fork_stays_in_same_namespace ... ok
+test session_control::tests::session_store_from_data_dir_namespaces_by_workspace ... ok
+test session_control::tests::session_store_latest_and_resolve_reference ... ok
+test session_control::tests::session_store_loads_safe_legacy_session_from_same_workspace ... ok
+test session_control::tests::session_store_loads_unbound_legacy_session_from_same_workspace ... ok
+test session_control::tests::session_store_rejects_legacy_session_from_other_workspace ... ok
+test session_control::tests::resolves_latest_alias_and_loads_session_from_workspace_root ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 542 filtered out; finished in 0.02s
+
+     Running tests/g004_conformance.rs (rust/target/debug/deps/g004_conformance-90f36d1f871b6313)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/integration_tests.rs (rust/target/debug/deps/integration_tests-526d4f853fc590de)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s
+
+== runtime session jsonl/bloat ==
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.18s
+     Running unittests src/lib.rs (rust/target/debug/deps/runtime-0e7d3d46ae40aa07)
+
+running 8 tests
+test session::tests::rejects_jsonl_record_with_unknown_type ... ok
+test session::tests::rejects_jsonl_message_record_without_message_payload ... ok
+test session::tests::rejects_jsonl_record_without_type ... ok
+test session::tests::persists_assistant_thinking_block_round_trip_through_jsonl ... ok
+test session::tests::persists_and_restores_session_jsonl ... ok
+test conversation::tests::persists_conversation_turn_messages_to_jsonl_session ... ok
+test session::tests::appends_messages_to_persisted_jsonl_session ... ok
+test session::tests::jsonl_persistence_redacts_and_truncates_oversized_payload_fields ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 549 filtered out; finished in 0.04s
+
+     Running tests/g004_conformance.rs (rust/target/debug/deps/g004_conformance-90f36d1f871b6313)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/integration_tests.rs (rust/target/debug/deps/integration_tests-526d4f853fc590de)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s
+
+== runtime compact ==
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.12s
+     Running unittests src/lib.rs (rust/target/debug/deps/runtime-0e7d3d46ae40aa07)
+
+running 17 tests
+test compact::tests::formats_compact_summary_like_upstream ... ok
+test compact::tests::ignores_existing_compacted_summary_when_deciding_to_recompact ... ok
+test compact::tests::compaction_does_not_split_tool_use_tool_result_pair ... ok
+test compact::tests::leaves_small_sessions_unchanged ... ok
+test compact::tests::infers_pending_work_from_recent_messages ... ok
+test compact::tests::truncates_long_blocks_in_summary ... ok
+test conversation::tests::auto_compaction_threshold_defaults_and_parses_values ... ok
+test compact::tests::extracts_key_files_from_message_content ... ok
+test compact::tests::compacts_older_messages_into_a_system_summary ... ok
+test conversation::tests::compaction_health_probe_blocks_turn_when_tool_executor_is_broken ... ok
+test conversation::tests::skips_auto_compaction_below_threshold ... ok
+test conversation::tests::auto_compacts_when_cumulative_input_threshold_is_crossed ... ok
+test conversation::tests::compaction_health_probe_skips_empty_compacted_session ... ok
+test conversation::tests::compacts_session_after_turns ... ok
+test prompt::tests::displays_context_paths_compactly ... ok
+test compact::tests::keeps_previous_compacted_context_when_compacting_again ... ok
+test session::tests::persists_compaction_metadata ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 540 filtered out; finished in 0.01s
+
+     Running tests/g004_conformance.rs (rust/target/debug/deps/g004_conformance-90f36d1f871b6313)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/integration_tests.rs (rust/target/debug/deps/integration_tests-526d4f853fc590de)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s
+
+== cli resume_slash_commands ==
+   Compiling runtime v0.1.0 (/Users/bellman/Documents/Workspace/claw-code/rust/crates/runtime)
+   Compiling rusty-claude-cli v0.1.0 (/Users/bellman/Documents/Workspace/claw-code/rust/crates/rusty-claude-cli)
+   Compiling api v0.1.0 (/Users/bellman/Documents/Workspace/claw-code/rust/crates/api)
+   Compiling commands v0.1.0 (/Users/bellman/Documents/Workspace/claw-code/rust/crates/commands)
+warning: enum `ProviderWireProtocol` is never used
+  --> crates/api/src/providers/mod.rs:54:10
+   |
+54 | pub enum ProviderWireProtocol {
+   |          ^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: enum `ProviderFeatureSupport` is never used
+  --> crates/api/src/providers/mod.rs:61:10
+   |
+61 | pub enum ProviderFeatureSupport {
+   |          ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `ProviderCapabilityReport` is never constructed
+  --> crates/api/src/providers/mod.rs:68:12
+   |
+68 | pub struct ProviderCapabilityReport {
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: enum `ProviderDiagnosticSeverity` is never used
+  --> crates/api/src/providers/mod.rs:88:10
+   |
+88 | pub enum ProviderDiagnosticSeverity {
+   |          ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `ProviderDiagnostic` is never constructed
+  --> crates/api/src/providers/mod.rs:94:12
+   |
+94 | pub struct ProviderDiagnostic {
+   |            ^^^^^^^^^^^^^^^^^^
+
+warning: function `provider_capabilities_for_model` is never used
+   --> crates/api/src/providers/mod.rs:384:8
+    |
+384 | pub fn provider_capabilities_for_model(model: &str) -> ProviderCapabilityReport {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `provider_diagnostics_for_request` is never used
+   --> crates/api/src/providers/mod.rs:452:8
+    |
+452 | pub fn provider_diagnostics_for_request(request: &MessageRequest) -> Vec<ProviderDiagnostic> {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `metadata_for_provider_kind` is never used
+   --> crates/api/src/providers/mod.rs:517:4
+    |
+517 | fn metadata_for_provider_kind(provider: ProviderKind) -> ProviderMetadata {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `provider_label` is never used
+   --> crates/api/src/providers/mod.rs:541:10
+    |
+541 | const fn provider_label(provider: ProviderKind) -> &'static str {
+    |          ^^^^^^^^^^^^^^
+
+warning: function `has_openai_tuning_parameters` is never used
+   --> crates/api/src/providers/mod.rs:550:4
+    |
+550 | fn has_openai_tuning_parameters(request: &MessageRequest) -> bool {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `declares_tool` is never used
+   --> crates/api/src/providers/mod.rs:558:4
+    |
+558 | fn declares_tool(request: &MessageRequest, tool_name: &str) -> bool {
+    |    ^^^^^^^^^^^^^
+
+warning: function `web_passthrough_diagnostic` is never used
+   --> crates/api/src/providers/mod.rs:567:4
+    |
+567 | fn web_passthrough_diagnostic(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `strip_routing_prefix` is never used
+   --> crates/api/src/providers/openai_compat.rs:901:4
+    |
+901 | fn strip_routing_prefix(model: &str) -> &str {
+    |    ^^^^^^^^^^^^^^^^^^^^
+
+   Compiling tools v0.1.0 (/Users/bellman/Documents/Workspace/claw-code/rust/crates/tools)
+   Compiling mock-anthropic-service v0.1.0 (/Users/bellman/Documents/Workspace/claw-code/rust/crates/mock-anthropic-service)
+warning: `api` (lib) generated 13 warnings
+   Compiling compat-harness v0.1.0 (/Users/bellman/Documents/Workspace/claw-code/rust/crates/compat-harness)
+error[E0004]: non-exhaustive patterns: `&SlashCommand::Session { action: None, .. }` not covered
+    --> crates/rusty-claude-cli/src/main.rs:3794:11
+     |
+3794 |     match command {
+     |           ^^^^^^^ pattern `&SlashCommand::Session { action: None, .. }` not covered
+     |
+note: `SlashCommand` defined here
+    --> crates/commands/src/lib.rs:1040:1
+     |
+1040 | pub enum SlashCommand {
+     | ^^^^^^^^^^^^^^^^^^^^^
+...
+1089 |     Session {
+     |     ------- not covered
+     = note: the matched value is of type `&SlashCommand`
+help: ensure that all possible cases are being handled by adding a match arm with a wildcard pattern or an explicit pattern as shown
+     |
+4197 ~         | SlashCommand::AddDir { .. } => Err("unsupported resumed slash command".into()),
+4198 ~         &SlashCommand::Session { action: None, .. } => todo!(),
+     |
+
+For more information about this error, try `rustc --explain E0004`.
+error: could not compile `rusty-claude-cli` (bin "claw") due to 1 previous error
+== cli compact_output ==
+warning: enum `ProviderWireProtocol` is never used
+  --> crates/api/src/providers/mod.rs:54:10
+   |
+54 | pub enum ProviderWireProtocol {
+   |          ^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: enum `ProviderFeatureSupport` is never used
+  --> crates/api/src/providers/mod.rs:61:10
+   |
+61 | pub enum ProviderFeatureSupport {
+   |          ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `ProviderCapabilityReport` is never constructed
+  --> crates/api/src/providers/mod.rs:68:12
+   |
+68 | pub struct ProviderCapabilityReport {
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: enum `ProviderDiagnosticSeverity` is never used
+  --> crates/api/src/providers/mod.rs:88:10
+   |
+88 | pub enum ProviderDiagnosticSeverity {
+   |          ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `ProviderDiagnostic` is never constructed
+  --> crates/api/src/providers/mod.rs:94:12
+   |
+94 | pub struct ProviderDiagnostic {
+   |            ^^^^^^^^^^^^^^^^^^
+
+warning: function `provider_capabilities_for_model` is never used
+   --> crates/api/src/providers/mod.rs:384:8
+    |
+384 | pub fn provider_capabilities_for_model(model: &str) -> ProviderCapabilityReport {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `provider_diagnostics_for_request` is never used
+   --> crates/api/src/providers/mod.rs:452:8
+    |
+452 | pub fn provider_diagnostics_for_request(request: &MessageRequest) -> Vec<ProviderDiagnostic> {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `metadata_for_provider_kind` is never used
+   --> crates/api/src/providers/mod.rs:517:4
+    |
+517 | fn metadata_for_provider_kind(provider: ProviderKind) -> ProviderMetadata {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `provider_label` is never used
+   --> crates/api/src/providers/mod.rs:541:10
+    |
+541 | const fn provider_label(provider: ProviderKind) -> &'static str {
+    |          ^^^^^^^^^^^^^^
+
+warning: function `has_openai_tuning_parameters` is never used
+   --> crates/api/src/providers/mod.rs:550:4
+    |
+550 | fn has_openai_tuning_parameters(request: &MessageRequest) -> bool {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `declares_tool` is never used
+   --> crates/api/src/providers/mod.rs:558:4
+    |
+558 | fn declares_tool(request: &MessageRequest, tool_name: &str) -> bool {
+    |    ^^^^^^^^^^^^^
+
+warning: function `web_passthrough_diagnostic` is never used
+   --> crates/api/src/providers/mod.rs:567:4
+    |
+567 | fn web_passthrough_diagnostic(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `strip_routing_prefix` is never used
+   --> crates/api/src/providers/openai_compat.rs:901:4
+    |
+901 | fn strip_routing_prefix(model: &str) -> &str {
+    |    ^^^^^^^^^^^^^^^^^^^^
+
+warning: `api` (lib) generated 13 warnings
+   Compiling rusty-claude-cli v0.1.0 (/Users/bellman/Documents/Workspace/claw-code/rust/crates/rusty-claude-cli)
+error[E0004]: non-exhaustive patterns: `&SlashCommand::Session { action: None, .. }` not covered
+    --> crates/rusty-claude-cli/src/main.rs:3794:11
+     |
+3794 |     match command {
+     |           ^^^^^^^ pattern `&SlashCommand::Session { action: None, .. }` not covered
+     |
+note: `SlashCommand` defined here
+    --> crates/commands/src/lib.rs:1040:1
+     |
+1040 | pub enum SlashCommand {
+     | ^^^^^^^^^^^^^^^^^^^^^
+...
+1089 |     Session {
+     |     ------- not covered
+     = note: the matched value is of type `&SlashCommand`
+help: ensure that all possible cases are being handled by adding a match arm with a wildcard pattern or an explicit pattern as shown
+     |
+4197 ~         | SlashCommand::AddDir { .. } => Err("unsupported resumed slash command".into()),
+4198 ~         &SlashCommand::Session { action: None, .. } => todo!(),
+     |
+
+For more information about this error, try `rustc --explain E0004`.
+error: could not compile `rusty-claude-cli` (bin "claw") due to 1 previous error
+== diff check ==

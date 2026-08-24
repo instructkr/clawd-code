@@ -1,4 +1,5 @@
 use std::ffi::OsStr;
+use std::fmt::Write as FmtWrite;
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::{
@@ -10,8 +11,10 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
+use crate::config::{RuntimeFeatureConfig, RuntimeHookCommand, RuntimeHookConfig};
 use crate::permissions::PermissionOverride;
+
+const HOOK_PREVIEW_CHAR_LIMIT: usize = 160;
 
 pub type HookPermissionDecision = PermissionOverride;
 
@@ -179,7 +182,7 @@ impl HookRunner {
     ) -> HookRunResult {
         Self::run_commands(
             HookEvent::PreToolUse,
-            self.config.pre_tool_use(),
+            self.config.pre_tool_use_entries(),
             tool_name,
             tool_input,
             None,
@@ -229,7 +232,7 @@ impl HookRunner {
     ) -> HookRunResult {
         Self::run_commands(
             HookEvent::PostToolUse,
-            self.config.post_tool_use(),
+            self.config.post_tool_use_entries(),
             tool_name,
             tool_input,
             Some(tool_output),
@@ -279,7 +282,7 @@ impl HookRunner {
     ) -> HookRunResult {
         Self::run_commands(
             HookEvent::PostToolUseFailure,
-            self.config.post_tool_use_failure(),
+            self.config.post_tool_use_failure_entries(),
             tool_name,
             tool_input,
             Some(tool_error),
@@ -309,7 +312,7 @@ impl HookRunner {
     #[allow(clippy::too_many_arguments)]
     fn run_commands(
         event: HookEvent,
-        commands: &[String],
+        commands: &[RuntimeHookCommand],
         tool_name: &str,
         tool_input: &str,
         tool_output: Option<&str>,
@@ -339,17 +342,21 @@ impl HookRunner {
         let payload = hook_payload(event, tool_name, tool_input, tool_output, is_error).to_string();
         let mut result = HookRunResult::allow(Vec::new());
 
-        for command in commands {
+        for command in commands
+            .iter()
+            .filter(|command| command.matches_tool(tool_name))
+        {
+            let command_text = command.command();
             if let Some(reporter) = reporter.as_deref_mut() {
                 reporter.on_event(&HookProgressEvent::Started {
                     event,
                     tool_name: tool_name.to_string(),
-                    command: command.clone(),
+                    command: command_text.to_string(),
                 });
             }
 
             match Self::run_command(
-                command,
+                command_text,
                 event,
                 tool_name,
                 tool_input,
@@ -363,7 +370,7 @@ impl HookRunner {
                         reporter.on_event(&HookProgressEvent::Completed {
                             event,
                             tool_name: tool_name.to_string(),
-                            command: command.clone(),
+                            command: command_text.to_string(),
                         });
                     }
                     merge_parsed_hook_output(&mut result, parsed);
@@ -373,7 +380,7 @@ impl HookRunner {
                         reporter.on_event(&HookProgressEvent::Completed {
                             event,
                             tool_name: tool_name.to_string(),
-                            command: command.clone(),
+                            command: command_text.to_string(),
                         });
                     }
                     merge_parsed_hook_output(&mut result, parsed);
@@ -385,7 +392,7 @@ impl HookRunner {
                         reporter.on_event(&HookProgressEvent::Completed {
                             event,
                             tool_name: tool_name.to_string(),
-                            command: command.clone(),
+                            command: command_text.to_string(),
                         });
                     }
                     merge_parsed_hook_output(&mut result, parsed);
@@ -397,7 +404,7 @@ impl HookRunner {
                         reporter.on_event(&HookProgressEvent::Cancelled {
                             event,
                             tool_name: tool_name.to_string(),
-                            command: command.clone(),
+                            command: command_text.to_string(),
                         });
                     }
                     result.cancelled = true;
@@ -437,7 +444,7 @@ impl HookRunner {
             Ok(CommandExecution::Finished(output)) => {
                 let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                let parsed = parse_hook_output(&stdout);
+                let parsed = parse_hook_output(event, tool_name, command, &stdout, &stderr);
                 let primary_message = parsed.primary_message().map(ToOwned::to_owned);
                 match output.status.code() {
                     Some(0) => {
@@ -532,16 +539,54 @@ fn merge_parsed_hook_output(target: &mut HookRunResult, parsed: ParsedHookOutput
     }
 }
 
-fn parse_hook_output(stdout: &str) -> ParsedHookOutput {
+fn parse_hook_output(
+    event: HookEvent,
+    tool_name: &str,
+    command: &str,
+    stdout: &str,
+    stderr: &str,
+) -> ParsedHookOutput {
     if stdout.is_empty() {
         return ParsedHookOutput::default();
     }
 
-    let Ok(Value::Object(root)) = serde_json::from_str::<Value>(stdout) else {
-        return ParsedHookOutput {
-            messages: vec![stdout.to_string()],
-            ..ParsedHookOutput::default()
-        };
+    let root = match serde_json::from_str::<Value>(stdout) {
+        Ok(Value::Object(root)) => root,
+        Ok(value) => {
+            return ParsedHookOutput {
+                messages: vec![format_invalid_hook_output(
+                    event,
+                    tool_name,
+                    command,
+                    &format!(
+                        "expected top-level JSON object, got {}",
+                        json_type_name(&value)
+                    ),
+                    stdout,
+                    stderr,
+                )],
+                ..ParsedHookOutput::default()
+            };
+        }
+        Err(error) if looks_like_json_attempt(stdout) => {
+            return ParsedHookOutput {
+                messages: vec![format_invalid_hook_output(
+                    event,
+                    tool_name,
+                    command,
+                    &error.to_string(),
+                    stdout,
+                    stderr,
+                )],
+                ..ParsedHookOutput::default()
+            };
+        }
+        Err(_) => {
+            return ParsedHookOutput {
+                messages: vec![stdout.to_string()],
+                ..ParsedHookOutput::default()
+            };
+        }
     };
 
     let mut parsed = ParsedHookOutput::default();
@@ -619,6 +664,69 @@ fn parse_tool_input(tool_input: &str) -> Value {
     serde_json::from_str(tool_input).unwrap_or_else(|_| json!({ "raw": tool_input }))
 }
 
+fn format_invalid_hook_output(
+    event: HookEvent,
+    tool_name: &str,
+    command: &str,
+    detail: &str,
+    stdout: &str,
+    stderr: &str,
+) -> String {
+    let stdout_preview = bounded_hook_preview(stdout).unwrap_or_else(|| "<empty>".to_string());
+    let stderr_preview = bounded_hook_preview(stderr).unwrap_or_else(|| "<empty>".to_string());
+    let command_preview = bounded_hook_preview(command).unwrap_or_else(|| "<empty>".to_string());
+
+    format!(
+        "hook_invalid_json: phase={} tool={} command={} detail={} stdout_preview={} stderr_preview={}",
+        event.as_str(),
+        tool_name,
+        command_preview,
+        detail,
+        stdout_preview,
+        stderr_preview
+    )
+}
+
+fn bounded_hook_preview(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut preview = String::new();
+    for (count, ch) in trimmed.chars().enumerate() {
+        if count == HOOK_PREVIEW_CHAR_LIMIT {
+            preview.push('…');
+            break;
+        }
+        match ch {
+            '\n' => preview.push_str("\\n"),
+            '\r' => preview.push_str("\\r"),
+            '\t' => preview.push_str("\\t"),
+            control if control.is_control() => {
+                let _ = write!(&mut preview, "\\u{{{:x}}}", control as u32);
+            }
+            _ => preview.push(ch),
+        }
+    }
+    Some(preview)
+}
+
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+fn looks_like_json_attempt(value: &str) -> bool {
+    matches!(value.trim_start().chars().next(), Some('{' | '['))
+}
+
 fn format_hook_failure(command: &str, code: i32, stdout: Option<&str>, stderr: &str) -> String {
     let mut message = format!("Hook `{command}` exited with status {code}");
     if let Some(stdout) = stdout.filter(|stdout| !stdout.is_empty()) {
@@ -633,7 +741,7 @@ fn format_hook_failure(command: &str, code: i32, stdout: Option<&str>, stderr: &
 
 fn shell_command(command: &str) -> CommandWithStdin {
     #[cfg(windows)]
-    let mut command_builder = {
+    let command_builder = {
         let mut command_builder = Command::new("cmd");
         command_builder.arg("/C").arg(command);
         CommandWithStdin::new(command_builder)
@@ -721,7 +829,7 @@ mod tests {
         HookAbortSignal, HookEvent, HookProgressEvent, HookProgressReporter, HookRunResult,
         HookRunner,
     };
-    use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
+    use crate::config::{RuntimeFeatureConfig, RuntimeHookCommand, RuntimeHookConfig};
     use crate::permissions::PermissionOverride;
 
     struct RecordingReporter {
@@ -745,6 +853,37 @@ mod tests {
         let result = runner.run_pre_tool_use("Read", r#"{"path":"README.md"}"#);
 
         assert_eq!(result, HookRunResult::allow(vec!["pre ok".to_string()]));
+    }
+
+    #[test]
+    fn object_style_hook_matchers_filter_runtime_execution() {
+        let runner = HookRunner::new(RuntimeHookConfig::from_hook_commands(
+            vec![
+                RuntimeHookCommand::new(shell_snippet("printf 'legacy'")),
+                RuntimeHookCommand::with_matcher(
+                    shell_snippet("printf 'bash only'"),
+                    Some("Bash".to_string()),
+                ),
+                RuntimeHookCommand::with_matcher(
+                    shell_snippet("printf 'read only'"),
+                    Some("Read*".to_string()),
+                ),
+            ],
+            Vec::new(),
+            Vec::new(),
+        ));
+
+        let read_result = runner.run_pre_tool_use("ReadFile", r#"{"path":"README.md"}"#);
+        let bash_result = runner.run_pre_tool_use("Bash", r#"{"command":"pwd"}"#);
+
+        assert_eq!(
+            read_result,
+            HookRunResult::allow(vec!["legacy".to_string(), "read only".to_string()])
+        );
+        assert_eq!(
+            bash_result,
+            HookRunResult::allow(vec!["legacy".to_string(), "bash only".to_string()])
+        );
     }
 
     #[test]
@@ -933,6 +1072,31 @@ mod tests {
             .iter()
             .any(|message| message.contains("broken")));
         assert!(!result.messages().iter().any(|message| message == "later"));
+    }
+
+    #[test]
+    fn malformed_nonempty_hook_output_reports_explicit_diagnostic_with_previews() {
+        let runner = HookRunner::new(RuntimeHookConfig::new(
+            vec![shell_snippet(
+                "printf '{not-json\nsecond line'; printf 'stderr warning' >&2; exit 1",
+            )],
+            Vec::new(),
+            Vec::new(),
+        ));
+
+        let result = runner.run_pre_tool_use("Edit", r#"{"file":"src/lib.rs"}"#);
+
+        assert!(result.is_failed());
+        let rendered = result.messages().join("\n");
+        assert!(rendered.contains("hook_invalid_json:"));
+        assert!(rendered.contains("phase=PreToolUse"));
+        assert!(rendered.contains("tool=Edit"));
+        assert!(rendered.contains("command=printf '{not-json"));
+        assert!(rendered.contains("printf 'stderr warning' >&2; exit 1"));
+        assert!(rendered.contains("detail=key must be a string"));
+        assert!(rendered.contains("stdout_preview={not-json"));
+        assert!(rendered.contains("second line stderr_preview=stderr warning"));
+        assert!(rendered.contains("stderr_preview=stderr warning"));
     }
 
     #[test]

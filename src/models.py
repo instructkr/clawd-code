@@ -23,6 +23,7 @@ class PortingModule:
 class PermissionDenial:
     tool_name: str
     reason: str
+    status: str = 'blocked'
 
 
 @dataclass(frozen=True)

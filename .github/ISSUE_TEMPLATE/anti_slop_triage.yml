@@ -1,0 +1,54 @@
+name: Anti-slop triage
+about: Classify low-signal, duplicate, generated, or unsafe reports before engineering work starts.
+title: "triage: "
+labels: ["needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form for issue intake that needs evidence-backed classification before anyone closes, fixes, or escalates it.
+        Do not paste secrets, live tokens, private logs, or non-public customer data.
+  - type: dropdown
+    id: classification
+    attributes:
+      label: Initial classification
+      description: Pick the strongest current classification. Update it if evidence changes.
+      options:
+        - actionable-bug
+        - actionable-docs
+        - actionable-feature
+        - duplicate
+        - spam-or-promotion
+        - generated-slop-or-hallucinated
+        - unsafe-or-security-sensitive
+        - not-reproducible-yet
+        - externally-blocked
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence
+      description: Link the PR, issue, command output, docs page, reproduction, duplicate, or policy that supports the classification.
+      placeholder: "Evidence: ..."
+    validations:
+      required: true
+  - type: textarea
+    id: safe_next_action
+    attributes:
+      label: Safe next action
+      description: State the next non-destructive action. If closure or merge is proposed, name the required owner/gate.
+      placeholder: "Next action: label only / request repro / link duplicate / fix docs / defer with rationale / owner review required"
+    validations:
+      required: true
+  - type: checkboxes
+    id: guardrails
+    attributes:
+      label: Guardrails
+      options:
+        - label: I did not close, merge, or mutate remote state as part of this triage-only report.
+          required: true
+        - label: I checked for duplicates or related PRs/issues before recommending action.
+          required: true
+        - label: If this touches credentials, security, or private data, I avoided public reproduction details and routed to the appropriate private/security path.
+          required: true

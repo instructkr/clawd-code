@@ -220,15 +220,14 @@ pub fn build_linux_sandbox_command(
         return None;
     }
 
-    let mut args = vec![
-        "--user".to_string(),
-        "--map-root-user".to_string(),
-        "--mount".to_string(),
-        "--ipc".to_string(),
-        "--pid".to_string(),
-        "--uts".to_string(),
-        "--fork".to_string(),
-    ];
+    let mut args: Vec<String> = working_unshare_mapping()
+        .unwrap_or(UNSHARE_MAPPING_CANDIDATES[0])
+        .iter()
+        .map(|arg| arg.to_string())
+        .collect();
+    // The candidates already carry the namespace flags, so the probe and the
+    // launcher share a single argument shape; only the opt-in `--net` is
+    // added here.
     if status.network_active {
         args.push("--net".to_string());
     }
@@ -282,6 +281,82 @@ fn command_exists(command: &str) -> bool {
         .is_some_and(|paths| env::split_paths(&paths).any(|path| path.join(command).exists()))
 }
 
+/// Candidate `unshare` user-namespace mapping options, in preference order.
+///
+/// Most systems accept `--map-root-user` alone. Some hardened containers and
+/// seccomp profiles block unprivileged writes to `/proc/self/uid_map`; there,
+/// util-linux delegates to the setuid `newuidmap`/`newgidmap` helpers when
+/// `--map-auto` is also present.
+///
+/// That fallback therefore depends on the setuid helpers (the `uidmap`
+/// package on Debian/Ubuntu) and on the current user having a range in
+/// `/etc/subuid` and `/etc/subgid`. When either is missing, `--map-auto`
+/// fails and the startup probe rejects the candidate, keeping the plain form.
+///
+/// Each candidate is the **complete** static argument shape the launcher
+/// uses (see `build_linux_sandbox_command`): mapping flags followed by the
+/// namespace flags `--mount --ipc --pid --uts --fork`. The startup probe
+/// runs each candidate verbatim (plus a trivial program), so probe success
+/// implies launch success: on systems where the mapping works but the
+/// namespace flags are denied (e.g. AppArmor-restricted CI runners that
+/// block mount propagation in user namespaces), the probe fails and the
+/// sandbox stays disabled instead of activating a launcher that always
+/// errors.
+///
+/// `--net` is intentionally absent: it is appended only when network
+/// isolation is active (the non-default path), and probing with it would
+/// disable the sandbox on hosts that block network-namespace creation (e.g.
+/// Docker's default seccomp profile) even when network isolation is never
+/// requested.
+const UNSHARE_MAPPING_CANDIDATES: &[&[&str]] = &[
+    &[
+        "--user",
+        "--map-root-user",
+        "--mount",
+        "--ipc",
+        "--pid",
+        "--uts",
+        "--fork",
+    ],
+    &[
+        "--user",
+        "--map-root-user",
+        "--map-auto",
+        "--mount",
+        "--ipc",
+        "--pid",
+        "--uts",
+        "--fork",
+    ],
+];
+
+/// Probe a candidate `unshare` mapping invocation with a trivial program.
+fn unshare_probe(args: &[&str]) -> bool {
+    std::process::Command::new("unshare")
+        .args(args)
+        .arg("true")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// The first mapping option set that works on this machine, if any.
+///
+/// Probes are cached for the process lifetime; a missing `unshare` binary or a
+/// kernel that refuses every mapping yields `None`.
+fn working_unshare_mapping() -> Option<&'static [&'static str]> {
+    use std::sync::OnceLock;
+    static MAPPING: OnceLock<Option<&'static [&'static str]>> = OnceLock::new();
+    *MAPPING.get_or_init(|| {
+        UNSHARE_MAPPING_CANDIDATES
+            .iter()
+            .copied()
+            .find(|args| unshare_probe(args))
+    })
+}
+
 /// Check whether `unshare --user` actually works on this system.
 /// On some CI environments (e.g. GitHub Actions), the binary exists but
 /// user namespaces are restricted, causing silent failures.
@@ -292,14 +367,7 @@ fn unshare_user_namespace_works() -> bool {
         if !command_exists("unshare") {
             return false;
         }
-        std::process::Command::new("unshare")
-            .args(["--user", "--map-root-user", "true"])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+        working_unshare_mapping().is_some()
     })
 }
 
@@ -358,6 +426,52 @@ mod tests {
         assert!(request.network_isolation);
         assert_eq!(request.filesystem_mode, FilesystemIsolationMode::AllowList);
         assert_eq!(request.allowed_mounts, vec!["tmp"]);
+    }
+
+    #[test]
+    fn mapping_candidates_prefer_plain_root_mapping() {
+        assert!(!super::UNSHARE_MAPPING_CANDIDATES.is_empty());
+        for candidate in super::UNSHARE_MAPPING_CANDIDATES {
+            // Mapping flags.
+            assert!(candidate.contains(&"--user"));
+            assert!(candidate.contains(&"--map-root-user"));
+            // Namespace flags the real launcher appends — the probe must
+            // exercise the full invocation shape, not just mapping flags.
+            assert!(candidate.contains(&"--mount"));
+            assert!(candidate.contains(&"--ipc"));
+            assert!(candidate.contains(&"--pid"));
+            assert!(candidate.contains(&"--uts"));
+            assert!(candidate.contains(&"--fork"));
+        }
+        // The plain form must be tried first; `--map-auto` is only a fallback
+        // for kernels/containers that block unprivileged uid_map writes.
+        assert_eq!(
+            super::UNSHARE_MAPPING_CANDIDATES[0],
+            &[
+                "--user",
+                "--map-root-user",
+                "--mount",
+                "--ipc",
+                "--pid",
+                "--uts",
+                "--fork",
+            ]
+        );
+        // The second candidate inserts `--map-auto` in the position util-linux
+        // expects (after `--map-root-user`, before the namespace flags).
+        assert_eq!(
+            super::UNSHARE_MAPPING_CANDIDATES[1],
+            &[
+                "--user",
+                "--map-root-user",
+                "--map-auto",
+                "--mount",
+                "--ipc",
+                "--pid",
+                "--uts",
+                "--fork",
+            ]
+        );
     }
 
     #[test]

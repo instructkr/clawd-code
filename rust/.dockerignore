@@ -1,0 +1,15 @@
+# This .dockerignore applies to docker-compose build context: ./rust
+target
+**/target
+.claw
+.claw-rag
+.claude
+node_modules
+dist
+build
+*.log
+*.tmp
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+.DS_Store

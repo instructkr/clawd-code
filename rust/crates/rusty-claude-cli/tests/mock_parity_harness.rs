@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -183,17 +183,24 @@ fn clean_env_cli_reaches_mock_anthropic_service_across_scripted_parity_scenarios
     }
 
     let captured = runtime.block_on(server.captured_requests());
-    assert_eq!(
-        captured.len(),
-        21,
-        "twelve scenarios should produce twenty-one requests"
-    );
-    assert!(captured
+    // After `be561bf` added count_tokens preflight, each turn sends an
+    // extra POST to `/v1/messages/count_tokens` before the messages POST.
+    // The original count (21) assumed messages-only requests.  We now
+    // filter to `/v1/messages` and verify that subset matches the original
+    // scenario expectation.
+    let messages_only: Vec<_> = captured
         .iter()
-        .all(|request| request.path == "/v1/messages"));
-    assert!(captured.iter().all(|request| request.stream));
+        .filter(|r| r.path == "/v1/messages")
+        .collect();
+    assert_eq!(
+        messages_only.len(),
+        21,
+        "twelve scenarios should produce twenty-one /v1/messages requests (total captured: {}, includes count_tokens)",
+        captured.len()
+    );
+    assert!(messages_only.iter().all(|request| request.stream));
 
-    let scenarios = captured
+    let scenarios = messages_only
         .iter()
         .map(|request| request.scenario.as_str())
         .collect::<Vec<_>>();
@@ -419,11 +426,15 @@ fn prepare_plugin_fixture(workspace: &HarnessWorkspace) {
         "#!/bin/sh\nINPUT=$(cat)\nprintf '{\"plugin\":\"%s\",\"tool\":\"%s\",\"input\":%s}\\n' \"$CLAWD_PLUGIN_ID\" \"$CLAWD_TOOL_NAME\" \"$INPUT\"\n",
     )
     .expect("plugin script should write");
-    let mut permissions = fs::metadata(&script_path)
-        .expect("plugin script metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&script_path, permissions).expect("plugin script should be executable");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&script_path)
+            .expect("plugin script metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions).expect("plugin script should be executable");
+    }
 
     fs::write(
         manifest_dir.join("plugin.json"),

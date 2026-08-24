@@ -1,0 +1,42 @@
+{
+  "goal_id": "G009-windows-docs-release",
+  "timestamp_utc": "2026-05-15T01:57:16Z",
+  "commit": "a3af0133e0cf8d529465950ada88623e3cf3b3f2",
+  "team": "g009-windows-docs-rel-e61d2271",
+  "team_phase": "complete",
+  "tasks": "5/5 completed",
+  "verification": {
+    "release_readiness": "passed",
+    "doc_source_of_truth": "passed",
+    "cargo_fmt": "passed",
+    "targeted_windows_no_credentials_smoke_test": "passed",
+    "cargo_check_workspace": "passed with existing api dead_code warnings",
+    "git_diff_check": "passed",
+    "coverage_check": "passed"
+  },
+  "known_gaps": [
+    {
+      "scope": "actual GitHub windows-latest execution",
+      "status": "not run locally"
+    },
+    {
+      "scope": "full cargo test --workspace",
+      "status": "known pre-existing unrelated CLI failures reported by workers; targeted changed-surface tests pass"
+    }
+  ],
+  "artifacts": [
+    ".github/workflows/rust-ci.yml",
+    ".github/workflows/release.yml",
+    "docs/windows-install-release.md",
+    "docs/g009-windows-docs-release-verification-map.md",
+    "LICENSE",
+    "CONTRIBUTING.md",
+    "SECURITY.md",
+    "SUPPORT.md",
+    "CODE_OF_CONDUCT.md",
+    ".github/scripts/check_release_readiness.py",
+    "/tmp/g009-final-verify.log"
+  ],
+  "git_status": "## main...origin/main [ahead 13]",
+  "log_tail": "   |          ^^^^^^^^^^^^^^^^^^^^\n   |\n   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default\n\nwarning: enum `ProviderFeatureSupport` is never used\n  --> crates/api/src/providers/mod.rs:61:10\n   |\n61 | pub enum ProviderFeatureSupport {\n   |          ^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: struct `ProviderCapabilityReport` is never constructed\n  --> crates/api/src/providers/mod.rs:68:12\n   |\n68 | pub struct ProviderCapabilityReport {\n   |            ^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: enum `ProviderDiagnosticSeverity` is never used\n  --> crates/api/src/providers/mod.rs:88:10\n   |\n88 | pub enum ProviderDiagnosticSeverity {\n   |          ^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: struct `ProviderDiagnostic` is never constructed\n  --> crates/api/src/providers/mod.rs:94:12\n   |\n94 | pub struct ProviderDiagnostic {\n   |            ^^^^^^^^^^^^^^^^^^\n\nwarning: function `provider_capabilities_for_model` is never used\n   --> crates/api/src/providers/mod.rs:384:8\n    |\n384 | pub fn provider_capabilities_for_model(model: &str) -> ProviderCapabilityReport {\n    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `provider_diagnostics_for_request` is never used\n   --> crates/api/src/providers/mod.rs:452:8\n    |\n452 | pub fn provider_diagnostics_for_request(request: &MessageRequest) -> Vec<ProviderDiagnostic> {\n    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `metadata_for_provider_kind` is never used\n   --> crates/api/src/providers/mod.rs:517:4\n    |\n517 | fn metadata_for_provider_kind(provider: ProviderKind) -> ProviderMetadata {\n    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `provider_label` is never used\n   --> crates/api/src/providers/mod.rs:541:10\n    |\n541 | const fn provider_label(provider: ProviderKind) -> &'static str {\n    |          ^^^^^^^^^^^^^^\n\nwarning: function `has_openai_tuning_parameters` is never used\n   --> crates/api/src/providers/mod.rs:550:4\n    |\n550 | fn has_openai_tuning_parameters(request: &MessageRequest) -> bool {\n    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `declares_tool` is never used\n   --> crates/api/src/providers/mod.rs:558:4\n    |\n558 | fn declares_tool(request: &MessageRequest, tool_name: &str) -> bool {\n    |    ^^^^^^^^^^^^^\n\nwarning: function `web_passthrough_diagnostic` is never used\n   --> crates/api/src/providers/mod.rs:567:4\n    |\n567 | fn web_passthrough_diagnostic(\n    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nwarning: function `strip_routing_prefix` is never used\n   --> crates/api/src/providers/openai_compat.rs:901:4\n    |\n901 | fn strip_routing_prefix(model: &str) -> &str {\n    |    ^^^^^^^^^^^^^^^^^^^^\n\nwarning: `api` (lib) generated 13 warnings\n   Compiling rusty-claude-cli v0.1.0 (/Users/bellman/Documents/Workspace/claw-code/rust/crates/rusty-claude-cli)\n    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.35s\nG009 coverage check passed"
+}

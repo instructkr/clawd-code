@@ -5,3 +5,11 @@ archive/
 # Claude Code local artifacts
 .claude/settings.local.json
 .claude/sessions/
+# Claw Code local artifacts
+.claw/settings.local.json
+.claw/sessions/
+.claw/rules.local/
+.clawhip/
+status-help.txt
+# Legacy Python port session scratch artifacts
+.port_sessions/

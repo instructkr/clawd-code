@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Claw Code local pre-push safety gate.
+#
+# Install with:
+#   git config core.hooksPath .github/hooks
+#
+# This intentionally mirrors the CI build gate so stale field/enum references are
+# caught before pushing to main or PR branches.
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null)"
+cd "$repo_root"
+
+if [[ -x scripts/roadmap-check-ids.sh ]]; then
+  echo "pre-push: scripts/roadmap-check-ids.sh" >&2
+  scripts/roadmap-check-ids.sh >&2
+fi
+
+if [[ "${SKIP_CLAW_PRE_PUSH_BUILD:-}" == "1" ]]; then
+  echo "pre-push: SKIP_CLAW_PRE_PUSH_BUILD=1 set; skipping cargo workspace build" >&2
+  exit 0
+fi
+
+if [[ ! -f rust/Cargo.toml ]]; then
+  echo "pre-push: rust/Cargo.toml not found; skipping cargo workspace build" >&2
+  exit 0
+fi
+
+build_cmd=(cargo build --manifest-path rust/Cargo.toml --workspace --locked)
+echo "pre-push: ${build_cmd[*]}" >&2
+"${build_cmd[@]}"

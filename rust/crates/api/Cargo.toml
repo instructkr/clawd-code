@@ -13,5 +13,12 @@ serde_json.workspace = true
 telemetry = { path = "../telemetry" }
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
 
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
 [lints]
 workspace = true
+
+[[bench]]
+name = "request_building"
+harness = false

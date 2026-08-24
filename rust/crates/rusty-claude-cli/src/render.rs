@@ -249,13 +249,14 @@ impl TerminalRenderer {
 
     #[must_use]
     pub fn render_markdown(&self, markdown: &str) -> String {
+        let normalized = normalize_nested_fences(markdown);
         let mut output = String::new();
         let mut state = RenderState::default();
         let mut code_language = String::new();
         let mut code_buffer = String::new();
         let mut in_code_block = false;
 
-        for event in Parser::new_ext(markdown, Options::all()) {
+        for event in Parser::new_ext(&normalized, Options::all()) {
             self.render_event(
                 event,
                 &mut state,
@@ -634,8 +635,186 @@ fn apply_code_block_background(line: &str) -> String {
     format!("\u{1b}[48;5;236m{with_background}\u{1b}[0m{trailing_newline}")
 }
 
+/// Pre-process raw markdown so that fenced code blocks whose body contains
+/// fence markers of equal or greater length are wrapped with a longer fence.
+///
+/// LLMs frequently emit triple-backtick code blocks that contain triple-backtick
+/// examples.  `CommonMark` (and pulldown-cmark) treats the inner marker as the
+/// closing fence, breaking the render.  This function detects the situation and
+/// upgrades the outer fence to use enough backticks (or tildes) that the inner
+/// markers become ordinary content.
+#[allow(
+    clippy::too_many_lines,
+    clippy::items_after_statements,
+    clippy::manual_repeat_n,
+    clippy::manual_str_repeat
+)]
+fn normalize_nested_fences(markdown: &str) -> String {
+    // A fence line is either "labeled" (has an info string ⇒ always an opener)
+    // or "bare" (no info string ⇒ could be opener or closer).
+    #[derive(Debug, Clone)]
+    struct FenceLine {
+        char: char,
+        len: usize,
+        has_info: bool,
+        indent: usize,
+    }
+
+    fn parse_fence_line(line: &str) -> Option<FenceLine> {
+        let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
+        let indent = trimmed.chars().take_while(|c| *c == ' ').count();
+        if indent > 3 {
+            return None;
+        }
+        let rest = &trimmed[indent..];
+        let ch = rest.chars().next()?;
+        if ch != '`' && ch != '~' {
+            return None;
+        }
+        let len = rest.chars().take_while(|c| *c == ch).count();
+        if len < 3 {
+            return None;
+        }
+        let after = &rest[len..];
+        if ch == '`' && after.contains('`') {
+            return None;
+        }
+        let has_info = !after.trim().is_empty();
+        Some(FenceLine {
+            char: ch,
+            len,
+            has_info,
+            indent,
+        })
+    }
+
+    let lines: Vec<&str> = markdown.split_inclusive('\n').collect();
+    // Handle final line that may lack trailing newline.
+    // split_inclusive already keeps the original chunks, including a
+    // final chunk without '\n' if the input doesn't end with one.
+
+    // First pass: classify every line.
+    let fence_info: Vec<Option<FenceLine>> = lines.iter().map(|l| parse_fence_line(l)).collect();
+
+    // Second pass: pair openers with closers using a stack, recording
+    // (opener_idx, closer_idx) pairs plus the max fence length found between
+    // them.
+    struct StackEntry {
+        line_idx: usize,
+        fence: FenceLine,
+    }
+
+    let mut stack: Vec<StackEntry> = Vec::new();
+    // Paired blocks: (opener_line, closer_line, max_inner_fence_len)
+    let mut pairs: Vec<(usize, usize, usize)> = Vec::new();
+
+    for (i, fi) in fence_info.iter().enumerate() {
+        let Some(fl) = fi else { continue };
+
+        if fl.has_info {
+            // Labeled fence ⇒ always an opener.
+            stack.push(StackEntry {
+                line_idx: i,
+                fence: fl.clone(),
+            });
+        } else {
+            // Bare fence ⇒ try to close the top of the stack if compatible.
+            let closes_top = stack
+                .last()
+                .is_some_and(|top| top.fence.char == fl.char && fl.len >= top.fence.len);
+            if closes_top {
+                let opener = stack.pop().unwrap();
+                // Find max fence length of any fence line strictly between
+                // opener and closer (these are the nested fences).
+                let inner_max = fence_info[opener.line_idx + 1..i]
+                    .iter()
+                    .filter_map(|fi| fi.as_ref().map(|f| f.len))
+                    .max()
+                    .unwrap_or(0);
+                pairs.push((opener.line_idx, i, inner_max));
+            } else {
+                // Treat as opener.
+                stack.push(StackEntry {
+                    line_idx: i,
+                    fence: fl.clone(),
+                });
+            }
+        }
+    }
+
+    // Determine which lines need rewriting.  A pair needs rewriting when
+    // its opener length <= max inner fence length.
+    struct Rewrite {
+        char: char,
+        new_len: usize,
+        indent: usize,
+    }
+    let mut rewrites: std::collections::HashMap<usize, Rewrite> = std::collections::HashMap::new();
+
+    for (opener_idx, closer_idx, inner_max) in &pairs {
+        let opener_fl = fence_info[*opener_idx].as_ref().unwrap();
+        if opener_fl.len <= *inner_max {
+            let new_len = inner_max + 1;
+            let info_part = {
+                let trimmed = lines[*opener_idx]
+                    .trim_end_matches('\n')
+                    .trim_end_matches('\r');
+                let rest = &trimmed[opener_fl.indent..];
+                rest[opener_fl.len..].to_string()
+            };
+            rewrites.insert(
+                *opener_idx,
+                Rewrite {
+                    char: opener_fl.char,
+                    new_len,
+                    indent: opener_fl.indent,
+                },
+            );
+            let closer_fl = fence_info[*closer_idx].as_ref().unwrap();
+            rewrites.insert(
+                *closer_idx,
+                Rewrite {
+                    char: closer_fl.char,
+                    new_len,
+                    indent: closer_fl.indent,
+                },
+            );
+            // Store info string only in the opener; closer keeps the trailing
+            // portion which is already handled through the original line.
+            // Actually, we rebuild both lines from scratch below, including
+            // the info string for the opener.
+            let _ = info_part; // consumed in rebuild
+        }
+    }
+
+    if rewrites.is_empty() {
+        return markdown.to_string();
+    }
+
+    // Rebuild.
+    let mut out = String::with_capacity(markdown.len() + rewrites.len() * 4);
+    for (i, line) in lines.iter().enumerate() {
+        if let Some(rw) = rewrites.get(&i) {
+            let fence_str: String = std::iter::repeat(rw.char).take(rw.new_len).collect();
+            let indent_str: String = std::iter::repeat(' ').take(rw.indent).collect();
+            // Recover the original info string (if any) and trailing newline.
+            let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
+            let fi = fence_info[i].as_ref().unwrap();
+            let info = &trimmed[fi.indent + fi.len..];
+            let trailing = &line[trimmed.len()..];
+            out.push_str(&indent_str);
+            out.push_str(&fence_str);
+            out.push_str(info);
+            out.push_str(trailing);
+        } else {
+            out.push_str(line);
+        }
+    }
+    out
+}
+
 fn find_stream_safe_boundary(markdown: &str) -> Option<usize> {
-    let mut in_fence = false;
+    let mut open_fence: Option<FenceMarker> = None;
     let mut last_boundary = None;
 
     for (offset, line) in markdown.split_inclusive('\n').scan(0usize, |cursor, line| {
@@ -643,25 +822,66 @@ fn find_stream_safe_boundary(markdown: &str) -> Option<usize> {
         *cursor += line.len();
         Some((start, line))
     }) {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            in_fence = !in_fence;
-            if !in_fence {
+        let line_without_newline = line.trim_end_matches('\n');
+        if let Some(opener) = open_fence {
+            if line_closes_fence(line_without_newline, opener) {
+                open_fence = None;
                 last_boundary = Some(offset + line.len());
             }
             continue;
         }
 
-        if in_fence {
+        if let Some(opener) = parse_fence_opener(line_without_newline) {
+            open_fence = Some(opener);
             continue;
         }
 
-        if trimmed.is_empty() {
+        if line_without_newline.trim().is_empty() {
             last_boundary = Some(offset + line.len());
         }
     }
 
     last_boundary
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FenceMarker {
+    character: char,
+    length: usize,
+}
+
+fn parse_fence_opener(line: &str) -> Option<FenceMarker> {
+    let indent = line.chars().take_while(|c| *c == ' ').count();
+    if indent > 3 {
+        return None;
+    }
+    let rest = &line[indent..];
+    let character = rest.chars().next()?;
+    if character != '`' && character != '~' {
+        return None;
+    }
+    let length = rest.chars().take_while(|c| *c == character).count();
+    if length < 3 {
+        return None;
+    }
+    let info_string = &rest[length..];
+    if character == '`' && info_string.contains('`') {
+        return None;
+    }
+    Some(FenceMarker { character, length })
+}
+
+fn line_closes_fence(line: &str, opener: FenceMarker) -> bool {
+    let indent = line.chars().take_while(|c| *c == ' ').count();
+    if indent > 3 {
+        return false;
+    }
+    let rest = &line[indent..];
+    let length = rest.chars().take_while(|c| *c == opener.character).count();
+    if length < opener.length {
+        return false;
+    }
+    rest[length..].chars().all(|c| c == ' ' || c == '\t')
 }
 
 fn visible_width(input: &str) -> usize {
@@ -776,6 +996,60 @@ mod tests {
             .push(&renderer, "```\n")
             .expect("closed code fence flushes");
         assert!(strip_ansi(&code).contains("fn main()"));
+    }
+
+    #[test]
+    fn streaming_state_holds_outer_fence_with_nested_inner_fence() {
+        let renderer = TerminalRenderer::new();
+        let mut state = MarkdownStreamState::default();
+
+        assert_eq!(
+            state.push(&renderer, "````markdown\n```rust\nfn inner() {}\n"),
+            None,
+            "inner triple backticks must not close the outer four-backtick fence"
+        );
+        assert_eq!(
+            state.push(&renderer, "```\n"),
+            None,
+            "closing the inner fence must not flush the outer fence"
+        );
+        let flushed = state
+            .push(&renderer, "````\n")
+            .expect("closing the outer four-backtick fence flushes the buffered block");
+        let plain_text = strip_ansi(&flushed);
+        assert!(plain_text.contains("fn inner()"));
+        assert!(plain_text.contains("```rust"));
+    }
+
+    #[test]
+    fn streaming_state_distinguishes_backtick_and_tilde_fences() {
+        let renderer = TerminalRenderer::new();
+        let mut state = MarkdownStreamState::default();
+
+        assert_eq!(state.push(&renderer, "~~~text\n"), None);
+        assert_eq!(
+            state.push(&renderer, "```\nstill inside tilde fence\n"),
+            None,
+            "a backtick fence cannot close a tilde-opened fence"
+        );
+        assert_eq!(state.push(&renderer, "```\n"), None);
+        let flushed = state
+            .push(&renderer, "~~~\n")
+            .expect("matching tilde marker closes the fence");
+        let plain_text = strip_ansi(&flushed);
+        assert!(plain_text.contains("still inside tilde fence"));
+    }
+
+    #[test]
+    fn renders_nested_fenced_code_block_preserves_inner_markers() {
+        let terminal_renderer = TerminalRenderer::new();
+        let markdown_output =
+            terminal_renderer.markdown_to_ansi("````markdown\n```rust\nfn nested() {}\n```\n````");
+        let plain_text = strip_ansi(&markdown_output);
+
+        assert!(plain_text.contains("╭─ markdown"));
+        assert!(plain_text.contains("```rust"));
+        assert!(plain_text.contains("fn nested()"));
     }
 
     #[test]

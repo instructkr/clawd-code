@@ -442,6 +442,7 @@ mod tests {
         log_path: &Path,
     ) -> ScopedMcpServerConfig {
         ScopedMcpServerConfig {
+            required: false,
             scope: ConfigSource::Local,
             config: McpServerConfig::Stdio(McpStdioServerConfig {
                 command: "python3".to_string(),

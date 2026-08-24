@@ -1,4 +1,5 @@
 use std::cmp::Reverse;
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -7,13 +8,22 @@ use std::time::Instant;
 use glob::Pattern;
 use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
-use walkdir::WalkDir;
+use walkdir::{DirEntry, WalkDir};
 
 /// Maximum file size that can be read (10 MB).
 const MAX_READ_SIZE: u64 = 10 * 1024 * 1024;
 
 /// Maximum file size that can be written (10 MB).
 const MAX_WRITE_SIZE: usize = 10 * 1024 * 1024;
+
+const GLOB_SEARCH_IGNORED_DIRS: &[&str] = &[
+    ".git",
+    "node_modules",
+    ".build",
+    "target",
+    "dist",
+    "coverage",
+];
 
 /// Check whether a file appears to contain binary content by examining
 /// the first chunk for NUL bytes.
@@ -297,23 +307,61 @@ pub fn edit_file(
 
 /// Expands a glob pattern and returns matching filenames.
 pub fn glob_search(pattern: &str, path: Option<&str>) -> io::Result<GlobSearchOutput> {
+    glob_search_impl(pattern, path, None)
+}
+
+fn glob_search_impl(
+    pattern: &str,
+    path: Option<&str>,
+    workspace_root: Option<&Path>,
+) -> io::Result<GlobSearchOutput> {
     let started = Instant::now();
     let base_dir = path
         .map(normalize_path)
         .transpose()?
         .unwrap_or(std::env::current_dir()?);
+    let canonical_root = workspace_root.map(canonicalize_workspace_root);
+    if let Some(root) = canonical_root.as_deref() {
+        validate_workspace_boundary(&base_dir, root)?;
+    }
     let search_pattern = if Path::new(pattern).is_absolute() {
         pattern.to_owned()
     } else {
         base_dir.join(pattern).to_string_lossy().into_owned()
     };
 
+    // The `glob` crate does not support brace expansion ({a,b,c}).
+    // Expand braces into multiple patterns so patterns like
+    // `Assets/**/*.{cs,uxml,uss}` work correctly.
+    let expanded = expand_braces(&search_pattern);
+
+    let mut seen = HashSet::new();
     let mut matches = Vec::new();
-    let entries = glob::glob(&search_pattern)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
-    for entry in entries.flatten() {
-        if entry.is_file() {
-            matches.push(entry);
+    for pat in &expanded {
+        let compiled = Pattern::new(pat)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+        let walk_root = derive_glob_walk_root(pat);
+        if let Some(root) = canonical_root.as_deref() {
+            let canonical_walk_root = walk_root
+                .canonicalize()
+                .unwrap_or_else(|_| walk_root.clone());
+            validate_workspace_boundary(&canonical_walk_root, root)?;
+        }
+        let entries = WalkDir::new(&walk_root)
+            .into_iter()
+            .filter_entry(|entry| !should_skip_glob_dir(entry));
+        for entry in entries.flatten() {
+            let candidate = entry.path();
+            if entry.file_type().is_file()
+                && compiled.matches_path(candidate)
+                && seen.insert(candidate.to_path_buf())
+            {
+                if let Some(root) = canonical_root.as_deref() {
+                    let canonical_candidate = candidate.canonicalize()?;
+                    validate_workspace_boundary(&canonical_candidate, root)?;
+                }
+                matches.push(candidate.to_path_buf());
+            }
         }
     }
 
@@ -341,12 +389,23 @@ pub fn glob_search(pattern: &str, path: Option<&str>) -> io::Result<GlobSearchOu
 
 /// Runs a regex search over workspace files with optional context lines.
 pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
+    grep_search_impl(input, None)
+}
+
+fn grep_search_impl(
+    input: &GrepSearchInput,
+    workspace_root: Option<&Path>,
+) -> io::Result<GrepSearchOutput> {
     let base_path = input
         .path
         .as_deref()
         .map(normalize_path)
         .transpose()?
         .unwrap_or(std::env::current_dir()?);
+    let canonical_root = workspace_root.map(canonicalize_workspace_root);
+    if let Some(root) = canonical_root.as_deref() {
+        validate_workspace_boundary(&base_path, root)?;
+    }
 
     let regex = RegexBuilder::new(&input.pattern)
         .case_insensitive(input.case_insensitive.unwrap_or(false))
@@ -372,6 +431,10 @@ pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
     let mut total_matches = 0usize;
 
     for file_path in collect_search_files(&base_path)? {
+        if let Some(root) = canonical_root.as_deref() {
+            let canonical_file = file_path.canonicalize()?;
+            validate_workspace_boundary(&canonical_file, root)?;
+        }
         if !matches_optional_filters(&file_path, glob_filter.as_ref(), file_type) {
             continue;
         }
@@ -421,32 +484,85 @@ pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
 
     let (filenames, applied_limit, applied_offset) =
         apply_limit(filenames, input.head_limit, input.offset);
-    let content_output = if output_mode == "content" {
-        let (lines, limit, offset) = apply_limit(content_lines, input.head_limit, input.offset);
-        return Ok(GrepSearchOutput {
-            mode: Some(output_mode),
-            num_files: filenames.len(),
+    if output_mode == "content" {
+        return Ok(build_grep_content_output(
+            output_mode,
             filenames,
-            num_lines: Some(lines.len()),
-            content: Some(lines.join("\n")),
-            num_matches: None,
-            applied_limit: limit,
-            applied_offset: offset,
-        });
-    } else {
-        None
-    };
+            content_lines,
+            input.head_limit,
+            input.offset,
+        ));
+    }
 
     Ok(GrepSearchOutput {
         mode: Some(output_mode.clone()),
         num_files: filenames.len(),
         filenames,
-        content: content_output,
+        content: None,
         num_lines: None,
         num_matches: (output_mode == "count").then_some(total_matches),
         applied_limit,
         applied_offset,
     })
+}
+
+fn build_grep_content_output(
+    output_mode: String,
+    filenames: Vec<String>,
+    content_lines: Vec<String>,
+    head_limit: Option<usize>,
+    offset: Option<usize>,
+) -> GrepSearchOutput {
+    let (lines, limit, offset) = apply_limit(content_lines, head_limit, offset);
+    GrepSearchOutput {
+        mode: Some(output_mode),
+        num_files: filenames.len(),
+        filenames,
+        num_lines: Some(lines.len()),
+        content: Some(lines.join("\n")),
+        num_matches: None,
+        applied_limit: limit,
+        applied_offset: offset,
+    }
+}
+
+fn canonicalize_workspace_root(workspace_root: &Path) -> PathBuf {
+    workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf())
+}
+
+fn should_skip_glob_dir(entry: &DirEntry) -> bool {
+    entry.file_type().is_dir()
+        && entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| GLOB_SEARCH_IGNORED_DIRS.contains(&name))
+}
+
+fn derive_glob_walk_root(pattern: &str) -> PathBuf {
+    let path = Path::new(pattern);
+    let mut prefix = PathBuf::new();
+    let mut saw_component = false;
+
+    for component in path.components() {
+        let text = component.as_os_str().to_string_lossy();
+        if component_contains_glob(&text) {
+            break;
+        }
+        prefix.push(component.as_os_str());
+        saw_component = true;
+    }
+
+    if saw_component {
+        prefix
+    } else {
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    }
+}
+
+fn component_contains_glob(component: &str) -> bool {
+    component.contains('*') || component.contains('?') || component.contains('[')
 }
 
 fn collect_search_files(base_path: &Path) -> io::Result<Vec<PathBuf>> {
@@ -566,9 +682,7 @@ pub fn read_file_in_workspace(
     workspace_root: &Path,
 ) -> io::Result<ReadFileOutput> {
     let absolute_path = normalize_path(path)?;
-    let canonical_root = workspace_root
-        .canonicalize()
-        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    let canonical_root = canonicalize_workspace_root(workspace_root);
     validate_workspace_boundary(&absolute_path, &canonical_root)?;
     read_file(path, offset, limit)
 }
@@ -581,9 +695,7 @@ pub fn write_file_in_workspace(
     workspace_root: &Path,
 ) -> io::Result<WriteFileOutput> {
     let absolute_path = normalize_path_allow_missing(path)?;
-    let canonical_root = workspace_root
-        .canonicalize()
-        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    let canonical_root = canonicalize_workspace_root(workspace_root);
     validate_workspace_boundary(&absolute_path, &canonical_root)?;
     write_file(path, content)
 }
@@ -598,11 +710,28 @@ pub fn edit_file_in_workspace(
     workspace_root: &Path,
 ) -> io::Result<EditFileOutput> {
     let absolute_path = normalize_path(path)?;
-    let canonical_root = workspace_root
-        .canonicalize()
-        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    let canonical_root = canonicalize_workspace_root(workspace_root);
     validate_workspace_boundary(&absolute_path, &canonical_root)?;
     edit_file(path, old_string, new_string, replace_all)
+}
+
+/// Expand a glob pattern with workspace boundary enforcement.
+#[allow(dead_code)]
+pub fn glob_search_in_workspace(
+    pattern: &str,
+    path: Option<&str>,
+    workspace_root: &Path,
+) -> io::Result<GlobSearchOutput> {
+    glob_search_impl(pattern, path, Some(workspace_root))
+}
+
+/// Search file contents with workspace boundary enforcement.
+#[allow(dead_code)]
+pub fn grep_search_in_workspace(
+    input: &GrepSearchInput,
+    workspace_root: &Path,
+) -> io::Result<GrepSearchOutput> {
+    grep_search_impl(input, Some(workspace_root))
 }
 
 /// Check whether a path is a symlink that resolves outside the workspace.
@@ -619,13 +748,37 @@ pub fn is_symlink_escape(path: &Path, workspace_root: &Path) -> io::Result<bool>
     Ok(!resolved.starts_with(&canonical_root))
 }
 
+/// Expand shell-style brace groups in a glob pattern.
+///
+/// Handles one level of braces: `foo.{a,b,c}` → `["foo.a", "foo.b", "foo.c"]`.
+/// Nested braces are not expanded (uncommon in practice).
+/// Patterns without braces pass through unchanged.
+fn expand_braces(pattern: &str) -> Vec<String> {
+    let Some(open) = pattern.find('{') else {
+        return vec![pattern.to_owned()];
+    };
+    let Some(close) = pattern[open..].find('}').map(|i| open + i) else {
+        // Unmatched brace — treat as literal.
+        return vec![pattern.to_owned()];
+    };
+    let prefix = &pattern[..open];
+    let suffix = &pattern[close + 1..];
+    let alternatives = &pattern[open + 1..close];
+    alternatives
+        .split(',')
+        .flat_map(|alt| expand_braces(&format!("{prefix}{alt}{suffix}")))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        edit_file, glob_search, grep_search, is_symlink_escape, read_file, read_file_in_workspace,
-        write_file, GrepSearchInput, MAX_WRITE_SIZE,
+        component_contains_glob, derive_glob_walk_root, edit_file, expand_braces, glob_search,
+        grep_search, is_symlink_escape, read_file, read_file_in_workspace, write_file,
+        write_file_in_workspace, GrepSearchInput, MAX_WRITE_SIZE,
     };
 
     fn temp_path(name: &str) -> std::path::PathBuf {
@@ -726,6 +879,68 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn workspace_read_rejects_symlink_escape_regression_3007_class() {
+        let workspace = temp_path("workspace-read-symlink-escape");
+        let outside = temp_path("workspace-read-symlink-target");
+        std::fs::create_dir_all(&workspace).expect("workspace dir should be created");
+        std::fs::create_dir_all(&outside).expect("outside dir should be created");
+        let outside_file = outside.join("secret.txt");
+        std::fs::write(&outside_file, "outside secret").expect("outside file should write");
+
+        let link_path = workspace.join("linked-secret.txt");
+        std::os::unix::fs::symlink(&outside_file, &link_path).expect("symlink should create");
+
+        let result =
+            read_file_in_workspace(link_path.to_string_lossy().as_ref(), None, None, &workspace);
+
+        assert!(result.is_err(), "symlink escape must be rejected");
+        let error = result.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            error.to_string().contains("escapes workspace"),
+            "error should explain workspace escape: {error}"
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn workspace_write_rejects_parent_symlink_escape_regression_3007_class() {
+        let workspace = temp_path("workspace-write-symlink-escape");
+        let outside = temp_path("workspace-write-symlink-target");
+        std::fs::create_dir_all(&workspace).expect("workspace dir should be created");
+        std::fs::create_dir_all(&outside).expect("outside dir should be created");
+
+        let link_dir = workspace.join("linked-outside");
+        std::os::unix::fs::symlink(&outside, &link_dir).expect("symlink dir should create");
+        let escaped_child = link_dir.join("created.txt");
+
+        let result = write_file_in_workspace(
+            escaped_child.to_string_lossy().as_ref(),
+            "must not escape",
+            &workspace,
+        );
+
+        assert!(result.is_err(), "parent symlink escape must be rejected");
+        let error = result.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            error.to_string().contains("escapes workspace"),
+            "error should explain workspace escape: {error}"
+        );
+        assert!(
+            !outside.join("created.txt").exists(),
+            "write should not create through an escaping symlink"
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
     fn globs_and_greps_directory() {
         let dir = temp_path("search-dir");
         std::fs::create_dir_all(&dir).expect("directory should be created");
@@ -758,5 +973,98 @@ mod tests {
         })
         .expect("grep should succeed");
         assert!(grep_output.content.unwrap_or_default().contains("hello"));
+    }
+
+    #[test]
+    fn expand_braces_no_braces() {
+        assert_eq!(expand_braces("*.rs"), vec!["*.rs"]);
+    }
+
+    #[test]
+    fn expand_braces_single_group() {
+        let mut result = expand_braces("Assets/**/*.{cs,uxml,uss}");
+        result.sort();
+        assert_eq!(
+            result,
+            vec!["Assets/**/*.cs", "Assets/**/*.uss", "Assets/**/*.uxml",]
+        );
+    }
+
+    #[test]
+    fn expand_braces_nested() {
+        let mut result = expand_braces("src/{a,b}.{rs,toml}");
+        result.sort();
+        assert_eq!(
+            result,
+            vec!["src/a.rs", "src/a.toml", "src/b.rs", "src/b.toml"]
+        );
+    }
+
+    #[test]
+    fn expand_braces_unmatched() {
+        assert_eq!(expand_braces("foo.{bar"), vec!["foo.{bar"]);
+    }
+
+    #[test]
+    fn glob_search_with_braces_finds_files() {
+        let dir = temp_path("glob-braces");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.rs"), "fn main() {}").unwrap();
+        std::fs::write(dir.join("b.toml"), "[package]").unwrap();
+        std::fs::write(dir.join("c.txt"), "hello").unwrap();
+
+        let result =
+            glob_search("*.{rs,toml}", Some(dir.to_str().unwrap())).expect("glob should succeed");
+        assert_eq!(
+            result.num_files, 2,
+            "should match .rs and .toml but not .txt"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn glob_search_skips_common_heavy_directories() {
+        let dir = temp_path("glob-ignored-dirs");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join("docs")).unwrap();
+        std::fs::create_dir_all(dir.join("node_modules/pkg")).unwrap();
+        std::fs::create_dir_all(dir.join(".build/checkouts/pkg")).unwrap();
+        std::fs::create_dir_all(dir.join("target/debug/deps")).unwrap();
+
+        std::fs::write(dir.join("src/AGENTS.md"), "src").unwrap();
+        std::fs::write(dir.join("docs/AGENTS.md"), "docs").unwrap();
+        std::fs::write(dir.join("node_modules/pkg/AGENTS.md"), "node_modules").unwrap();
+        std::fs::write(dir.join(".build/checkouts/pkg/AGENTS.md"), ".build").unwrap();
+        std::fs::write(dir.join("target/debug/deps/AGENTS.md"), "target").unwrap();
+
+        let result =
+            glob_search("**/AGENTS.md", Some(dir.to_str().unwrap())).expect("glob should succeed");
+
+        assert_eq!(result.num_files, 2, "ignored dirs should be pruned");
+        assert!(result
+            .filenames
+            .iter()
+            .any(|path| path.ends_with("src/AGENTS.md")));
+        assert!(result
+            .filenames
+            .iter()
+            .any(|path| path.ends_with("docs/AGENTS.md")));
+        assert!(!result
+            .filenames
+            .iter()
+            .any(|path| path.contains("node_modules")
+                || path.contains(".build")
+                || path.contains("/target/")));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn derive_glob_walk_root_stops_at_first_glob_component() {
+        let root = derive_glob_walk_root("/tmp/demo/**/AGENTS.md");
+        assert_eq!(root, PathBuf::from("/tmp/demo"));
+        assert!(component_contains_glob("**"));
+        assert!(component_contains_glob("*.rs"));
+        assert!(!component_contains_glob("src"));
     }
 }

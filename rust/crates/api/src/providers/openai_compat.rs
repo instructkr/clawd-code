@@ -1,10 +1,14 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, VecDeque};
-use std::time::Duration;
+use std::net::Ipv4Addr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::error::ApiError;
+use crate::http_client::build_http_client_or_default;
 use crate::types::{
     ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent,
     InputContentBlock, InputMessage, MessageDelta, MessageDeltaEvent, MessageRequest,
@@ -12,15 +16,16 @@ use crate::types::{
     ToolChoice, ToolDefinition, ToolResultContentBlock, Usage,
 };
 
-use super::{preflight_message_request, Provider, ProviderFuture};
+use super::{preflight_message_request, resolve_model_alias, Provider, ProviderFuture};
 
 pub const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+pub const DEFAULT_DASHSCOPE_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
 const REQUEST_ID_HEADER: &str = "request-id";
 const ALT_REQUEST_ID_HEADER: &str = "x-request-id";
-const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_millis(200);
-const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(2);
-const DEFAULT_MAX_RETRIES: u32 = 2;
+const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(128);
+const DEFAULT_MAX_RETRIES: u32 = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenAiCompatConfig {
@@ -28,10 +33,29 @@ pub struct OpenAiCompatConfig {
     pub api_key_env: &'static str,
     pub base_url_env: &'static str,
     pub default_base_url: &'static str,
+    /// Maximum request body size in bytes. Provider-specific limits:
+    /// - `DashScope`: 6MB (`6_291_456` bytes) - observed in dogfood testing
+    /// - `OpenAI`: 100MB (`104_857_600` bytes)
+    /// - `xAI`: 50MB (`52_428_800` bytes)
+    pub max_request_body_bytes: usize,
 }
 
 const XAI_ENV_VARS: &[&str] = &["XAI_API_KEY"];
 const OPENAI_ENV_VARS: &[&str] = &["OPENAI_API_KEY"];
+const DASHSCOPE_ENV_VARS: &[&str] = &["DASHSCOPE_API_KEY"];
+
+// Provider-specific request body size limits in bytes
+const XAI_MAX_REQUEST_BODY_BYTES: usize = 52_428_800; // 50MB
+const OPENAI_MAX_REQUEST_BODY_BYTES: usize = 104_857_600; // 100MB
+const DASHSCOPE_MAX_REQUEST_BODY_BYTES: usize = 6_291_456; // 6MB (observed limit in dogfood)
+
+pub const OLLAMA_CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
+    provider_name: "Ollama",
+    api_key_env: "OLLAMA_HOST",
+    base_url_env: "OLLAMA_HOST",
+    default_base_url: "http://127.0.0.1:11434/v1",
+    max_request_body_bytes: 104_857_600,
+};
 
 impl OpenAiCompatConfig {
     #[must_use]
@@ -41,6 +65,7 @@ impl OpenAiCompatConfig {
             api_key_env: "XAI_API_KEY",
             base_url_env: "XAI_BASE_URL",
             default_base_url: DEFAULT_XAI_BASE_URL,
+            max_request_body_bytes: XAI_MAX_REQUEST_BODY_BYTES,
         }
     }
 
@@ -51,13 +76,31 @@ impl OpenAiCompatConfig {
             api_key_env: "OPENAI_API_KEY",
             base_url_env: "OPENAI_BASE_URL",
             default_base_url: DEFAULT_OPENAI_BASE_URL,
+            max_request_body_bytes: OPENAI_MAX_REQUEST_BODY_BYTES,
         }
     }
+
+    /// Alibaba `DashScope` compatible-mode endpoint (Qwen family models).
+    /// Uses the OpenAI-compatible REST shape at /compatible-mode/v1.
+    /// Requested via Discord #clawcode-get-help: native Alibaba API for
+    /// higher rate limits than going through `OpenRouter`.
+    #[must_use]
+    pub const fn dashscope() -> Self {
+        Self {
+            provider_name: "DashScope",
+            api_key_env: "DASHSCOPE_API_KEY",
+            base_url_env: "DASHSCOPE_BASE_URL",
+            default_base_url: DEFAULT_DASHSCOPE_BASE_URL,
+            max_request_body_bytes: DASHSCOPE_MAX_REQUEST_BODY_BYTES,
+        }
+    }
+
     #[must_use]
     pub fn credential_env_vars(self) -> &'static [&'static str] {
         match self.provider_name {
             "xAI" => XAI_ENV_VARS,
             "OpenAI" => OPENAI_ENV_VARS,
+            "DashScope" => DASHSCOPE_ENV_VARS,
             _ => &[],
         }
     }
@@ -78,10 +121,15 @@ impl OpenAiCompatClient {
     const fn config(&self) -> OpenAiCompatConfig {
         self.config
     }
+
+    #[must_use]
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
     #[must_use]
     pub fn new(api_key: impl Into<String>, config: OpenAiCompatConfig) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: build_http_client_or_default(),
             api_key: api_key.into(),
             config,
             base_url: read_base_url(config),
@@ -92,18 +140,49 @@ impl OpenAiCompatClient {
     }
 
     pub fn from_env(config: OpenAiCompatConfig) -> Result<Self, ApiError> {
-        let Some(api_key) = read_env_non_empty(config.api_key_env)? else {
-            return Err(ApiError::missing_credentials(
-                config.provider_name,
-                config.credential_env_vars(),
-            ));
+        let base_url = read_base_url(config);
+        let api_key = match read_env_non_empty(config.api_key_env)? {
+            Some(api_key) => api_key,
+            None if config.provider_name == "OpenAI"
+                && is_local_openai_compatible_base_url(&base_url) =>
+            {
+                "local-dev-token".to_string()
+            }
+            None => {
+                return Err(ApiError::missing_credentials(
+                    config.provider_name,
+                    config.credential_env_vars(),
+                ));
+            }
         };
-        Ok(Self::new(api_key, config))
+        Ok(Self::new(api_key, config).with_base_url(base_url))
+    }
+    /// Create an Ollama client from `OLLAMA_HOST` env var.
+    /// Ollama requires no API key; a placeholder is used for the Authorization header.
+    pub fn from_ollama_env() -> Option<Self> {
+        let host =
+            std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
+        let base_url = format!("{}/v1", host.trim_end_matches('/'));
+        Some(Self {
+            http: build_http_client_or_default(),
+            api_key: "ollama".to_string(),
+            config: OLLAMA_CONFIG,
+            base_url,
+            max_retries: DEFAULT_MAX_RETRIES,
+            initial_backoff: DEFAULT_INITIAL_BACKOFF,
+            max_backoff: DEFAULT_MAX_BACKOFF,
+        })
     }
 
     #[must_use]
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
+        self
+    }
+
+    #[must_use]
+    pub fn with_http_client(mut self, http: reqwest::Client) -> Self {
+        self.http = http;
         self
     }
 
@@ -120,22 +199,73 @@ impl OpenAiCompatClient {
         self
     }
 
+    /// Replace the internal HTTP client with one that respects the given
+    /// timeout configuration.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: &crate::http_client::TimeoutConfig) -> Self {
+        self.http = crate::http_client::build_http_client_with_opts(
+            &crate::http_client::ProxyConfig::from_env(),
+            timeout,
+        )
+        .unwrap_or_else(|_| reqwest::Client::new());
+        self
+    }
+
     pub async fn send_message(
         &self,
         request: &MessageRequest,
     ) -> Result<MessageResponse, ApiError> {
-        let request = MessageRequest {
+        let original_model = request.model.clone();
+        let canonical = resolve_model_alias(&request.model);
+
+        let mut request = MessageRequest {
             stream: false,
             ..request.clone()
         };
+        request.model = canonical;
+
         preflight_message_request(&request)?;
         let response = self.send_with_retry(&request).await?;
         let request_id = request_id_from_headers(response.headers());
-        let payload = response.json::<ChatCompletionResponse>().await?;
+        let body = response.text().await.map_err(ApiError::from)?;
+        if let Ok(raw) = serde_json::from_str::<serde_json::Value>(&body) {
+            if let Some(err_obj) = raw.get("error") {
+                let msg = err_obj
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("provider returned an error")
+                    .to_string();
+                let code = err_obj
+                    .get("code")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|c| c as u16);
+                return Err(ApiError::Api {
+                    status: reqwest::StatusCode::from_u16(code.unwrap_or(400))
+                        .unwrap_or(reqwest::StatusCode::BAD_REQUEST),
+                    error_type: err_obj
+                        .get("type")
+                        .and_then(|t| t.as_str())
+                        .map(str::to_owned),
+                    message: Some(msg),
+                    request_id,
+                    body,
+                    retryable: false,
+                    suggested_action: suggested_action_for_status(
+                        reqwest::StatusCode::from_u16(code.unwrap_or(400))
+                            .unwrap_or(reqwest::StatusCode::BAD_REQUEST),
+                    ),
+                    retry_after: None,
+                });
+            }
+        }
+        let payload = serde_json::from_str::<ChatCompletionResponse>(&body).map_err(|error| {
+            ApiError::json_deserialize(self.config.provider_name, &original_model, &body, error)
+        })?;
         let mut normalized = normalize_response(&request.model, payload)?;
         if normalized.request_id.is_none() {
             normalized.request_id = request_id;
         }
+        normalized.model = original_model;
         Ok(normalized)
     }
 
@@ -143,17 +273,25 @@ impl OpenAiCompatClient {
         &self,
         request: &MessageRequest,
     ) -> Result<MessageStream, ApiError> {
-        preflight_message_request(request)?;
-        let response = self
-            .send_with_retry(&request.clone().with_streaming())
-            .await?;
+        let original_model = request.model.clone();
+        let canonical = resolve_model_alias(&request.model);
+
+        let mut streaming_request = request.clone().with_streaming();
+        streaming_request.model = canonical;
+
+        preflight_message_request(&streaming_request)?;
+        let response = self.send_with_retry(&streaming_request).await?;
+
         Ok(MessageStream {
             request_id: request_id_from_headers(response.headers()),
             response,
-            parser: OpenAiSseParser::new(),
+            parser: OpenAiSseParser::with_context(
+                self.config.provider_name,
+                original_model.clone(),
+            ),
             pending: VecDeque::new(),
             done: false,
-            state: StreamState::new(request.model.clone()),
+            state: StreamState::new(original_model),
         })
     }
 
@@ -179,7 +317,12 @@ impl OpenAiCompatClient {
                 break retryable_error;
             }
 
-            tokio::time::sleep(self.backoff_for_attempt(attempts)?).await;
+            let delay = if let Some(retry_after) = retryable_error.retry_after() {
+                retry_after
+            } else {
+                self.jittered_backoff_for_attempt(attempts)?
+            };
+            tokio::time::sleep(delay).await;
         };
 
         Err(ApiError::RetriesExhausted {
@@ -192,12 +335,19 @@ impl OpenAiCompatClient {
         &self,
         request: &MessageRequest,
     ) -> Result<reqwest::Response, ApiError> {
+        // Pre-flight check: verify request body size against provider limits
+        check_request_body_size_for_base_url(request, self.config(), &self.base_url)?;
+
         let request_url = chat_completions_endpoint(&self.base_url);
         self.http
             .post(&request_url)
             .header("content-type", "application/json")
             .bearer_auth(&self.api_key)
-            .json(&build_chat_completion_request(request, self.config()))
+            .json(&build_chat_completion_request_for_base_url(
+                request,
+                self.config(),
+                &self.base_url,
+            ))
             .send()
             .await
             .map_err(ApiError::from)
@@ -215,6 +365,53 @@ impl OpenAiCompatClient {
             .checked_mul(multiplier)
             .map_or(self.max_backoff, |delay| delay.min(self.max_backoff)))
     }
+
+    fn jittered_backoff_for_attempt(&self, attempt: u32) -> Result<Duration, ApiError> {
+        let base = self.backoff_for_attempt(attempt)?;
+        Ok(base + jitter_for_base(base))
+    }
+}
+
+/// Process-wide counter that guarantees distinct jitter samples even when
+/// the system clock resolution is coarser than consecutive retry sleeps.
+static JITTER_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Returns a random additive jitter in `[0, base]` to decorrelate retries
+/// Deserialize a JSON field as a `Vec<T>`, treating an explicit `null` value
+/// the same as a missing field (i.e. as an empty vector).
+/// Some OpenAI-compatible providers emit `"tool_calls": null` instead of
+/// omitting the field or using `[]`, which serde's `#[serde(default)]` alone
+/// does not tolerate — `default` only handles absent keys, not null values.
+fn deserialize_null_as_empty_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+/// from multiple concurrent clients. Entropy is drawn from the nanosecond
+/// wall clock mixed with a monotonic counter and run through a splitmix64
+/// finalizer; adequate for retry jitter (no cryptographic requirement).
+fn jitter_for_base(base: Duration) -> Duration {
+    let base_nanos = u64::try_from(base.as_nanos()).unwrap_or(u64::MAX);
+    if base_nanos == 0 {
+        return Duration::ZERO;
+    }
+    let raw_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
+        });
+    let tick = JITTER_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut mixed = raw_nanos
+        .wrapping_add(tick)
+        .wrapping_add(0x9E37_79B9_7F4A_7C15);
+    mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    mixed ^= mixed >> 31;
+    let jitter_nanos = mixed % base_nanos.saturating_add(1);
+    Duration::from_nanos(jitter_nanos)
 }
 
 impl Provider for OpenAiCompatClient {
@@ -282,11 +479,17 @@ impl MessageStream {
 #[derive(Debug, Default)]
 struct OpenAiSseParser {
     buffer: Vec<u8>,
+    provider: String,
+    model: String,
 }
 
 impl OpenAiSseParser {
-    fn new() -> Self {
-        Self::default()
+    fn with_context(provider: impl Into<String>, model: impl Into<String>) -> Self {
+        Self {
+            buffer: Vec::new(),
+            provider: provider.into(),
+            model: model.into(),
+        }
     }
 
     fn push(&mut self, chunk: &[u8]) -> Result<Vec<ChatCompletionChunk>, ApiError> {
@@ -294,7 +497,7 @@ impl OpenAiSseParser {
         let mut events = Vec::new();
 
         while let Some(frame) = next_sse_frame(&mut self.buffer) {
-            if let Some(event) = parse_sse_frame(&frame)? {
+            if let Some(event) = parse_sse_frame(&frame, &self.provider, &self.model)? {
                 events.push(event);
             }
         }
@@ -314,6 +517,8 @@ struct StreamState {
     stop_reason: Option<String>,
     usage: Option<Usage>,
     tool_calls: BTreeMap<u32, ToolCallState>,
+    thinking_started: bool,
+    thinking_finished: bool,
 }
 
 impl StreamState {
@@ -327,9 +532,12 @@ impl StreamState {
             stop_reason: None,
             usage: None,
             tool_calls: BTreeMap::new(),
+            thinking_started: false,
+            thinking_finished: false,
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn ingest_chunk(&mut self, chunk: ChatCompletionChunk) -> Result<Vec<StreamEvent>, ApiError> {
         let mut events = Vec::new();
         if !self.message_started {
@@ -355,44 +563,72 @@ impl StreamState {
         }
 
         if let Some(usage) = chunk.usage {
-            self.usage = Some(Usage {
-                input_tokens: usage.prompt_tokens,
-                cache_creation_input_tokens: 0,
-                cache_read_input_tokens: 0,
-                output_tokens: usage.completion_tokens,
-            });
+            self.usage = Some(usage.normalized());
         }
 
         for choice in chunk.choices {
+            // Handle reasoning/thinking from various provider fields
+            if let Some(reasoning) = choice
+                .delta
+                .reasoning_content
+                .filter(|value| !value.is_empty())
+                .or(choice.delta.reasoning.filter(|value| !value.is_empty()))
+                .or(choice
+                    .delta
+                    .thinking
+                    .and_then(|t| t.content)
+                    .filter(|value| !value.is_empty()))
+            {
+                if !self.thinking_started {
+                    self.thinking_started = true;
+                    events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+                        index: 0,
+                        content_block: OutputContentBlock::Thinking {
+                            thinking: String::new(),
+                            signature: None,
+                        },
+                    }));
+                }
+                events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+                    index: 0,
+                    delta: ContentBlockDelta::ThinkingDelta {
+                        thinking: reasoning,
+                    },
+                }));
+            }
+
             if let Some(content) = choice.delta.content.filter(|value| !value.is_empty()) {
+                self.close_thinking(&mut events);
                 if !self.text_started {
                     self.text_started = true;
                     events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
-                        index: 0,
+                        index: self.text_block_index(),
                         content_block: OutputContentBlock::Text {
                             text: String::new(),
                         },
                     }));
                 }
                 events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
-                    index: 0,
+                    index: self.text_block_index(),
                     delta: ContentBlockDelta::TextDelta { text: content },
                 }));
             }
 
             for tool_call in choice.delta.tool_calls {
+                self.close_thinking(&mut events);
+                let tool_index_offset = self.tool_index_offset();
                 let state = self.tool_calls.entry(tool_call.index).or_default();
                 state.apply(tool_call);
-                let block_index = state.block_index();
+                let block_index = state.block_index(tool_index_offset);
                 if !state.started {
-                    if let Some(start_event) = state.start_event()? {
+                    if let Some(start_event) = state.start_event(tool_index_offset)? {
                         state.started = true;
                         events.push(StreamEvent::ContentBlockStart(start_event));
                     } else {
                         continue;
                     }
                 }
-                if let Some(delta_event) = state.delta_event() {
+                if let Some(delta_event) = state.delta_event(tool_index_offset) {
                     events.push(StreamEvent::ContentBlockDelta(delta_event));
                 }
                 if choice.finish_reason.as_deref() == Some("tool_calls") && !state.stopped {
@@ -406,11 +642,12 @@ impl StreamState {
             if let Some(finish_reason) = choice.finish_reason {
                 self.stop_reason = Some(normalize_finish_reason(&finish_reason));
                 if finish_reason == "tool_calls" {
+                    let tool_index_offset = self.tool_index_offset();
                     for state in self.tool_calls.values_mut() {
                         if state.started && !state.stopped {
                             state.stopped = true;
                             events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
-                                index: state.block_index(),
+                                index: state.block_index(tool_index_offset),
                             }));
                         }
                     }
@@ -428,19 +665,21 @@ impl StreamState {
         self.finished = true;
 
         let mut events = Vec::new();
+        self.close_thinking(&mut events);
         if self.text_started && !self.text_finished {
             self.text_finished = true;
             events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
-                index: 0,
+                index: self.text_block_index(),
             }));
         }
 
+        let tool_index_offset = self.tool_index_offset();
         for state in self.tool_calls.values_mut() {
             if !state.started {
-                if let Some(start_event) = state.start_event()? {
+                if let Some(start_event) = state.start_event(tool_index_offset)? {
                     state.started = true;
                     events.push(StreamEvent::ContentBlockStart(start_event));
-                    if let Some(delta_event) = state.delta_event() {
+                    if let Some(delta_event) = state.delta_event(tool_index_offset) {
                         events.push(StreamEvent::ContentBlockDelta(delta_event));
                     }
                 }
@@ -448,7 +687,7 @@ impl StreamState {
             if state.started && !state.stopped {
                 state.stopped = true;
                 events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
-                    index: state.block_index(),
+                    index: state.block_index(tool_index_offset),
                 }));
             }
         }
@@ -473,6 +712,31 @@ impl StreamState {
             events.push(StreamEvent::MessageStop(MessageStopEvent {}));
         }
         Ok(events)
+    }
+
+    fn close_thinking(&mut self, events: &mut Vec<StreamEvent>) {
+        if self.thinking_started && !self.thinking_finished {
+            self.thinking_finished = true;
+            events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
+                index: 0,
+            }));
+        }
+    }
+
+    const fn text_block_index(&self) -> u32 {
+        if self.thinking_started {
+            1
+        } else {
+            0
+        }
+    }
+
+    const fn tool_index_offset(&self) -> u32 {
+        if self.thinking_started {
+            2
+        } else {
+            1
+        }
     }
 }
 
@@ -501,12 +765,12 @@ impl ToolCallState {
         }
     }
 
-    const fn block_index(&self) -> u32 {
-        self.openai_index + 1
+    const fn block_index(&self, offset: u32) -> u32 {
+        self.openai_index + offset
     }
 
     #[allow(clippy::unnecessary_wraps)]
-    fn start_event(&self) -> Result<Option<ContentBlockStartEvent>, ApiError> {
+    fn start_event(&self, offset: u32) -> Result<Option<ContentBlockStartEvent>, ApiError> {
         let Some(name) = self.name.clone() else {
             return Ok(None);
         };
@@ -515,7 +779,7 @@ impl ToolCallState {
             .clone()
             .unwrap_or_else(|| format!("tool_call_{}", self.openai_index));
         Ok(Some(ContentBlockStartEvent {
-            index: self.block_index(),
+            index: self.block_index(offset),
             content_block: OutputContentBlock::ToolUse {
                 id,
                 name,
@@ -524,14 +788,14 @@ impl ToolCallState {
         }))
     }
 
-    fn delta_event(&mut self) -> Option<ContentBlockDeltaEvent> {
+    fn delta_event(&mut self, offset: u32) -> Option<ContentBlockDeltaEvent> {
         if self.emitted_len >= self.arguments.len() {
             return None;
         }
         let delta = self.arguments[self.emitted_len..].to_string();
         self.emitted_len = self.arguments.len();
         Some(ContentBlockDeltaEvent {
-            index: self.block_index(),
+            index: self.block_index(offset),
             delta: ContentBlockDelta::InputJsonDelta {
                 partial_json: delta,
             },
@@ -541,6 +805,7 @@ impl ToolCallState {
 
 #[derive(Debug, Deserialize)]
 struct ChatCompletionResponse {
+    #[serde(default)]
     id: String,
     model: String,
     choices: Vec<ChatChoice>,
@@ -560,6 +825,10 @@ struct ChatMessage {
     role: String,
     #[serde(default)]
     content: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    reasoning: Option<String>,
     #[serde(default)]
     tool_calls: Vec<ResponseToolCall>,
 }
@@ -582,10 +851,34 @@ struct OpenAiUsage {
     prompt_tokens: u32,
     #[serde(default)]
     completion_tokens: u32,
+    #[serde(default)]
+    prompt_tokens_details: Option<OpenAiPromptTokensDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiPromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: u32,
+}
+
+impl OpenAiUsage {
+    fn normalized(&self) -> Usage {
+        let cached_tokens = self
+            .prompt_tokens_details
+            .as_ref()
+            .map_or(0, |details| details.cached_tokens);
+        Usage {
+            input_tokens: self.prompt_tokens.saturating_sub(cached_tokens),
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: cached_tokens,
+            output_tokens: self.completion_tokens,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
 struct ChatCompletionChunk {
+    #[serde(default)]
     id: String,
     #[serde(default)]
     model: Option<String>,
@@ -597,6 +890,7 @@ struct ChatCompletionChunk {
 
 #[derive(Debug, Deserialize)]
 struct ChunkChoice {
+    #[serde(default)]
     delta: ChunkDelta,
     #[serde(default)]
     finish_reason: Option<String>,
@@ -606,8 +900,21 @@ struct ChunkChoice {
 struct ChunkDelta {
     #[serde(default)]
     content: Option<String>,
+    /// Some providers (GLM, DeepSeek) emit reasoning in `reasoning_content`
     #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    reasoning: Option<String>,
+    #[serde(default)]
+    thinking: Option<ThinkingDelta>,
+    #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
     tool_calls: Vec<DeltaToolCall>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ThinkingDelta {
+    #[serde(default)]
+    content: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -640,7 +947,193 @@ struct ErrorBody {
     message: Option<String>,
 }
 
-fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatConfig) -> Value {
+/// Returns true for models known to reject tuning parameters like temperature,
+/// `top_p`, `frequency_penalty`, and `presence_penalty`. These are typically
+/// reasoning/chain-of-thought models with fixed sampling.
+/// Returns true for models known to reject tuning parameters like temperature,
+/// `top_p`, `frequency_penalty`, and `presence_penalty`. These are typically
+/// reasoning/chain-of-thought models with fixed sampling.
+/// Public for benchmarking and testing purposes.
+#[must_use]
+pub fn is_reasoning_model(model: &str) -> bool {
+    let lowered = model.to_ascii_lowercase();
+    // Strip any provider/ prefix for the check (e.g. qwen/qwen-qwq -> qwen-qwq)
+    let canonical = lowered.rsplit('/').next().unwrap_or(lowered.as_str());
+    // OpenAI reasoning models
+    canonical.starts_with("o1")
+        || canonical.starts_with("o3")
+        || canonical.starts_with("o4")
+        // xAI reasoning: grok-3-mini always uses reasoning mode
+        || canonical == "grok-3-mini"
+        // Alibaba DashScope reasoning variants (QwQ + Qwen3-Thinking family)
+        || canonical.starts_with("qwen-qwq")
+        || canonical.starts_with("qwq")
+        || canonical.contains("thinking")
+}
+
+/// Returns true for OpenAI-compatible `DeepSeek` V4 models that require prior
+/// assistant reasoning to be echoed back as `reasoning_content` in history.
+#[must_use]
+pub fn model_requires_reasoning_content_in_history(model: &str) -> bool {
+    let lowered = model.to_ascii_lowercase();
+    let canonical = lowered.rsplit('/').next().unwrap_or(lowered.as_str());
+    canonical.starts_with("deepseek-v4")
+}
+
+/// Strip routing prefix (e.g., "openai/gpt-4" → "gpt-4") for the wire.
+/// The prefix is used only to select transport; the backend expects the
+/// bare model id. Use `local/` to force OpenAI-compatible routing while
+/// preserving any slashes that follow the prefix.
+#[allow(dead_code)]
+fn strip_routing_prefix(model: &str) -> &str {
+    if let Some(pos) = model.find('/') {
+        let prefix = &model[..pos];
+        // Only strip if the prefix before "/" is a known routing prefix,
+        // not if "/" appears in the middle of the model name for other reasons.
+        if matches!(
+            prefix,
+            "openai" | "xai" | "grok" | "qwen" | "kimi" | "local"
+        ) {
+            &model[pos + 1..]
+        } else {
+            model
+        }
+    } else {
+        model
+    }
+}
+
+fn normalize_base_url_for_model_routing(url: &str) -> &str {
+    let trimmed = url.trim_end_matches('/');
+    trimmed
+        .strip_suffix("/chat/completions")
+        .map(|value| value.trim_end_matches('/'))
+        .unwrap_or(trimmed)
+}
+
+fn url_host(url: &str) -> &str {
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host_port)| host_port);
+    if host_port.starts_with('[') {
+        return host_port
+            .split(']')
+            .next()
+            .unwrap_or("")
+            .trim_start_matches('[');
+    }
+    host_port.split(':').next().unwrap_or("")
+}
+
+fn is_local_openai_compatible_base_url(url: &str) -> bool {
+    let host = url_host(url.trim());
+    if host.eq_ignore_ascii_case("localhost") || host == "::1" {
+        return true;
+    }
+    let Ok(address) = host.parse::<Ipv4Addr>() else {
+        return false;
+    };
+    let [first, second, ..] = address.octets();
+    matches!(first, 10 | 127)
+        || first == 192 && second == 168
+        || first == 172 && (16..=31).contains(&second)
+}
+
+fn wire_model_for_base_url<'a>(
+    model: &'a str,
+    config: OpenAiCompatConfig,
+    base_url: &str,
+) -> Cow<'a, str> {
+    let Some(pos) = model.find('/') else {
+        return Cow::Borrowed(model);
+    };
+    let prefix = &model[..pos];
+    let lowered_prefix = prefix.to_ascii_lowercase();
+
+    if lowered_prefix == "openai" {
+        let normalized_base_url = normalize_base_url_for_model_routing(base_url);
+        let default_base_url = normalize_base_url_for_model_routing(config.default_base_url);
+        if normalized_base_url.eq_ignore_ascii_case(default_base_url)
+            || is_local_openai_compatible_base_url(base_url)
+        {
+            return Cow::Borrowed(&model[pos + 1..]);
+        }
+        return Cow::Borrowed(model);
+    }
+
+    if matches!(lowered_prefix.as_str(), "xai" | "grok" | "qwen" | "kimi") {
+        return Cow::Borrowed(&model[pos + 1..]);
+    }
+    if lowered_prefix == "local" {
+        return Cow::Borrowed(&model[pos + 1..]);
+    }
+
+    Cow::Borrowed(model)
+}
+
+/// Estimate the serialized JSON size of a request payload in bytes.
+/// This is a pre-flight check to avoid hitting provider-specific size limits.
+#[must_use]
+pub fn estimate_request_body_size(request: &MessageRequest, config: OpenAiCompatConfig) -> usize {
+    estimate_request_body_size_for_base_url(request, config, &read_base_url(config))
+}
+
+fn estimate_request_body_size_for_base_url(
+    request: &MessageRequest,
+    config: OpenAiCompatConfig,
+    base_url: &str,
+) -> usize {
+    let payload = build_chat_completion_request_for_base_url(request, config, base_url);
+    // serde_json::to_vec gives us the exact byte size of the serialized JSON
+    serde_json::to_vec(&payload).map_or(0, |v| v.len())
+}
+
+/// Pre-flight check for request body size against provider limits.
+/// Returns Ok(()) if the request is within limits, or an error with
+/// a clear message about the size limit being exceeded.
+pub fn check_request_body_size(
+    request: &MessageRequest,
+    config: OpenAiCompatConfig,
+) -> Result<(), ApiError> {
+    check_request_body_size_for_base_url(request, config, &read_base_url(config))
+}
+
+fn check_request_body_size_for_base_url(
+    request: &MessageRequest,
+    config: OpenAiCompatConfig,
+    base_url: &str,
+) -> Result<(), ApiError> {
+    let estimated_bytes = estimate_request_body_size_for_base_url(request, config, base_url);
+    let max_bytes = config.max_request_body_bytes;
+
+    if estimated_bytes > max_bytes {
+        Err(ApiError::RequestBodySizeExceeded {
+            estimated_bytes,
+            max_bytes,
+            provider: config.provider_name,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+/// Builds a chat completion request payload from a `MessageRequest`.
+/// Public for benchmarking purposes.
+#[must_use]
+pub fn build_chat_completion_request(
+    request: &MessageRequest,
+    config: OpenAiCompatConfig,
+) -> Value {
+    build_chat_completion_request_for_base_url(request, config, &read_base_url(config))
+}
+
+fn build_chat_completion_request_for_base_url(
+    request: &MessageRequest,
+    config: OpenAiCompatConfig,
+    base_url: &str,
+) -> Value {
     let mut messages = Vec::new();
     if let Some(system) = request.system.as_ref().filter(|value| !value.is_empty()) {
         messages.push(json!({
@@ -648,13 +1141,34 @@ fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatC
             "content": system,
         }));
     }
+    // Resolve the transport routing prefix into the wire model. Custom
+    // OpenAI-compatible gateways may require slash-containing slugs intact.
+    let wire_model = wire_model_for_base_url(&request.model, config, base_url);
+    let wire_model = wire_model.as_ref();
     for message in &request.messages {
-        messages.extend(translate_message(message));
+        messages.extend(translate_message(message, wire_model));
     }
+    // Sanitize: drop any `role:"tool"` message that does not have a valid
+    // paired `role:"assistant"` with a `tool_calls` entry carrying the same
+    // `id` immediately before it (directly or as part of a run of tool
+    // results). OpenAI-compatible backends return 400 for orphaned tool
+    // messages regardless of how they were produced (compaction, session
+    // editing, resume, etc.). We drop rather than error so the request can
+    // still proceed with the remaining history intact.
+    messages = sanitize_tool_message_pairing(messages);
+
+    // gpt-5* requires `max_completion_tokens`; older OpenAI models accept both.
+    // We send the correct field based on the wire model name so gpt-5.x requests
+    // don't fail with "unknown field max_tokens".
+    let max_tokens_key = if wire_model.starts_with("gpt-5") {
+        "max_completion_tokens"
+    } else {
+        "max_tokens"
+    };
 
     let mut payload = json!({
-        "model": request.model,
-        "max_tokens": request.max_tokens,
+        "model": wire_model,
+        max_tokens_key: request.max_tokens,
         "messages": messages,
         "stream": request.stream,
     });
@@ -671,17 +1185,94 @@ fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatC
         payload["tool_choice"] = openai_tool_choice(tool_choice);
     }
 
+    // OpenAI-compatible tuning parameters — only included when explicitly set.
+    // Reasoning models (o1/o3/o4/grok-3-mini) reject these params with 400;
+    // silently strip them to avoid cryptic provider errors.
+    if !is_reasoning_model(&request.model) {
+        if let Some(temperature) = request.temperature {
+            payload["temperature"] = json!(temperature);
+        }
+        if let Some(top_p) = request.top_p {
+            payload["top_p"] = json!(top_p);
+        }
+        if let Some(frequency_penalty) = request.frequency_penalty {
+            payload["frequency_penalty"] = json!(frequency_penalty);
+        }
+        if let Some(presence_penalty) = request.presence_penalty {
+            payload["presence_penalty"] = json!(presence_penalty);
+        }
+    }
+    // stop is generally safe for all providers
+    if let Some(stop) = &request.stop {
+        if !stop.is_empty() {
+            payload["stop"] = json!(stop);
+        }
+    }
+    // reasoning_effort for OpenAI-compatible reasoning models (o4-mini, o3, etc.)
+    if let Some(effort) = &request.reasoning_effort {
+        payload["reasoning_effort"] = json!(effort);
+    }
+
+    for (key, value) in &request.extra_body {
+        if is_protected_extra_body_key(key) {
+            continue;
+        }
+        payload[key] = value.clone();
+    }
+
+    // DeepSeek V4 Pro/Flash thinking mode requires this provider-specific opt-in
+    // and also requires assistant reasoning history to be echoed as `reasoning_content`.
+    // Apply it after extra_body so callers cannot accidentally override the required shape.
+    if model_requires_reasoning_content_in_history(wire_model) {
+        payload["thinking"] = json!({"type": "enabled"});
+    }
+
     payload
 }
 
-fn translate_message(message: &InputMessage) -> Vec<Value> {
+fn is_protected_extra_body_key(key: &str) -> bool {
+    matches!(
+        key,
+        "model"
+            | "messages"
+            | "stream"
+            | "tools"
+            | "tool_choice"
+            | "max_tokens"
+            | "max_completion_tokens"
+    )
+}
+
+/// Returns true for models that do NOT support the `is_error` field in tool results.
+/// kimi models (via Moonshot AI/Dashscope) reject this field with 400 Bad Request.
+/// Returns true for models that do NOT support the `is_error` field in tool results.
+/// kimi models (via Moonshot AI/Dashscope) reject this field with 400 Bad Request.
+/// Public for benchmarking and testing purposes.
+#[must_use]
+pub fn model_rejects_is_error_field(model: &str) -> bool {
+    let lowered = model.to_ascii_lowercase();
+    // Strip any provider/ prefix for the check
+    let canonical = lowered.rsplit('/').next().unwrap_or(lowered.as_str());
+    // kimi models (kimi-k2.5, kimi-k1.5, kimi-moonshot, etc.)
+    canonical.starts_with("kimi")
+}
+
+/// Translates an `InputMessage` into OpenAI-compatible message format.
+/// Public for benchmarking purposes.
+#[must_use]
+pub fn translate_message(message: &InputMessage, model: &str) -> Vec<Value> {
+    let supports_is_error = !model_rejects_is_error_field(model);
     match message.role.as_str() {
         "assistant" => {
             let mut text = String::new();
+            let mut reasoning = String::new();
             let mut tool_calls = Vec::new();
             for block in &message.content {
                 match block {
                     InputContentBlock::Text { text: value } => text.push_str(value),
+                    InputContentBlock::Thinking {
+                        thinking: value, ..
+                    } => reasoning.push_str(value),
                     InputContentBlock::ToolUse { id, name, input } => tool_calls.push(json!({
                         "id": id,
                         "type": "function",
@@ -693,14 +1284,27 @@ fn translate_message(message: &InputMessage) -> Vec<Value> {
                     InputContentBlock::ToolResult { .. } => {}
                 }
             }
-            if text.is_empty() && tool_calls.is_empty() {
+            let needs_reasoning = model_requires_reasoning_content_in_history(model);
+            if text.is_empty() && tool_calls.is_empty() && reasoning.is_empty() {
                 Vec::new()
             } else {
-                vec![json!({
+                let mut msg = serde_json::json!({
                     "role": "assistant",
-                    "content": (!text.is_empty()).then_some(text),
-                    "tool_calls": tool_calls,
-                })]
+                });
+                if !text.is_empty() {
+                    msg["content"] = json!(text);
+                } else if !needs_reasoning {
+                    msg["content"] = Value::Null;
+                }
+                if needs_reasoning {
+                    msg["reasoning_content"] = json!(reasoning);
+                }
+                // Only include tool_calls when non-empty: some providers reject
+                // assistant messages with an explicit empty tool_calls array.
+                if !tool_calls.is_empty() {
+                    msg["tool_calls"] = json!(tool_calls);
+                }
+                vec![msg]
             }
         }
         _ => message
@@ -715,36 +1319,167 @@ fn translate_message(message: &InputMessage) -> Vec<Value> {
                     tool_use_id,
                     content,
                     is_error,
-                } => Some(json!({
-                    "role": "tool",
-                    "tool_call_id": tool_use_id,
-                    "content": flatten_tool_result_content(content),
-                    "is_error": is_error,
-                })),
-                InputContentBlock::ToolUse { .. } => None,
+                } => {
+                    let mut msg = json!({
+                        "role": "tool",
+                        "tool_call_id": tool_use_id,
+                        "content": flatten_tool_result_content(content),
+                    });
+                    // Only include is_error for models that support it.
+                    // kimi models reject this field with 400 Bad Request.
+                    if supports_is_error {
+                        msg["is_error"] = json!(is_error);
+                    }
+                    Some(msg)
+                }
+                InputContentBlock::Thinking { .. } | InputContentBlock::ToolUse { .. } => None,
             })
             .collect(),
     }
 }
 
-fn flatten_tool_result_content(content: &[ToolResultContentBlock]) -> String {
-    content
+/// Remove `role:"tool"` messages from `messages` that have no valid paired
+/// `role:"assistant"` message with a matching `tool_calls[].id` immediately
+/// preceding them. This is a last-resort safety net at the request-building
+/// layer — the compaction boundary fix (6e301c8) prevents the most common
+/// producer path, but resume, session editing, or future compaction variants
+/// could still create orphaned tool messages.
+///
+/// Algorithm: scan left-to-right. For each `role:"tool"` message, check the
+/// immediately preceding non-tool message. If it's `role:"assistant"` with a
+/// `tool_calls` array containing an entry whose `id` matches the tool
+/// message's `tool_call_id`, the pair is valid and both are kept. Otherwise
+/// the tool message is dropped.
+/// Remove `role:"tool"` messages from `messages` that have no valid paired
+/// `role:"assistant"` message with a matching `tool_calls[].id` immediately
+/// preceding them. Public for benchmarking purposes.
+pub fn sanitize_tool_message_pairing(messages: Vec<Value>) -> Vec<Value> {
+    // Collect indices of tool messages that are orphaned.
+    let mut drop_indices = std::collections::HashSet::new();
+    for (i, msg) in messages.iter().enumerate() {
+        if msg.get("role").and_then(|v| v.as_str()) != Some("tool") {
+            continue;
+        }
+        let tool_call_id = msg
+            .get("tool_call_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        // Find the nearest preceding non-tool message.
+        let preceding = messages[..i]
+            .iter()
+            .rev()
+            .find(|m| m.get("role").and_then(|v| v.as_str()) != Some("tool"));
+        // A tool message is considered paired when:
+        // (a) the nearest preceding non-tool message is an assistant message
+        //     whose `tool_calls` array contains an entry with the matching id, OR
+        // (b) there's no clear preceding context (e.g. the message comes right
+        //     after a user turn — this can happen with translated mixed-content
+        //     user messages). In case (b) we allow the message through rather
+        //     than silently dropping potentially valid history.
+        let preceding_role = preceding
+            .and_then(|m| m.get("role"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        // Only apply sanitization when the preceding message is an assistant
+        // turn (the invariant is: assistant-with-tool_calls must precede tool).
+        // If the preceding is something else (user, system) don't drop — it
+        // may be a valid translation artifact or a path we don't understand.
+        if preceding_role != "assistant" {
+            continue;
+        }
+        let paired = preceding
+            .and_then(|m| m.get("tool_calls").and_then(|tc| tc.as_array()))
+            .is_some_and(|tool_calls| {
+                tool_calls
+                    .iter()
+                    .any(|tc| tc.get("id").and_then(|v| v.as_str()) == Some(tool_call_id))
+            });
+        if !paired {
+            drop_indices.insert(i);
+        }
+    }
+    if drop_indices.is_empty() {
+        return messages;
+    }
+    messages
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| !drop_indices.contains(i))
+        .map(|(_, m)| m)
+        .collect()
+}
+
+/// Flattens tool result content blocks into a single string.
+/// Optimized to pre-allocate capacity and avoid intermediate `Vec` construction.
+#[must_use]
+pub fn flatten_tool_result_content(content: &[ToolResultContentBlock]) -> String {
+    // Pre-calculate total capacity needed to avoid reallocations
+    let total_len: usize = content
         .iter()
         .map(|block| match block {
-            ToolResultContentBlock::Text { text } => text.clone(),
-            ToolResultContentBlock::Json { value } => value.to_string(),
+            ToolResultContentBlock::Text { text } => text.len(),
+            ToolResultContentBlock::Json { value } => value.to_string().len(),
         })
-        .collect::<Vec<_>>()
-        .join("\n")
+        .sum();
+
+    // Add capacity for newlines between blocks
+    let capacity = total_len + content.len().saturating_sub(1);
+
+    let mut result = String::with_capacity(capacity);
+    for (i, block) in content.iter().enumerate() {
+        if i > 0 {
+            result.push('\n');
+        }
+        match block {
+            ToolResultContentBlock::Text { text } => result.push_str(text),
+            ToolResultContentBlock::Json { value } => {
+                // Use write! to append without creating intermediate String
+                result.push_str(&value.to_string());
+            }
+        }
+    }
+    result
+}
+
+/// Recursively ensure every object-type node in a JSON Schema has
+/// `"properties"` (at least `{}`) and `"additionalProperties": false`.
+/// The `OpenAI` `/responses` endpoint validates schemas strictly and rejects
+/// objects that omit these fields; `/chat/completions` is lenient but also
+/// accepts them, so we normalise unconditionally.
+fn normalize_object_schema(schema: &mut Value) {
+    if let Some(obj) = schema.as_object_mut() {
+        if obj.get("type").and_then(Value::as_str) == Some("object") {
+            obj.entry("properties").or_insert_with(|| json!({}));
+            obj.entry("additionalProperties")
+                .or_insert(Value::Bool(false));
+        }
+        // Recurse into properties values
+        if let Some(props) = obj.get_mut("properties") {
+            if let Some(props_obj) = props.as_object_mut() {
+                let keys: Vec<String> = props_obj.keys().cloned().collect();
+                for k in keys {
+                    if let Some(v) = props_obj.get_mut(&k) {
+                        normalize_object_schema(v);
+                    }
+                }
+            }
+        }
+        // Recurse into items (arrays)
+        if let Some(items) = obj.get_mut("items") {
+            normalize_object_schema(items);
+        }
+    }
 }
 
 fn openai_tool_definition(tool: &ToolDefinition) -> Value {
+    let mut parameters = tool.input_schema.clone();
+    normalize_object_schema(&mut parameters);
     json!({
         "type": "function",
         "function": {
             "name": tool.name,
             "description": tool.description,
-            "parameters": tool.input_schema,
+            "parameters": parameters,
         }
     })
 }
@@ -776,6 +1511,17 @@ fn normalize_response(
             "chat completion response missing choices",
         ))?;
     let mut content = Vec::new();
+    if let Some(thinking) = choice
+        .message
+        .reasoning_content
+        .filter(|value| !value.is_empty())
+        .or(choice.message.reasoning.filter(|value| !value.is_empty()))
+    {
+        content.push(OutputContentBlock::Thinking {
+            thinking,
+            signature: None,
+        });
+    }
     if let Some(text) = choice.message.content.filter(|value| !value.is_empty()) {
         content.push(OutputContentBlock::Text { text });
     }
@@ -797,18 +1543,10 @@ fn normalize_response(
             .finish_reason
             .map(|value| normalize_finish_reason(&value)),
         stop_sequence: None,
-        usage: Usage {
-            input_tokens: response
-                .usage
-                .as_ref()
-                .map_or(0, |usage| usage.prompt_tokens),
-            cache_creation_input_tokens: 0,
-            cache_read_input_tokens: 0,
-            output_tokens: response
-                .usage
-                .as_ref()
-                .map_or(0, |usage| usage.completion_tokens),
-        },
+        usage: response
+            .usage
+            .as_ref()
+            .map_or_else(Usage::default, OpenAiUsage::normalized),
         request_id: None,
     })
 }
@@ -835,7 +1573,11 @@ fn next_sse_frame(buffer: &mut Vec<u8>) -> Option<String> {
     Some(String::from_utf8_lossy(&frame[..frame_len]).into_owned())
 }
 
-fn parse_sse_frame(frame: &str) -> Result<Option<ChatCompletionChunk>, ApiError> {
+fn parse_sse_frame(
+    frame: &str,
+    provider: &str,
+    model: &str,
+) -> Result<Option<ChatCompletionChunk>, ApiError> {
     let trimmed = frame.trim();
     if trimmed.is_empty() {
         return Ok(None);
@@ -850,22 +1592,114 @@ fn parse_sse_frame(frame: &str) -> Result<Option<ChatCompletionChunk>, ApiError>
             data_lines.push(data.trim_start());
         }
     }
+    // If no SSE data lines found, check if the entire frame is raw JSON (error or otherwise)
     if data_lines.is_empty() {
+        // Detect raw JSON error response (not SSE-framed)
+        if let Ok(raw) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            if let Some(err_obj) = raw.get("error") {
+                let msg = err_obj
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("provider returned an error")
+                    .to_string();
+                let code = err_obj
+                    .get("code")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|c| c as u16);
+                let status = reqwest::StatusCode::from_u16(code.unwrap_or(500))
+                    .unwrap_or(reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+                return Err(ApiError::Api {
+                    status,
+                    error_type: err_obj
+                        .get("type")
+                        .and_then(|t| t.as_str())
+                        .map(str::to_owned),
+                    message: Some(msg),
+                    request_id: None,
+                    body: trimmed.chars().take(500).collect(),
+                    retryable: false,
+                    suggested_action: suggested_action_for_status(status),
+                    retry_after: None,
+                });
+            }
+        }
+        // Detect HTML responses
+        if trimmed.starts_with('<') || trimmed.starts_with("<!") {
+            return Err(ApiError::Api {
+                status: reqwest::StatusCode::BAD_REQUEST,
+                error_type: Some("invalid_response".to_string()),
+                message: Some(
+                    "provider returned HTML instead of JSON (check endpoint URL)".to_string(),
+                ),
+                request_id: None,
+                body: trimmed.chars().take(200).collect(),
+                retryable: false,
+                suggested_action: Some("verify the API endpoint URL is correct".to_string()),
+                retry_after: None,
+            });
+        }
         return Ok(None);
     }
     let payload = data_lines.join("\n");
     if payload == "[DONE]" {
         return Ok(None);
     }
-    serde_json::from_str(&payload)
+    // Some backends embed an error object in a data: frame instead of using an
+    // HTTP error status. Surface the error message directly rather than letting
+    // ChatCompletionChunk deserialization fail with a cryptic 'missing field' error.
+    if let Ok(raw) = serde_json::from_str::<serde_json::Value>(&payload) {
+        if let Some(err_obj) = raw.get("error") {
+            let msg = err_obj
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("provider returned an error in stream")
+                .to_string();
+            let code = err_obj
+                .get("code")
+                .and_then(serde_json::Value::as_u64)
+                .map(|c| c as u16);
+            let status = reqwest::StatusCode::from_u16(code.unwrap_or(400))
+                .unwrap_or(reqwest::StatusCode::BAD_REQUEST);
+            return Err(ApiError::Api {
+                status,
+                error_type: err_obj
+                    .get("type")
+                    .and_then(|t| t.as_str())
+                    .map(str::to_owned),
+                message: Some(msg),
+                request_id: None,
+                body: payload.clone(),
+                retryable: false,
+                suggested_action: suggested_action_for_status(status),
+                retry_after: None,
+            });
+        }
+    }
+    // Detect HTML or other non-JSON responses early for better error messages
+    let trimmed_payload = payload.trim();
+    if trimmed_payload.starts_with('<') || trimmed_payload.starts_with("<!") {
+        return Err(ApiError::Api {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            error_type: Some("invalid_response".to_string()),
+            message: Some(
+                "provider returned HTML instead of JSON (check endpoint URL)".to_string(),
+            ),
+            request_id: None,
+            body: payload.chars().take(200).collect(),
+            retryable: false,
+            suggested_action: Some("verify the API endpoint URL is correct".to_string()),
+            retry_after: None,
+        });
+    }
+    serde_json::from_str::<ChatCompletionChunk>(&payload)
         .map(Some)
-        .map_err(ApiError::from)
+        .map_err(|error| ApiError::json_deserialize(provider, model, &payload, error))
 }
 
 fn read_env_non_empty(key: &str) -> Result<Option<String>, ApiError> {
     match std::env::var(key) {
         Ok(value) if !value.is_empty() => Ok(Some(value)),
-        Ok(_) | Err(std::env::VarError::NotPresent) => Ok(None),
+        Ok(_) | Err(std::env::VarError::NotPresent) => Ok(super::dotenv_value(key)),
         Err(error) => Err(ApiError::from(error)),
     }
 }
@@ -906,10 +1740,14 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
         return Ok(response);
     }
 
-    let request_id = request_id_from_headers(response.headers());
+    let headers = response.headers().clone();
+    let request_id = request_id_from_headers(&headers);
     let body = response.text().await.unwrap_or_default();
     let parsed_error = serde_json::from_str::<ErrorEnvelope>(&body).ok();
     let retryable = is_retryable_status(status);
+    let retry_after = parse_retry_after(&headers, status);
+
+    let suggested_action = suggested_action_for_status(status);
 
     Err(ApiError::Api {
         status,
@@ -922,11 +1760,56 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
         request_id,
         body,
         retryable,
+        suggested_action,
+        retry_after,
     })
+}
+
+fn parse_retry_after(
+    headers: &reqwest::header::HeaderMap,
+    status: reqwest::StatusCode,
+) -> Option<std::time::Duration> {
+    if status != reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return None;
+    }
+    headers
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
 }
 
 const fn is_retryable_status(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 408 | 409 | 429 | 500 | 502 | 503 | 504)
+}
+
+/// Some providers return HTTP 400 with an unparseable body when a gateway
+/// or proxy flakes (e.g. "HTTP 400 from backend (no parseable body)").
+/// These are transient network blips, not actual bad requests, and should
+/// be retried.
+fn is_retryable_400(status: reqwest::StatusCode, body: &str) -> bool {
+    if status != reqwest::StatusCode::BAD_REQUEST {
+        return false;
+    }
+    let lowered = body.to_ascii_lowercase();
+    lowered.contains("no parseable body")
+        || lowered.contains("connection reset")
+        || lowered.contains("broken pipe")
+        || lowered.contains("empty reply from server")
+}
+
+/// Generate a suggested user action based on the HTTP status code and error context.
+/// This provides actionable guidance when API requests fail.
+fn suggested_action_for_status(status: reqwest::StatusCode) -> Option<String> {
+    match status.as_u16() {
+        401 => Some("Check API key is set correctly and has not expired".to_string()),
+        403 => Some("Verify API key has required permissions for this operation".to_string()),
+        413 => Some("Reduce prompt size or context window before retrying".to_string()),
+        429 => Some("Wait a moment before retrying; consider reducing request rate".to_string()),
+        500 => Some("Provider server error - retry after a brief wait".to_string()),
+        502..=504 => Some("Provider gateway error - retry after a brief wait".to_string()),
+        _ => None,
+    }
 }
 
 fn normalize_finish_reason(value: &str) -> String {
@@ -955,15 +1838,20 @@ impl StringExt for String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_chat_completion_request, chat_completions_endpoint, normalize_finish_reason,
+        build_chat_completion_request, chat_completions_endpoint, is_reasoning_model,
+        model_requires_reasoning_content_in_history, normalize_finish_reason, normalize_response,
         openai_tool_choice, parse_tool_arguments, OpenAiCompatClient, OpenAiCompatConfig,
+        StreamState,
     };
     use crate::error::ApiError;
     use crate::types::{
-        InputContentBlock, InputMessage, MessageRequest, ToolChoice, ToolDefinition,
-        ToolResultContentBlock,
+        ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent,
+        InputContentBlock, InputMessage, MessageRequest, OutputContentBlock, StreamEvent,
+        ToolChoice, ToolDefinition, ToolResultContentBlock,
     };
     use serde_json::json;
+    use std::borrow::Cow;
+    use std::collections::BTreeMap;
     use std::sync::{Mutex, OnceLock};
 
     #[test]
@@ -995,6 +1883,7 @@ mod tests {
                 }]),
                 tool_choice: Some(ToolChoice::Auto),
                 stream: false,
+                ..Default::default()
             },
             OpenAiCompatConfig::xai(),
         );
@@ -1004,6 +1893,331 @@ mod tests {
         assert_eq!(payload["messages"][2]["role"], json!("tool"));
         assert_eq!(payload["tools"][0]["type"], json!("function"));
         assert_eq!(payload["tool_choice"], json!("auto"));
+    }
+
+    #[test]
+    fn model_requires_reasoning_content_in_history_detects_deepseek_v4_models() {
+        // Given DeepSeek V4 and non-V4 model names.
+        let positive = [
+            "deepseek-v4-flash",
+            "deepseek-v4-pro",
+            "openai/deepseek-v4-pro",
+            "deepseek/deepseek-v4-flash",
+        ];
+        let negative = [
+            "deepseek-reasoner",
+            "deepseek-chat",
+            "gpt-4o",
+            "claude-sonnet-4-6",
+        ];
+
+        // When checking whether history reasoning_content is required.
+        // Then only DeepSeek V4 variants require it.
+        for model in positive {
+            assert!(model_requires_reasoning_content_in_history(model));
+        }
+        for model in negative {
+            assert!(!model_requires_reasoning_content_in_history(model));
+        }
+    }
+
+    #[test]
+    fn legacy_deepseek_reasoner_request_omits_reasoning_content_for_assistant_history() {
+        // Given an assistant history turn containing thinking.
+        let request = assistant_history_with_thinking_request("deepseek-reasoner");
+
+        // When serializing for legacy deepseek-reasoner.
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+
+        // Then reasoning_content is omitted.
+        let assistant = &payload["messages"][0];
+        assert_eq!(assistant["role"], json!("assistant"));
+        assert!(assistant.get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn deepseek_v4_pro_request_includes_reasoning_content_for_assistant_history() {
+        // Given an assistant history turn containing thinking.
+        let request = assistant_history_with_thinking_request("openai/deepseek-v4-pro");
+
+        // When serializing for DeepSeek V4 Pro.
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+
+        // Then reasoning_content is included on the assistant message.
+        let assistant = &payload["messages"][0];
+        assert_eq!(assistant["reasoning_content"], json!("prior reasoning"));
+        assert_eq!(assistant["content"], json!("answer"));
+    }
+
+    #[test]
+    fn deepseek_v4_assistant_with_only_tool_calls_omits_content_and_includes_reasoning() {
+        let request = MessageRequest {
+            model: "deepseek-v4-pro".to_string(),
+            max_tokens: 100,
+            messages: vec![InputMessage {
+                role: "assistant".to_string(),
+                content: vec![InputContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "get_weather".to_string(),
+                    input: json!({"city": "Paris"}),
+                }],
+            }],
+            stream: false,
+            ..Default::default()
+        };
+
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+        let assistant = &payload["messages"][0];
+
+        assert!(assistant.get("content").is_none());
+        assert_eq!(assistant["reasoning_content"], json!(""));
+        assert_eq!(assistant["tool_calls"].as_array().map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn deepseek_v4_flash_request_includes_reasoning_content_for_assistant_history() {
+        // Given an assistant history turn containing thinking.
+        let request = assistant_history_with_thinking_request("deepseek-v4-flash");
+
+        // When serializing for DeepSeek V4 Flash.
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+
+        // Then reasoning_content is included on the assistant message.
+        let assistant = &payload["messages"][0];
+        assert_eq!(assistant["reasoning_content"], json!("prior reasoning"));
+    }
+
+    #[test]
+    fn non_streaming_response_with_reasoning_content_emits_thinking_block_first() {
+        // Given a non-streaming OpenAI-compatible response with reasoning_content.
+        let response = super::ChatCompletionResponse {
+            id: "chatcmpl_reasoning".to_string(),
+            model: "deepseek-v4-pro".to_string(),
+            choices: vec![super::ChatChoice {
+                message: super::ChatMessage {
+                    role: "assistant".to_string(),
+                    content: Some("final answer".to_string()),
+                    reasoning_content: Some("hidden thought".to_string()),
+                    reasoning: None,
+                    tool_calls: Vec::new(),
+                },
+                finish_reason: Some("stop".to_string()),
+            }],
+            usage: None,
+        };
+
+        // When normalizing the provider response.
+        let normalized = normalize_response("deepseek-v4-pro", response).expect("normalized");
+
+        // Then Thinking is the first content block, before text.
+        assert_eq!(
+            normalized.content,
+            vec![
+                OutputContentBlock::Thinking {
+                    thinking: "hidden thought".to_string(),
+                    signature: None,
+                },
+                OutputContentBlock::Text {
+                    text: "final answer".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn streaming_chunks_with_reasoning_content_emit_thinking_block_events_before_text() {
+        // Given streaming chunks with reasoning_content followed by text.
+        let mut state = StreamState::new("deepseek-v4-pro".to_string());
+        let mut events = state
+            .ingest_chunk(super::ChatCompletionChunk {
+                id: "chatcmpl_stream_reasoning".to_string(),
+                model: Some("deepseek-v4-pro".to_string()),
+                choices: vec![super::ChunkChoice {
+                    delta: super::ChunkDelta {
+                        content: None,
+                        reasoning_content: Some("think".to_string()),
+                        reasoning: None,
+                        thinking: None,
+                        tool_calls: Vec::new(),
+                    },
+                    finish_reason: None,
+                }],
+                usage: None,
+            })
+            .expect("reasoning chunk");
+        events.extend(
+            state
+                .ingest_chunk(super::ChatCompletionChunk {
+                    id: "chatcmpl_stream_reasoning".to_string(),
+                    model: None,
+                    choices: vec![super::ChunkChoice {
+                        delta: super::ChunkDelta {
+                            content: Some(" answer".to_string()),
+                            reasoning_content: None,
+                            reasoning: None,
+                            thinking: None,
+                            tool_calls: Vec::new(),
+                        },
+                        finish_reason: Some("stop".to_string()),
+                    }],
+                    usage: None,
+                })
+                .expect("text chunk"),
+        );
+        events.extend(state.finish().expect("finish"));
+
+        // When reading normalized stream events.
+        // Then Thinking starts at index 0, text is offset to index 1.
+        assert!(matches!(events[0], StreamEvent::MessageStart(_)));
+        assert!(matches!(
+            events[1],
+            StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+                index: 0,
+                content_block: OutputContentBlock::Thinking { .. },
+            })
+        ));
+        assert!(matches!(
+            events[2],
+            StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+                index: 0,
+                delta: ContentBlockDelta::ThinkingDelta { .. },
+            })
+        ));
+        assert!(matches!(
+            events[3],
+            StreamEvent::ContentBlockStop(ContentBlockStopEvent { index: 0 })
+        ));
+        assert!(matches!(
+            events[4],
+            StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+                index: 1,
+                content_block: OutputContentBlock::Text { .. },
+            })
+        ));
+        assert!(matches!(
+            events[5],
+            StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+                index: 1,
+                delta: ContentBlockDelta::TextDelta { .. },
+            })
+        ));
+        assert!(matches!(
+            events[6],
+            StreamEvent::ContentBlockStop(ContentBlockStopEvent { index: 1 })
+        ));
+    }
+
+    #[test]
+    fn tool_schema_object_gets_strict_fields_for_responses_endpoint() {
+        // OpenAI /responses endpoint rejects object schemas missing
+        // "properties" and "additionalProperties". Verify normalize_object_schema
+        // fills them in so the request shape is strict-validator-safe.
+        use super::normalize_object_schema;
+
+        // Bare object — no properties at all
+        let mut schema = json!({"type": "object"});
+        normalize_object_schema(&mut schema);
+        assert_eq!(schema["properties"], json!({}));
+        assert_eq!(schema["additionalProperties"], json!(false));
+
+        // Nested object inside properties
+        let mut schema2 = json!({
+            "type": "object",
+            "properties": {
+                "location": {"type": "object", "properties": {"lat": {"type": "number"}}}
+            }
+        });
+        normalize_object_schema(&mut schema2);
+        assert_eq!(schema2["additionalProperties"], json!(false));
+        assert_eq!(
+            schema2["properties"]["location"]["additionalProperties"],
+            json!(false)
+        );
+
+        // Existing properties/additionalProperties should not be overwritten
+        let mut schema3 = json!({
+            "type": "object",
+            "properties": {"x": {"type": "string"}},
+            "additionalProperties": true
+        });
+        normalize_object_schema(&mut schema3);
+        assert_eq!(
+            schema3["additionalProperties"],
+            json!(true),
+            "must not overwrite existing"
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_is_included_when_set() {
+        let payload = build_chat_completion_request(
+            &MessageRequest {
+                model: "o4-mini".to_string(),
+                max_tokens: 1024,
+                messages: vec![InputMessage::user_text("think hard")],
+                reasoning_effort: Some("high".to_string()),
+                ..Default::default()
+            },
+            OpenAiCompatConfig::openai(),
+        );
+        assert_eq!(payload["reasoning_effort"], json!("high"));
+    }
+
+    #[test]
+    fn deepseek_v4_request_includes_thinking_parameter() {
+        let payload = build_chat_completion_request(
+            &MessageRequest {
+                model: "deepseek-v4-pro".to_string(),
+                max_tokens: 1024,
+                messages: vec![InputMessage::user_text("hello")],
+                ..Default::default()
+            },
+            OpenAiCompatConfig::openai(),
+        );
+        assert_eq!(payload["thinking"], json!({"type": "enabled"}));
+        assert_eq!(payload["model"], json!("deepseek-v4-pro"));
+
+        let mut extra_body = BTreeMap::new();
+        extra_body.insert("thinking".to_string(), json!({"type": "disabled"}));
+        let payload_with_override = build_chat_completion_request(
+            &MessageRequest {
+                model: "openai/deepseek-v4-flash".to_string(),
+                max_tokens: 1024,
+                messages: vec![InputMessage::user_text("hello")],
+                extra_body,
+                ..Default::default()
+            },
+            OpenAiCompatConfig::openai(),
+        );
+        assert_eq!(
+            payload_with_override["thinking"],
+            json!({"type": "enabled"})
+        );
+
+        let non_deepseek_payload = build_chat_completion_request(
+            &MessageRequest {
+                model: "gpt-4o".to_string(),
+                max_tokens: 64,
+                messages: vec![InputMessage::user_text("hello")],
+                ..Default::default()
+            },
+            OpenAiCompatConfig::openai(),
+        );
+        assert!(non_deepseek_payload.get("thinking").is_none());
+    }
+
+    #[test]
+    fn reasoning_effort_omitted_when_not_set() {
+        let payload = build_chat_completion_request(
+            &MessageRequest {
+                model: "gpt-4o".to_string(),
+                max_tokens: 64,
+                messages: vec![InputMessage::user_text("hello")],
+                ..Default::default()
+            },
+            OpenAiCompatConfig::openai(),
+        );
+        assert!(payload.get("reasoning_effort").is_none());
     }
 
     #[test]
@@ -1017,6 +2231,7 @@ mod tests {
                 tools: None,
                 tool_choice: None,
                 stream: true,
+                ..Default::default()
             },
             OpenAiCompatConfig::openai(),
         );
@@ -1035,6 +2250,7 @@ mod tests {
                 tools: None,
                 tool_choice: None,
                 stream: true,
+                ..Default::default()
             },
             OpenAiCompatConfig::xai(),
         );
@@ -1078,6 +2294,28 @@ mod tests {
     }
 
     #[test]
+    fn local_openai_base_url_does_not_require_api_key() {
+        let _lock = env_lock();
+        let original_base_url = std::env::var_os("OPENAI_BASE_URL");
+        let original_api_key = std::env::var_os("OPENAI_API_KEY");
+        std::env::set_var("OPENAI_BASE_URL", "http://127.0.0.1:11434/v1");
+        std::env::remove_var("OPENAI_API_KEY");
+
+        let client = OpenAiCompatClient::from_env(OpenAiCompatConfig::openai())
+            .expect("local OpenAI-compatible endpoint should not require an API key");
+        assert_eq!(client.base_url(), "http://127.0.0.1:11434/v1");
+
+        match original_base_url {
+            Some(value) => std::env::set_var("OPENAI_BASE_URL", value),
+            None => std::env::remove_var("OPENAI_BASE_URL"),
+        }
+        match original_api_key {
+            Some(value) => std::env::set_var("OPENAI_API_KEY", value),
+            None => std::env::remove_var("OPENAI_API_KEY"),
+        }
+    }
+
+    #[test]
     fn endpoint_builder_accepts_base_urls_and_full_endpoints() {
         assert_eq!(
             chat_completions_endpoint("https://api.x.ai/v1"),
@@ -1093,6 +2331,27 @@ mod tests {
         );
     }
 
+    fn assistant_history_with_thinking_request(model: &str) -> MessageRequest {
+        MessageRequest {
+            model: model.to_string(),
+            max_tokens: 100,
+            messages: vec![InputMessage {
+                role: "assistant".to_string(),
+                content: vec![
+                    InputContentBlock::Thinking {
+                        thinking: "prior reasoning".to_string(),
+                        signature: None,
+                    },
+                    InputContentBlock::Text {
+                        text: "answer".to_string(),
+                    },
+                ],
+            }],
+            stream: false,
+            ..Default::default()
+        }
+    }
+
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
@@ -1104,5 +2363,677 @@ mod tests {
     fn normalizes_stop_reasons() {
         assert_eq!(normalize_finish_reason("stop"), "end_turn");
         assert_eq!(normalize_finish_reason("tool_calls"), "tool_use");
+    }
+
+    #[test]
+    fn tuning_params_included_in_payload_when_set() {
+        let request = MessageRequest {
+            model: "gpt-4o".to_string(),
+            max_tokens: 1024,
+            messages: vec![],
+            system: None,
+            tools: None,
+            tool_choice: None,
+            stream: false,
+            temperature: Some(0.7),
+            top_p: Some(0.9),
+            frequency_penalty: Some(0.5),
+            presence_penalty: Some(0.3),
+            stop: Some(vec!["\n".to_string()]),
+            reasoning_effort: None,
+            extra_body: BTreeMap::new(),
+        };
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+        assert_eq!(payload["temperature"], 0.7);
+        assert_eq!(payload["top_p"], 0.9);
+        assert_eq!(payload["frequency_penalty"], 0.5);
+        assert_eq!(payload["presence_penalty"], 0.3);
+        assert_eq!(payload["stop"], json!(["\n"]));
+    }
+
+    #[test]
+    fn extra_body_params_are_passed_through_without_overriding_core_fields() {
+        let mut extra_body = BTreeMap::new();
+        extra_body.insert(
+            "web_search_options".to_string(),
+            json!({"search_context_size": "medium"}),
+        );
+        extra_body.insert("parallel_tool_calls".to_string(), json!(false));
+        extra_body.insert("model".to_string(), json!("bad-override"));
+        extra_body.insert("messages".to_string(), json!([]));
+        extra_body.insert("max_tokens".to_string(), json!(1));
+
+        let payload = build_chat_completion_request(
+            &MessageRequest {
+                model: "gpt-4o".to_string(),
+                max_tokens: 1024,
+                messages: vec![InputMessage::user_text("hello")],
+                extra_body,
+                ..Default::default()
+            },
+            OpenAiCompatConfig::openai(),
+        );
+
+        assert_eq!(payload["model"], json!("gpt-4o"));
+        assert_eq!(payload["max_tokens"], json!(1024));
+        assert_eq!(payload["messages"].as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            payload["web_search_options"],
+            json!({"search_context_size": "medium"})
+        );
+        assert_eq!(payload["parallel_tool_calls"], json!(false));
+    }
+
+    #[test]
+    fn reasoning_model_strips_tuning_params() {
+        let request = MessageRequest {
+            model: "o1-mini".to_string(),
+            max_tokens: 1024,
+            messages: vec![],
+            stream: false,
+            temperature: Some(0.7),
+            top_p: Some(0.9),
+            frequency_penalty: Some(0.5),
+            presence_penalty: Some(0.3),
+            stop: Some(vec!["\n".to_string()]),
+            ..Default::default()
+        };
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+        assert!(
+            payload.get("temperature").is_none(),
+            "reasoning model should strip temperature"
+        );
+        assert!(
+            payload.get("top_p").is_none(),
+            "reasoning model should strip top_p"
+        );
+        assert!(payload.get("frequency_penalty").is_none());
+        assert!(payload.get("presence_penalty").is_none());
+        // stop is safe for all providers
+        assert_eq!(payload["stop"], json!(["\n"]));
+    }
+
+    #[test]
+    fn grok_3_mini_is_reasoning_model() {
+        assert!(is_reasoning_model("grok-3-mini"));
+        assert!(is_reasoning_model("o1"));
+        assert!(is_reasoning_model("o1-mini"));
+        assert!(is_reasoning_model("o3-mini"));
+        assert!(!is_reasoning_model("gpt-4o"));
+        assert!(!is_reasoning_model("grok-3"));
+        assert!(!is_reasoning_model("claude-sonnet-4-6"));
+    }
+
+    #[test]
+    fn qwen_reasoning_variants_are_detected() {
+        // QwQ reasoning model
+        assert!(is_reasoning_model("qwen-qwq-32b"));
+        assert!(is_reasoning_model("qwen/qwen-qwq-32b"));
+        // Qwen3 thinking family
+        assert!(is_reasoning_model("qwen3-30b-a3b-thinking"));
+        assert!(is_reasoning_model("qwen/qwen3-30b-a3b-thinking"));
+        // Bare qwq
+        assert!(is_reasoning_model("qwq-plus"));
+        // Regular Qwen models must NOT be classified as reasoning
+        assert!(!is_reasoning_model("qwen-max"));
+        assert!(!is_reasoning_model("qwen/qwen-plus"));
+        assert!(!is_reasoning_model("qwen-turbo"));
+    }
+
+    #[test]
+    fn tuning_params_omitted_from_payload_when_none() {
+        let request = MessageRequest {
+            model: "gpt-4o".to_string(),
+            max_tokens: 1024,
+            messages: vec![],
+            stream: false,
+            ..Default::default()
+        };
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+        assert!(
+            payload.get("temperature").is_none(),
+            "temperature should be absent"
+        );
+        assert!(payload.get("top_p").is_none(), "top_p should be absent");
+        assert!(payload.get("frequency_penalty").is_none());
+        assert!(payload.get("presence_penalty").is_none());
+        assert!(payload.get("stop").is_none());
+    }
+
+    #[test]
+    fn gpt5_uses_max_completion_tokens_not_max_tokens() {
+        // gpt-5* models require `max_completion_tokens`; legacy `max_tokens` causes
+        // a request-validation failure. Verify the correct key is emitted.
+        let request = MessageRequest {
+            model: "gpt-5.2".to_string(),
+            max_tokens: 512,
+            messages: vec![],
+            stream: false,
+            ..Default::default()
+        };
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+        assert_eq!(
+            payload["max_completion_tokens"],
+            json!(512),
+            "gpt-5.2 should emit max_completion_tokens"
+        );
+        assert!(
+            payload.get("max_tokens").is_none(),
+            "gpt-5.2 must not emit max_tokens"
+        );
+    }
+
+    /// Regression test: some OpenAI-compatible providers emit `"tool_calls": null`
+    /// in stream delta chunks instead of omitting the field or using `[]`.
+    /// Before the fix this produced: `invalid type: null, expected a sequence`.
+    #[test]
+    fn delta_with_null_tool_calls_deserializes_as_empty_vec() {
+        use super::deserialize_null_as_empty_vec;
+
+        #[allow(dead_code)]
+        #[derive(serde::Deserialize, Debug)]
+        struct Delta {
+            content: Option<String>,
+            #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
+            tool_calls: Vec<super::DeltaToolCall>,
+        }
+
+        // Simulate the exact shape observed in the wild (gaebal-gajae repro 2026-04-09)
+        let json = r#"{
+            "content": "",
+            "function_call": null,
+            "refusal": null,
+            "role": "assistant",
+            "tool_calls": null
+        }"#;
+        let delta: Delta = serde_json::from_str(json)
+            .expect("delta with tool_calls:null must deserialize without error");
+        assert!(
+            delta.tool_calls.is_empty(),
+            "tool_calls:null must produce an empty vec, not an error"
+        );
+    }
+
+    /// Regression: when building a multi-turn request where a prior assistant
+    /// turn has no tool calls, the serialized assistant message must NOT include
+    /// `tool_calls: []`. Some providers reject requests that carry an empty
+    /// `tool_calls` array on assistant turns (gaebal-gajae repro 2026-04-09).
+    #[test]
+    fn assistant_message_without_tool_calls_omits_tool_calls_field() {
+        use crate::types::{InputContentBlock, InputMessage};
+
+        let request = MessageRequest {
+            model: "gpt-4o".to_string(),
+            max_tokens: 100,
+            messages: vec![InputMessage {
+                role: "assistant".to_string(),
+                content: vec![InputContentBlock::Text {
+                    text: "Hello".to_string(),
+                }],
+            }],
+            stream: false,
+            ..Default::default()
+        };
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+        let messages = payload["messages"].as_array().unwrap();
+        let assistant_msg = messages
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .expect("assistant message must be present");
+        assert!(
+            assistant_msg.get("tool_calls").is_none(),
+            "assistant message without tool calls must omit tool_calls field: {assistant_msg:?}"
+        );
+    }
+
+    /// Regression: assistant messages WITH tool calls must still include
+    /// the `tool_calls` array (normal multi-turn tool-use flow).
+    #[test]
+    fn assistant_message_with_tool_calls_includes_tool_calls_field() {
+        use crate::types::{InputContentBlock, InputMessage};
+
+        let request = MessageRequest {
+            model: "gpt-4o".to_string(),
+            max_tokens: 100,
+            messages: vec![InputMessage {
+                role: "assistant".to_string(),
+                content: vec![InputContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "/tmp/test"}),
+                }],
+            }],
+            stream: false,
+            ..Default::default()
+        };
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+        let messages = payload["messages"].as_array().unwrap();
+        let assistant_msg = messages
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .expect("assistant message must be present");
+        let tool_calls = assistant_msg
+            .get("tool_calls")
+            .expect("assistant message with tool calls must include tool_calls field");
+        assert!(tool_calls.is_array());
+        assert_eq!(tool_calls.as_array().unwrap().len(), 1);
+    }
+
+    /// Orphaned tool messages (no preceding assistant `tool_calls`) must be
+    /// dropped by the request-builder sanitizer. Regression for the second
+    /// layer of the tool-pairing invariant fix (gaebal-gajae 2026-04-10).
+    #[test]
+    fn sanitize_drops_orphaned_tool_messages() {
+        use super::sanitize_tool_message_pairing;
+
+        // Valid pair: assistant with tool_calls → tool result
+        let valid = vec![
+            json!({"role": "assistant", "content": null, "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "search", "arguments": "{}"}}]}),
+            json!({"role": "tool", "tool_call_id": "call_1", "content": "result"}),
+        ];
+        let out = sanitize_tool_message_pairing(valid);
+        assert_eq!(out.len(), 2, "valid pair must be preserved");
+
+        // Orphaned tool message: no preceding assistant tool_calls
+        let orphaned = vec![
+            json!({"role": "assistant", "content": "hi"}),
+            json!({"role": "tool", "tool_call_id": "call_2", "content": "orphaned"}),
+        ];
+        let out = sanitize_tool_message_pairing(orphaned);
+        assert_eq!(out.len(), 1, "orphaned tool message must be dropped");
+        assert_eq!(out[0]["role"], json!("assistant"));
+
+        // Mismatched tool_call_id
+        let mismatched = vec![
+            json!({"role": "assistant", "content": null, "tool_calls": [{"id": "call_3", "type": "function", "function": {"name": "f", "arguments": "{}"}}]}),
+            json!({"role": "tool", "tool_call_id": "call_WRONG", "content": "bad"}),
+        ];
+        let out = sanitize_tool_message_pairing(mismatched);
+        assert_eq!(out.len(), 1, "tool message with wrong id must be dropped");
+
+        // Two tool results both valid (same preceding assistant)
+        let two_results = vec![
+            json!({"role": "assistant", "content": null, "tool_calls": [
+                {"id": "call_a", "type": "function", "function": {"name": "fa", "arguments": "{}"}},
+                {"id": "call_b", "type": "function", "function": {"name": "fb", "arguments": "{}"}}
+            ]}),
+            json!({"role": "tool", "tool_call_id": "call_a", "content": "ra"}),
+            json!({"role": "tool", "tool_call_id": "call_b", "content": "rb"}),
+        ];
+        let out = sanitize_tool_message_pairing(two_results);
+        assert_eq!(out.len(), 3, "both valid tool results must be preserved");
+    }
+
+    #[test]
+    fn non_gpt5_uses_max_tokens() {
+        // Older OpenAI models expect `max_tokens`; verify gpt-4o is unaffected.
+        let request = MessageRequest {
+            model: "gpt-4o".to_string(),
+            max_tokens: 512,
+            messages: vec![],
+            stream: false,
+            ..Default::default()
+        };
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+        assert_eq!(payload["max_tokens"], json!(512));
+        assert!(
+            payload.get("max_completion_tokens").is_none(),
+            "gpt-4o must not emit max_completion_tokens"
+        );
+    }
+
+    // ============================================================================
+    // US-009: kimi model compatibility tests
+    // ============================================================================
+
+    #[test]
+    fn model_rejects_is_error_field_detects_kimi_models() {
+        // kimi models (various formats) should be detected
+        assert!(super::model_rejects_is_error_field("kimi-k2.5"));
+        assert!(super::model_rejects_is_error_field("kimi-k1.5"));
+        assert!(super::model_rejects_is_error_field("kimi-moonshot"));
+        assert!(super::model_rejects_is_error_field("KIMI-K2.5")); // case insensitive
+        assert!(super::model_rejects_is_error_field("dashscope/kimi-k2.5")); // with prefix
+        assert!(super::model_rejects_is_error_field("moonshot/kimi-k2.5")); // different prefix
+
+        // Non-kimi models should NOT be detected
+        assert!(!super::model_rejects_is_error_field("gpt-4o"));
+        assert!(!super::model_rejects_is_error_field("gpt-4"));
+        assert!(!super::model_rejects_is_error_field("claude-sonnet-4-6"));
+        assert!(!super::model_rejects_is_error_field("grok-3"));
+        assert!(!super::model_rejects_is_error_field("grok-3-mini"));
+        assert!(!super::model_rejects_is_error_field("xai/grok-3"));
+        assert!(!super::model_rejects_is_error_field("qwen/qwen-plus"));
+        assert!(!super::model_rejects_is_error_field("o1-mini"));
+    }
+
+    #[test]
+    fn translate_message_includes_is_error_for_non_kimi_models() {
+        use crate::types::{InputContentBlock, InputMessage, ToolResultContentBlock};
+
+        // Test with gpt-4o (should include is_error)
+        let message = InputMessage {
+            role: "user".to_string(),
+            content: vec![InputContentBlock::ToolResult {
+                tool_use_id: "call_1".to_string(),
+                content: vec![ToolResultContentBlock::Text {
+                    text: "Error occurred".to_string(),
+                }],
+                is_error: true,
+            }],
+        };
+
+        let translated = super::translate_message(&message, "gpt-4o");
+        assert_eq!(translated.len(), 1);
+        let tool_msg = &translated[0];
+        assert_eq!(tool_msg["role"], json!("tool"));
+        assert_eq!(tool_msg["tool_call_id"], json!("call_1"));
+        assert_eq!(tool_msg["content"], json!("Error occurred"));
+        assert!(
+            tool_msg.get("is_error").is_some(),
+            "gpt-4o should include is_error field"
+        );
+        assert_eq!(tool_msg["is_error"], json!(true));
+
+        // Test with grok-3 (should include is_error)
+        let message2 = InputMessage {
+            role: "user".to_string(),
+            content: vec![InputContentBlock::ToolResult {
+                tool_use_id: "call_2".to_string(),
+                content: vec![ToolResultContentBlock::Text {
+                    text: "Success".to_string(),
+                }],
+                is_error: false,
+            }],
+        };
+
+        let translated2 = super::translate_message(&message2, "grok-3");
+        assert!(
+            translated2[0].get("is_error").is_some(),
+            "grok-3 should include is_error field"
+        );
+        assert_eq!(translated2[0]["is_error"], json!(false));
+
+        // Test with claude model (should include is_error)
+        let translated3 = super::translate_message(&message, "claude-sonnet-4-6");
+        assert!(
+            translated3[0].get("is_error").is_some(),
+            "claude should include is_error field"
+        );
+    }
+
+    #[test]
+    fn translate_message_excludes_is_error_for_kimi_models() {
+        use crate::types::{InputContentBlock, InputMessage, ToolResultContentBlock};
+
+        // Test with kimi-k2.5 (should EXCLUDE is_error)
+        let message = InputMessage {
+            role: "user".to_string(),
+            content: vec![InputContentBlock::ToolResult {
+                tool_use_id: "call_1".to_string(),
+                content: vec![ToolResultContentBlock::Text {
+                    text: "Error occurred".to_string(),
+                }],
+                is_error: true,
+            }],
+        };
+
+        let translated = super::translate_message(&message, "kimi-k2.5");
+        assert_eq!(translated.len(), 1);
+        let tool_msg = &translated[0];
+        assert_eq!(tool_msg["role"], json!("tool"));
+        assert_eq!(tool_msg["tool_call_id"], json!("call_1"));
+        assert_eq!(tool_msg["content"], json!("Error occurred"));
+        assert!(
+            tool_msg.get("is_error").is_none(),
+            "kimi-k2.5 must NOT include is_error field (would cause 400 Bad Request)"
+        );
+
+        // Test with kimi-k1.5
+        let translated2 = super::translate_message(&message, "kimi-k1.5");
+        assert!(
+            translated2[0].get("is_error").is_none(),
+            "kimi-k1.5 must NOT include is_error field"
+        );
+
+        // Test with dashscope/kimi-k2.5 (with provider prefix)
+        let translated3 = super::translate_message(&message, "dashscope/kimi-k2.5");
+        assert!(
+            translated3[0].get("is_error").is_none(),
+            "dashscope/kimi-k2.5 must NOT include is_error field"
+        );
+    }
+
+    #[test]
+    fn build_chat_completion_request_kimi_vs_non_kimi_tool_results() {
+        use crate::types::{InputContentBlock, InputMessage, ToolResultContentBlock};
+
+        // Helper to create a request with a tool result
+        let make_request = |model: &str| MessageRequest {
+            model: model.to_string(),
+            max_tokens: 100,
+            messages: vec![
+                InputMessage {
+                    role: "assistant".to_string(),
+                    content: vec![InputContentBlock::ToolUse {
+                        id: "call_1".to_string(),
+                        name: "read_file".to_string(),
+                        input: serde_json::json!({"path": "/tmp/test"}),
+                    }],
+                },
+                InputMessage {
+                    role: "user".to_string(),
+                    content: vec![InputContentBlock::ToolResult {
+                        tool_use_id: "call_1".to_string(),
+                        content: vec![ToolResultContentBlock::Text {
+                            text: "file contents".to_string(),
+                        }],
+                        is_error: false,
+                    }],
+                },
+            ],
+            stream: false,
+            ..Default::default()
+        };
+
+        // Non-kimi model: should have is_error field
+        let request_gpt = make_request("gpt-4o");
+        let payload_gpt = build_chat_completion_request(&request_gpt, OpenAiCompatConfig::openai());
+        let messages_gpt = payload_gpt["messages"].as_array().unwrap();
+        let tool_msg_gpt = messages_gpt.iter().find(|m| m["role"] == "tool").unwrap();
+        assert!(
+            tool_msg_gpt.get("is_error").is_some(),
+            "gpt-4o request should include is_error in tool result"
+        );
+
+        // kimi model: should NOT have is_error field
+        let request_kimi = make_request("kimi-k2.5");
+        let payload_kimi =
+            build_chat_completion_request(&request_kimi, OpenAiCompatConfig::dashscope());
+        let messages_kimi = payload_kimi["messages"].as_array().unwrap();
+        let tool_msg_kimi = messages_kimi.iter().find(|m| m["role"] == "tool").unwrap();
+        assert!(
+            tool_msg_kimi.get("is_error").is_none(),
+            "kimi-k2.5 request must NOT include is_error in tool result (would cause 400)"
+        );
+
+        // Verify both have the essential fields
+        assert_eq!(tool_msg_gpt["tool_call_id"], json!("call_1"));
+        assert_eq!(tool_msg_kimi["tool_call_id"], json!("call_1"));
+        assert_eq!(tool_msg_gpt["content"], json!("file contents"));
+        assert_eq!(tool_msg_kimi["content"], json!("file contents"));
+    }
+
+    // ============================================================================
+    // US-021: Request body size pre-flight check tests
+    // ============================================================================
+
+    #[test]
+    fn estimate_request_body_size_returns_reasonable_estimate() {
+        let request = MessageRequest {
+            model: "gpt-4o".to_string(),
+            max_tokens: 100,
+            messages: vec![InputMessage::user_text("Hello world".to_string())],
+            stream: false,
+            ..Default::default()
+        };
+
+        let size = super::estimate_request_body_size(&request, OpenAiCompatConfig::openai());
+        // Should be non-zero and reasonable for a small request
+        assert!(size > 0, "estimated size should be positive");
+        assert!(size < 10_000, "small request should be under 10KB");
+    }
+
+    #[test]
+    fn check_request_body_size_passes_for_small_requests() {
+        let request = MessageRequest {
+            model: "gpt-4o".to_string(),
+            max_tokens: 100,
+            messages: vec![InputMessage::user_text("Hello".to_string())],
+            stream: false,
+            ..Default::default()
+        };
+
+        // Should pass for all providers with a small request
+        assert!(super::check_request_body_size(&request, OpenAiCompatConfig::openai()).is_ok());
+        assert!(super::check_request_body_size(&request, OpenAiCompatConfig::xai()).is_ok());
+        assert!(super::check_request_body_size(&request, OpenAiCompatConfig::dashscope()).is_ok());
+    }
+
+    #[test]
+    fn check_request_body_size_fails_for_dashscope_when_exceeds_6mb() {
+        // Create a request that exceeds DashScope's 6MB limit
+        let large_content = "x".repeat(7_000_000); // 7MB of content
+        let request = MessageRequest {
+            model: "qwen-plus".to_string(),
+            max_tokens: 100,
+            messages: vec![InputMessage::user_text(large_content)],
+            stream: false,
+            ..Default::default()
+        };
+
+        let result = super::check_request_body_size(&request, OpenAiCompatConfig::dashscope());
+        assert!(result.is_err(), "should fail for 7MB request to DashScope");
+
+        let err = result.unwrap_err();
+        match err {
+            crate::error::ApiError::RequestBodySizeExceeded {
+                estimated_bytes,
+                max_bytes,
+                provider,
+            } => {
+                assert_eq!(provider, "DashScope");
+                assert_eq!(max_bytes, 6_291_456); // 6MB limit
+                assert!(estimated_bytes > max_bytes);
+            }
+            _ => panic!("expected RequestBodySizeExceeded error, got {err:?}"),
+        }
+    }
+
+    #[test]
+    fn wire_model_strips_openai_prefix_for_default_and_local_preserves_custom_gateways() {
+        assert_eq!(
+            super::wire_model_for_base_url(
+                "openai/gpt-4o",
+                OpenAiCompatConfig::openai(),
+                super::DEFAULT_OPENAI_BASE_URL,
+            ),
+            Cow::Borrowed("gpt-4o")
+        );
+        assert_eq!(
+            super::wire_model_for_base_url(
+                "openai/qwen2.5-coder:7b",
+                OpenAiCompatConfig::openai(),
+                "http://127.0.0.1:11434/v1",
+            ),
+            Cow::Borrowed("qwen2.5-coder:7b")
+        );
+        assert_eq!(
+            super::wire_model_for_base_url(
+                "openai/llama3.2",
+                OpenAiCompatConfig::openai(),
+                "http://localhost:11434/v1/chat/completions",
+            ),
+            Cow::Borrowed("llama3.2")
+        );
+        assert_eq!(
+            super::wire_model_for_base_url(
+                "openai/gpt-4.1-mini",
+                OpenAiCompatConfig::openai(),
+                "https://openrouter.ai/api/v1",
+            ),
+            Cow::Borrowed("openai/gpt-4.1-mini")
+        );
+        assert_eq!(
+            super::wire_model_for_base_url(
+                "openai/gpt-4.1-mini",
+                OpenAiCompatConfig::openai(),
+                "https://not-localhost.example.com/v1",
+            ),
+            Cow::Borrowed("openai/gpt-4.1-mini")
+        );
+    }
+
+    #[test]
+    fn local_routing_prefix_strips_only_escape_hatch() {
+        assert_eq!(
+            super::strip_routing_prefix("local/Qwen/Qwen3.6-27B-FP8"),
+            "Qwen/Qwen3.6-27B-FP8"
+        );
+        assert_eq!(
+            super::wire_model_for_base_url(
+                "local/Qwen/Qwen3.6-27B-FP8",
+                OpenAiCompatConfig::openai(),
+                "http://127.0.0.1:8000/v1",
+            ),
+            Cow::Borrowed("Qwen/Qwen3.6-27B-FP8")
+        );
+    }
+
+    #[test]
+    fn check_request_body_size_allows_large_requests_for_openai() {
+        // Create a request that exceeds DashScope's limit but is under OpenAI's 100MB limit
+        let large_content = "x".repeat(10_000_000); // 10MB of content
+        let request = MessageRequest {
+            model: "gpt-4o".to_string(),
+            max_tokens: 100,
+            messages: vec![InputMessage::user_text(large_content)],
+            stream: false,
+            ..Default::default()
+        };
+
+        // Should pass for OpenAI (100MB limit)
+        assert!(
+            super::check_request_body_size(&request, OpenAiCompatConfig::openai()).is_ok(),
+            "10MB request should pass for OpenAI's 100MB limit"
+        );
+
+        // Should fail for DashScope (6MB limit)
+        assert!(
+            super::check_request_body_size(&request, OpenAiCompatConfig::dashscope()).is_err(),
+            "10MB request should fail for DashScope's 6MB limit"
+        );
+    }
+
+    #[test]
+    fn provider_specific_size_limits_are_correct() {
+        assert_eq!(
+            OpenAiCompatConfig::dashscope().max_request_body_bytes,
+            6_291_456
+        ); // 6MB
+        assert_eq!(
+            OpenAiCompatConfig::openai().max_request_body_bytes,
+            104_857_600
+        ); // 100MB
+        assert_eq!(OpenAiCompatConfig::xai().max_request_body_bytes, 52_428_800);
+        // 50MB
+    }
+
+    #[test]
+    fn strip_routing_prefix_strips_kimi_provider_prefix() {
+        // US-023: kimi prefix should be stripped for wire format
+        assert_eq!(super::strip_routing_prefix("kimi/kimi-k2.5"), "kimi-k2.5");
+        assert_eq!(super::strip_routing_prefix("kimi-k2.5"), "kimi-k2.5"); // no prefix, unchanged
+        assert_eq!(super::strip_routing_prefix("kimi/kimi-k1.5"), "kimi-k1.5");
     }
 }
