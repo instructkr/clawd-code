@@ -107,6 +107,11 @@ class WorkspacePathScopeTests(unittest.TestCase):
 
             self.assertTrue(decision.allowed, decision.reason)
 
+    def test_extract_path_candidates_preserves_unc_paths(self) -> None:
+        payload = r'type \\server\share\secret.txt'
+        candidates = extract_path_candidates(payload)
+        self.assertIn(r'\\server\share\secret.txt', candidates)
+
     def test_windows_absolute_paths_are_denied_for_posix_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp) / 'workspace'
@@ -116,9 +121,13 @@ class WorkspacePathScopeTests(unittest.TestCase):
             unc_decision = WorkspacePathScope.from_root(workspace).validate_payload(r'type \\server\share\secret.txt')
 
             self.assertFalse(drive_decision.allowed)
-            self.assertIn('windows absolute path', drive_decision.reason)
             self.assertFalse(unc_decision.allowed)
-            self.assertIn('windows absolute path', unc_decision.reason)
+            if os.name == 'nt':
+                self.assertIn('outside workspace scope', drive_decision.reason)
+                self.assertIn('outside workspace scope', unc_decision.reason)
+            else:
+                self.assertIn('windows absolute path', drive_decision.reason)
+                self.assertIn('windows absolute path', unc_decision.reason)
 
     def test_file_and_shell_tools_use_workspace_scope_context(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
