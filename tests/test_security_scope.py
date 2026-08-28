@@ -30,12 +30,39 @@ class WorkspacePathScopeTests(unittest.TestCase):
             outside.mkdir()
             (outside / 'secret.txt').write_text('secret')
             link = workspace / 'linked-outside'
-            link.symlink_to(outside, target_is_directory=True)
+            try:
+                link.symlink_to(outside, target_is_directory=True)
+            except OSError as e:
+                if getattr(e, 'winerror', None) == 1314:
+                    self.skipTest('Requires symlink privileges on Windows')
+                raise
 
             decision = WorkspacePathScope.from_root(workspace).validate_payload('cat linked-outside/secret.txt')
 
             self.assertFalse(decision.allowed)
             self.assertIn(str(outside.resolve()), decision.resolved or '')
+
+    def test_windows_absolute_symlink_escape_is_denied(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / 'workspace'
+            outside = root / 'outside'
+            workspace.mkdir()
+            outside.mkdir()
+            (outside / 'secret.txt').write_text('secret')
+            link = workspace / 'linked-outside'
+            try:
+                link.symlink_to(outside, target_is_directory=True)
+            except OSError as e:
+                if getattr(e, 'winerror', None) == 1314:
+                    self.skipTest('Requires symlink privileges on Windows')
+                raise
+
+            payload = f'cat {link.resolve()}/secret.txt'
+            decision = WorkspacePathScope.from_root(workspace).validate_payload(payload)
+
+            self.assertFalse(decision.allowed)
+            self.assertIn('outside workspace scope', decision.reason)
 
     def test_glob_expansion_must_stay_inside_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
