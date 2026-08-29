@@ -12,6 +12,29 @@ from src.query_engine import QueryEnginePort
 from src.tools import execute_tool
 
 
+def _create_directory_link(target: Path, link: Path) -> None:
+    """Create a directory symlink or fallback to an NTFS junction on Windows.
+
+    Standard Windows user accounts cannot create symbolic links without
+    SeCreateSymbolicLinkPrivilege (Developer Mode / Elevation), but NTFS
+    directory junctions can be created unprivileged and exercise the exact same
+    path resolution logic in Path.resolve().
+    """
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError as e:
+        if getattr(e, 'winerror', None) == 1314 and os.name == 'nt':
+            try:
+                import _winapi
+                _winapi.CreateJunction(str(target), str(link))
+                return
+            except Exception:
+                pass
+            self_skip_msg = 'Requires filesystem symlink or junction support on Windows runner'
+            raise unittest.SkipTest(self_skip_msg) from e
+        raise
+
+
 class WorkspacePathScopeTests(unittest.TestCase):
     def test_direct_parent_escape_is_denied(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -30,12 +53,7 @@ class WorkspacePathScopeTests(unittest.TestCase):
             outside.mkdir()
             (outside / 'secret.txt').write_text('secret')
             link = workspace / 'linked-outside'
-            try:
-                link.symlink_to(outside, target_is_directory=True)
-            except OSError as e:
-                if getattr(e, 'winerror', None) == 1314:
-                    self.skipTest('Requires symlink privileges on Windows')
-                raise
+            _create_directory_link(outside, link)
 
             decision = WorkspacePathScope.from_root(workspace).validate_payload('cat linked-outside/secret.txt')
 
@@ -51,18 +69,27 @@ class WorkspacePathScopeTests(unittest.TestCase):
             outside.mkdir()
             (outside / 'secret.txt').write_text('secret')
             link = workspace / 'linked-outside'
-            try:
-                link.symlink_to(outside, target_is_directory=True)
-            except OSError as e:
-                if getattr(e, 'winerror', None) == 1314:
-                    self.skipTest('Requires symlink privileges on Windows')
-                raise
+            _create_directory_link(outside, link)
 
-            payload = f'cat {link.resolve()}/secret.txt'
+            payload = f'cat {link}/secret.txt'
             decision = WorkspacePathScope.from_root(workspace).validate_payload(payload)
 
             self.assertFalse(decision.allowed)
             self.assertIn('outside workspace scope', decision.reason)
+
+    def test_symlink_resolution_escape_mocked(self) -> None:
+        """Verify containment check catches escapes via resolve() even if unprivileged."""
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / 'workspace'
+            workspace.mkdir()
+            scope = WorkspacePathScope.from_root(workspace)
+
+            from unittest.mock import patch
+            fake_target = (Path(tmp) / 'outside' / 'secret.txt').resolve()
+            with patch.object(Path, 'resolve', return_value=fake_target):
+                decision = scope.validate_path(str(workspace / 'fake-link' / 'secret.txt'))
+                self.assertFalse(decision.allowed)
+                self.assertIn('outside workspace scope', decision.reason)
 
     def test_glob_expansion_must_stay_inside_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
