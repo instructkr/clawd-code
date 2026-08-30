@@ -1,5 +1,16 @@
 from __future__ import annotations
 
+import unittest
+import os
+
+def require_bash() -> bool:
+    import shutil
+    bash = shutil.which('bash')
+    if os.name == 'nt':
+        return False
+    return bash is not None
+
+
 import os
 import subprocess
 import unittest
@@ -11,6 +22,7 @@ PRE_PUSH_HOOK = REPO_ROOT / '.github' / 'hooks' / 'pre-push'
 
 
 class PrePushHookContractTests(unittest.TestCase):
+    @unittest.skipUnless(require_bash(), 'Requires bash')
     def test_skip_escape_hatch_exits_successfully_with_stderr_notice(self) -> None:
         env = os.environ.copy()
         env['SKIP_CLAW_PRE_PUSH_BUILD'] = '1'
@@ -28,6 +40,7 @@ class PrePushHookContractTests(unittest.TestCase):
         self.assertIn('SKIP_CLAW_PRE_PUSH_BUILD=1', result.stderr)
         self.assertIn('skipping cargo workspace build', result.stderr)
 
+    @unittest.skipUnless(require_bash(), 'Requires bash')
     def test_default_build_gate_uses_workspace_locked_cargo_build(self) -> None:
         hook = PRE_PUSH_HOOK.read_text()
 
