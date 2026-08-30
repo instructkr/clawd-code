@@ -65,7 +65,7 @@ class WorkspacePathScope:
             elif not any(_is_windows_absolute(str(root)) for root in self.roots):
                 # Even on Windows, deny if no roots are Windows absolute paths (edge case)
                 return PathScopeDecision(False, 'windows absolute path is outside workspace scope', str(candidate), raw)
-                
+
         base = Path(cwd).expanduser().resolve(strict=False) if cwd else self.roots[0]
         path = Path(raw)
         if not path.is_absolute():
