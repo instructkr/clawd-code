@@ -19,6 +19,10 @@ def _create_directory_link(target: Path, link: Path) -> None:
     SeCreateSymbolicLinkPrivilege (Developer Mode / Elevation), but NTFS
     directory junctions can be created unprivileged and exercise the exact same
     path resolution logic in Path.resolve().
+
+    Note: NTFS junctions can only target local directory paths and cannot point
+    at UNC/remote targets. Links resolving to remote/UNC paths are covered
+    deterministically via `test_symlink_resolving_to_unc_escape_mocked`.
     """
     try:
         link.symlink_to(target, target_is_directory=True)
@@ -88,6 +92,20 @@ class WorkspacePathScopeTests(unittest.TestCase):
             fake_target = (Path(tmp) / 'outside' / 'secret.txt').resolve()
             with patch.object(Path, 'resolve', return_value=fake_target):
                 decision = scope.validate_path(str(workspace / 'fake-link' / 'secret.txt'))
+                self.assertFalse(decision.allowed)
+                self.assertIn('outside workspace scope', decision.reason)
+
+    def test_symlink_resolving_to_unc_escape_mocked(self) -> None:
+        """Verify containment check denies links resolving to remote/UNC targets."""
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / 'workspace'
+            workspace.mkdir()
+            scope = WorkspacePathScope.from_root(workspace)
+
+            from unittest.mock import patch
+            unc_target = Path(r'\\remote-server\share\secret.txt')
+            with patch.object(Path, 'resolve', return_value=unc_target):
+                decision = scope.validate_path(str(workspace / 'net-link' / 'secret.txt'))
                 self.assertFalse(decision.allowed)
                 self.assertIn('outside workspace scope', decision.reason)
 
