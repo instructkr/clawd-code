@@ -109,6 +109,19 @@ class WorkspacePathScopeTests(unittest.TestCase):
                 self.assertFalse(decision.allowed)
                 self.assertIn('outside workspace scope', decision.reason)
 
+    def test_unresolvable_path_raises_oserror_is_denied(self) -> None:
+        """Verify that paths raising OSError during resolve() are explicitly denied."""
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / 'workspace'
+            workspace.mkdir()
+            scope = WorkspacePathScope.from_root(workspace)
+
+            from unittest.mock import patch
+            with patch.object(Path, 'resolve', side_effect=OSError('dangling symlink or filesystem error')):
+                decision = scope.validate_path(str(workspace / 'broken_link.txt'))
+                self.assertFalse(decision.allowed)
+                self.assertIn('cannot be resolved', decision.reason)
+
     def test_glob_expansion_must_stay_inside_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

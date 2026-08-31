@@ -16,18 +16,38 @@ DOGFOOD_PROBE = REPO_ROOT / 'scripts' / 'dogfood-probe.py'
 
 import sys
 
-def require_bash() -> bool:
+def get_bash_executable() -> str | None:
     import os
-    import shutil
-    bash = shutil.which('bash')
     if os.name == 'nt':
-        # On Windows, 'bash' often resolves to WSL which fails if not configured
+        for candidate in (
+            r'C:\Program Files\Git\bin\bash.exe',
+            r'C:\Program Files\Git\usr\bin\bash.exe',
+            r'C:\Program Files (x86)\Git\bin\bash.exe',
+            os.path.expandvars(r'%LOCALAPPDATA%\Programs\Git\bin\bash.exe'),
+        ):
+            if os.path.exists(candidate):
+                return candidate
+    bash = shutil.which('bash')
+    if bash and 'WindowsApps' not in bash:
+        return bash
+    return None
+
+
+def require_bash() -> bool:
+    bash = get_bash_executable()
+    if not bash:
         return False
-    return bash is not None
+    try:
+        res = subprocess.run([bash, '-c', 'echo 1'], capture_output=True, text=True, timeout=2)
+        return res.returncode == 0
+    except Exception:
+        return False
+
 
 def run_next_id(roadmap: Path, script: Path = NEXT_ID) -> subprocess.CompletedProcess[str]:
+    bash_cmd = get_bash_executable() or 'bash'
     return subprocess.run(
-        ['bash', str(script), str(roadmap)],
+        [bash_cmd, str(script), str(roadmap)],
         cwd=REPO_ROOT,
         capture_output=True,
         text=True,

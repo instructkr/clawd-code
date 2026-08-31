@@ -72,7 +72,15 @@ class WorkspacePathScope:
             path = base / path
         expanded = self._expand_glob(path)
         for expanded_path in expanded:
-            resolved = expanded_path.resolve(strict=False)
+            try:
+                resolved = expanded_path.resolve(strict=False)
+            except (OSError, ValueError, RuntimeError):
+                return PathScopeDecision(
+                    False,
+                    'path cannot be resolved or is invalid',
+                    str(candidate),
+                    str(expanded_path),
+                )
             if not any(_is_relative_to(resolved, root) for root in self.roots):
                 return PathScopeDecision(
                     False,
@@ -80,7 +88,16 @@ class WorkspacePathScope:
                     str(candidate),
                     str(resolved),
                 )
-        return PathScopeDecision(True, 'path is inside workspace scope', str(candidate), str(expanded[0].resolve(strict=False)))
+        try:
+            final_resolved = str(expanded[0].resolve(strict=False))
+        except (OSError, ValueError, RuntimeError):
+            return PathScopeDecision(
+                False,
+                'path cannot be resolved or is invalid',
+                str(candidate),
+                str(expanded[0]),
+            )
+        return PathScopeDecision(True, 'path is inside workspace scope', str(candidate), final_resolved)
 
     def _expand_glob(self, path: Path) -> tuple[Path, ...]:
         path_text = str(path)
