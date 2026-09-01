@@ -1,3 +1,4 @@
+import functools
 import os
 import shutil
 import subprocess
@@ -5,6 +6,7 @@ import unittest
 from pathlib import Path
 
 
+@functools.lru_cache(maxsize=1)
 def get_bash_executable() -> str | None:
     if os.name == 'nt':
         for candidate in (
@@ -21,6 +23,7 @@ def get_bash_executable() -> str | None:
     return None
 
 
+@functools.lru_cache(maxsize=1)
 def require_bash() -> bool:
     bash = get_bash_executable()
     if not bash:

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import functools
+import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,12 +15,8 @@ NEXT_ID = REPO_ROOT / 'scripts' / 'roadmap-next-id.sh'
 DOGFOOD_PROBE = REPO_ROOT / 'scripts' / 'dogfood-probe.py'
 
 
-
-
-import sys
-
+@functools.lru_cache(maxsize=1)
 def get_bash_executable() -> str | None:
-    import os
     if os.name == 'nt':
         for candidate in (
             r'C:\Program Files\Git\bin\bash.exe',
@@ -33,6 +32,7 @@ def get_bash_executable() -> str | None:
     return None
 
 
+@functools.lru_cache(maxsize=1)
 def require_bash() -> bool:
     bash = get_bash_executable()
     if not bash:
