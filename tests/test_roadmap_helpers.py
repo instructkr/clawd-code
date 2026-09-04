@@ -14,7 +14,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 NEXT_ID = REPO_ROOT / 'scripts' / 'roadmap-next-id.sh'
 DOGFOOD_PROBE = REPO_ROOT / 'scripts' / 'dogfood-probe.py'
 
-from tests._bash import get_bash_executable, require_bash
+from tests._bash import get_bash_executable, require_bash, bash_skip_reason
 
 
 def run_next_id(roadmap: Path, script: Path = NEXT_ID) -> subprocess.CompletedProcess[str]:
@@ -40,7 +40,7 @@ def run_dogfood_probe(args: list[str]) -> subprocess.CompletedProcess[str]:
 
 
 class RoadmapHelperTests(unittest.TestCase):
-    @unittest.skipUnless(require_bash(), 'Requires bash')
+    @unittest.skipUnless(require_bash(), bash_skip_reason())
     def test_roadmap_next_id_prints_only_next_id_after_duplicate_check(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             roadmap = Path(temp_dir) / 'ROADMAP.md'
@@ -52,7 +52,7 @@ class RoadmapHelperTests(unittest.TestCase):
         self.assertEqual('725\n', result.stdout)
         self.assertEqual('', result.stderr)
 
-    @unittest.skipUnless(require_bash(), 'Requires bash')
+    @unittest.skipUnless(require_bash(), bash_skip_reason())
     def test_roadmap_next_id_fails_fast_on_helper_era_duplicate(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             roadmap = Path(temp_dir) / 'ROADMAP.md'
@@ -66,7 +66,7 @@ class RoadmapHelperTests(unittest.TestCase):
         self.assertIn('999', result.stderr)
         self.assertNotIn('1000', result.stdout)
 
-    @unittest.skipUnless(require_bash(), 'Requires bash')
+    @unittest.skipUnless(require_bash(), bash_skip_reason())
     def test_roadmap_next_id_fails_when_explicit_roadmap_path_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             roadmap = Path(temp_dir) / 'missing-ROADMAP.md'
@@ -78,7 +78,7 @@ class RoadmapHelperTests(unittest.TestCase):
         self.assertIn('ROADMAP not found', result.stderr)
         self.assertIn(str(roadmap), result.stderr)
 
-    @unittest.skipUnless(require_bash(), 'Requires bash')
+    @unittest.skipUnless(require_bash(), bash_skip_reason())
     def test_roadmap_next_id_fails_closed_when_checker_is_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             script_dir = Path(temp_dir) / 'scripts'
