@@ -214,6 +214,40 @@ class WorkspacePathScopeTests(unittest.TestCase):
                 self.assertIn('windows absolute path', drive_decision.reason)
                 self.assertIn('windows absolute path', unc_decision.reason)
 
+    def test_drive_relative_paths_are_resolved_and_denied_if_cross_drive(self) -> None:
+        """Verify that drive-relative paths like C:foo behave correctly."""
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / 'workspace'
+            workspace.mkdir()
+            scope = WorkspacePathScope.from_root(workspace)
+
+            # A drive-relative path on a DIFFERENT drive acts like an absolute escape
+            # If tmp is on C:, Z:foo resolves to Z:\foo which is outside.
+            other_drive = 'Z:' if workspace.drive.upper() != 'Z:' else 'Y:'
+            decision_cross = scope.validate_path(f'{other_drive}foo')
+            
+            # A drive-relative path on the SAME drive acts like a relative path to the CWD
+            # C:foo in C:\workspace resolves to C:\workspace\foo
+            decision_same = scope.validate_path(f'{workspace.drive}foo')
+            
+            if os.name == 'nt':
+                self.assertFalse(decision_cross.allowed)
+                self.assertIn('outside workspace scope', decision_cross.reason)
+                self.assertTrue(decision_same.allowed)
+
+    def test_escaped_unc_paths_are_extracted_and_denied(self) -> None:
+        """Verify that UNC paths with double backslashes (e.g. from JSON payloads) are properly identified and denied."""
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / 'workspace'
+            workspace.mkdir()
+
+            payload = r'type \\\\server\\share\\secret.txt'
+            candidates = extract_path_candidates(payload)
+            self.assertIn(r'\\\\server\\share\\secret.txt', candidates)
+
+            decision = WorkspacePathScope.from_root(workspace).validate_payload(payload)
+            self.assertFalse(decision.allowed)
+
     def test_file_and_shell_tools_use_workspace_scope_context(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
