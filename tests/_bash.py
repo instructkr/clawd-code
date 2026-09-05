@@ -17,6 +17,7 @@ def _probe_bash(bash_path: str) -> bool:
 
 @functools.lru_cache(maxsize=1)
 def _check_bash_state() -> tuple[str | None, str]:
+    reasons = []
     if os.name == 'nt':
         for candidate in (
             r'C:\Program Files\Git\bin\bash.exe',
@@ -27,12 +28,15 @@ def _check_bash_state() -> tuple[str | None, str]:
             if os.path.exists(candidate):
                 if _probe_bash(candidate):
                     return candidate, ""
-                return None, f"bash present at {candidate} but unusable"
+                reasons.append(f"present at {candidate} but unusable")
     bash = shutil.which('bash')
     if bash and 'WindowsApps' not in bash:
         if _probe_bash(bash):
             return bash, ""
-        return None, f"bash present at {bash} but unusable"
+        reasons.append(f"present at {bash} but unusable")
+    
+    if reasons:
+        return None, "bash found but broken: " + "; ".join(reasons)
     return None, "Requires bash"
 
 def get_bash_executable() -> str | None:

@@ -5,7 +5,7 @@ import subprocess
 import unittest
 from pathlib import Path
 
-from tests._bash import get_bash_executable, require_bash, bash_skip_reason
+from tests._bash import get_bash_executable, require_bash, bash_skip_reason, _check_bash_state
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -13,6 +13,14 @@ PRE_PUSH_HOOK = REPO_ROOT / '.github' / 'hooks' / 'pre-push'
 
 
 class PrePushHookContractTests(unittest.TestCase):
+    def setUp(self) -> None:
+        _check_bash_state.cache_clear()
+        super().setUp()
+
+    def tearDown(self) -> None:
+        _check_bash_state.cache_clear()
+        super().tearDown()
+
     @unittest.skipUnless(require_bash(), bash_skip_reason())
     def test_skip_escape_hatch_exits_successfully_with_stderr_notice(self) -> None:
         bash_cmd = get_bash_executable() or 'bash'
