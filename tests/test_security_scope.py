@@ -235,18 +235,35 @@ class WorkspacePathScopeTests(unittest.TestCase):
                 self.assertIn('outside workspace scope', decision_cross.reason)
                 self.assertTrue(decision_same.allowed)
 
-    def test_escaped_unc_paths_are_extracted_and_denied(self) -> None:
-        """Verify that UNC paths with double backslashes (e.g. from JSON payloads) are properly identified and denied."""
+    def test_unc_paths_are_evaluated_correctly_inside_and_outside(self) -> None:
+        """Verify that UNC paths are properly identified and validated for containment."""
         with tempfile.TemporaryDirectory() as tmp:
-            workspace = Path(tmp) / 'workspace'
-            workspace.mkdir()
+            local_workspace = Path(tmp) / 'workspace'
+            local_workspace.mkdir()
 
+            # 1. Test extraction of escaped UNC paths (like from JSON payloads)
             payload = r'type \\\\server\\share\\secret.txt'
             candidates = extract_path_candidates(payload)
             self.assertIn(r'\\\\server\\share\\secret.txt', candidates)
 
-            decision = WorkspacePathScope.from_root(workspace).validate_payload(payload)
-            self.assertFalse(decision.allowed)
+            # 2. Test denial of UNC path when workspace is on a local drive
+            decision_outside = WorkspacePathScope.from_root(local_workspace).validate_payload(payload)
+            self.assertFalse(decision_outside.allowed)
+            
+            # 3. Test allowance of UNC path when workspace root is itself a UNC path
+            # We mock resolve() because resolving a fake UNC path might raise OSError or hang
+            if os.name == 'nt':
+                from unittest.mock import patch
+                unc_workspace = Path(r'\\server\share\workspace')
+                inside_payload = r"type '\\server\share\workspace\secret.txt'"
+                
+                def _fake_resolve(self, strict=False):
+                    return self
+                    
+                with patch.object(Path, 'resolve', autospec=True, side_effect=_fake_resolve):
+                    scope = WorkspacePathScope.from_root(unc_workspace)
+                    decision_inside = scope.validate_payload(inside_payload)
+                    self.assertTrue(decision_inside.allowed)
 
     def test_file_and_shell_tools_use_workspace_scope_context(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
