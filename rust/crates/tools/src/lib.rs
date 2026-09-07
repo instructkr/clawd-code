@@ -60,6 +60,109 @@ fn global_cron_registry() -> &'static CronRegistry {
     REGISTRY.get_or_init(CronRegistry::new)
 }
 
+/// Per-team gate bounding how many sub-agents of one team execute
+/// concurrently. TeamCreate still spawns every agent thread immediately
+/// (manifests, task claims, and return semantics are unchanged), but each
+/// thread blocks here before entering its run loop. This is the team-level
+/// fan-out bound the parallel read-only tool execution assumes: without it,
+/// a `mega` team queues 24 simultaneous runs against whatever model server
+/// the team points at.
+#[derive(Default)]
+struct AgentGate {
+    state: std::sync::Mutex<std::collections::HashMap<String, TeamGateState>>,
+    available: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct TeamGateState {
+    running: usize,
+    limit: Option<usize>,
+}
+
+/// RAII slot for one agent run; releasing happens on drop, so early
+/// returns and unwound panics both free the slot.
+struct AgentGateGuard<'a> {
+    gate: &'a AgentGate,
+    team_id: String,
+}
+
+impl Drop for AgentGateGuard<'_> {
+    fn drop(&mut self) {
+        self.gate.release(&self.team_id);
+    }
+}
+
+impl AgentGate {
+    fn lock_state(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, TeamGateState>> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn set_limit(&self, team_id: &str, limit: Option<usize>) {
+        self.lock_state()
+            .entry(team_id.to_string())
+            .or_default()
+            .limit = limit;
+        self.available.notify_all();
+    }
+
+    fn acquire(&self, team_id: &str) -> AgentGateGuard<'_> {
+        let mut state = self.lock_state();
+        loop {
+            {
+                let entry = state.entry(team_id.to_string()).or_default();
+                if entry.limit.is_none_or(|limit| entry.running < limit) {
+                    entry.running += 1;
+                    return AgentGateGuard {
+                        gate: self,
+                        team_id: team_id.to_string(),
+                    };
+                }
+            }
+            state = self
+                .available
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    fn release(&self, team_id: &str) {
+        if let Some(entry) = self.lock_state().get_mut(team_id) {
+            entry.running = entry.running.saturating_sub(1);
+        }
+        self.available.notify_all();
+    }
+
+    fn forget(&self, team_id: &str) {
+        self.lock_state().remove(team_id);
+        self.available.notify_all();
+    }
+
+    #[cfg(test)]
+    fn running_count(&self, team_id: &str) -> usize {
+        self.lock_state()
+            .get(team_id)
+            .map_or(0, |entry| entry.running)
+    }
+}
+
+fn global_agent_gate() -> &'static AgentGate {
+    use std::sync::OnceLock;
+    static GATE: OnceLock<AgentGate> = OnceLock::new();
+    GATE.get_or_init(AgentGate::default)
+}
+
+/// Read the `maxConcurrentAgents` setting as the per-team sub-agent cap
+/// default, mirroring how `subagentModel` is resolved for the Agent tool.
+fn load_max_concurrent_agents_from_config() -> Option<usize> {
+    let cwd = std::env::current_dir().ok()?;
+    let config = ConfigLoader::default_for(&cwd).load().ok()?;
+    config.max_concurrent_agents()
+}
+
 fn global_task_registry() -> &'static TaskRegistry {
     use std::sync::OnceLock;
     static REGISTRY: OnceLock<TaskRegistry> = OnceLock::new();
@@ -1108,6 +1211,10 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                         "type": "string",
                         "description": "Shared prompt for all agents when using 'mode' preset. Each agent gets this prompt with its role prepended."
                     },
+                    "maxConcurrentAgents": {
+                        "type": "number",
+                        "description": "Cap on how many agents from this team run at the same time; extras queue until a slot frees. Defaults to the `maxConcurrentAgents` setting; unset = unlimited."
+                    },
                     "tasks": {
                         "type": "array",
                         "description": "Manual task list. Ignored when 'mode' is set.",
@@ -1901,6 +2008,14 @@ fn run_team_create(input: TeamCreateInput) -> Result<String, String> {
     let team_dir = output_dir.join("teams");
     std::fs::create_dir_all(&team_dir).map_err(|e| e.to_string())?;
 
+    // Resolve the per-team concurrency cap: explicit input > settings
+    // default > unlimited (pre-fix behavior preserved when unset).
+    let max_concurrent = input
+        .max_concurrent_agents
+        .filter(|n| *n > 0)
+        .or_else(load_max_concurrent_agents_from_config);
+    global_agent_gate().set_limit(&team_id, max_concurrent);
+
     // Expand mode preset into tasks, or use manual tasks.
     // Default to "2x" when neither mode nor tasks are provided.
     let tasks = if let Some(mode) = &input.mode {
@@ -1987,6 +2102,7 @@ fn run_team_create(input: TeamCreateInput) -> Result<String, String> {
         "agent_ids": agent_ids,
         "agent_count": agent_ids.len(),
         "status": "running",
+        "max_concurrent_agents": max_concurrent,
         "created_at": iso8601_now(),
     });
     let manifest_path = team_dir.join(format!("{team_id}.json"));
@@ -2384,6 +2500,9 @@ fn run_team_delete(input: TeamDeleteInput) -> Result<String, String> {
     let data = std::fs::read_to_string(&manifest_path).map_err(|e| e.to_string())?;
     let parsed: serde_json::Value = serde_json::from_str(&data).map_err(|e| e.to_string())?;
     let _ = std::fs::remove_file(&manifest_path);
+    // Drop the per-team concurrency cap so queued agents unblock and the
+    // gate map does not accumulate stale entries.
+    global_agent_gate().forget(&input.team_id);
     // Also clean up the team inbox directory
     let inbox_dir = agent_mailbox_dir().join("team").join(&input.team_id);
     if inbox_dir.exists() {
@@ -4161,6 +4280,10 @@ struct TeamCreateInput {
     prompt: Option<String>,
     #[serde(default)]
     tasks: Vec<Value>,
+    /// Per-team override for the concurrent-agent cap. Falls back to the
+    /// `maxConcurrentAgents` setting; `None` (or `0`) means unlimited.
+    #[serde(default, alias = "maxConcurrentAgents")]
+    max_concurrent_agents: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5411,6 +5534,12 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
         .name(thread_name)
         .spawn(move || {
             std::env::set_var("CLAWD_AGENT_ID", &agent_id_for_env);
+            // Team fan-out bound: block until this team has a free run slot.
+            // Non-team Agent() spawns (team_id: None) stay ungated.
+            let _gate_slot = job
+                .team_id
+                .as_deref()
+                .map(|team_id| global_agent_gate().acquire(team_id));
             let result =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_agent_job(&job)));
             match result {
@@ -11116,6 +11245,42 @@ mod tests {
         )
         .expect_err("blank prompt should fail");
         assert!(missing_prompt.contains("prompt must not be empty"));
+    }
+
+    #[test]
+    fn agent_gate_bounds_team_concurrency_and_releases_on_drop() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let team = format!("gate-test-{nanos}");
+        let gate = super::global_agent_gate();
+        gate.set_limit(&team, Some(1));
+
+        let guard = gate.acquire(&team);
+        assert_eq!(gate.running_count(&team), 1, "first acquire takes the slot");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let blocked_team = team.clone();
+        thread::spawn(move || {
+            let _blocked = super::global_agent_gate().acquire(&blocked_team);
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_millis(150)).is_err(),
+            "second agent must block while the team cap is saturated"
+        );
+
+        drop(guard);
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("slot must be released when the guard drops");
+        assert_eq!(
+            gate.running_count(&team),
+            0,
+            "running count returns to zero"
+        );
+
+        gate.forget(&team);
     }
 
     #[test]
