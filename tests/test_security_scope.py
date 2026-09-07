@@ -242,12 +242,17 @@ class WorkspacePathScopeTests(unittest.TestCase):
             local_workspace.mkdir()
 
             # 1. Test extraction of escaped UNC paths (like from JSON payloads)
-            payload = r'type \\\\server\\share\\secret.txt'
-            candidates = extract_path_candidates(payload)
-            self.assertIn(r'\\\\server\\share\\secret.txt', candidates)
+            payload_escaped = r'type \\\\server\\share\\secret.txt'
+            candidates_escaped = extract_path_candidates(payload_escaped)
+            self.assertIn(r'\\\\server\\share\\secret.txt', candidates_escaped)
+            
+            # 1b. Test extraction of unquoted UNC paths to ensure they survive shlex.split(posix=True)
+            payload_unquoted = r'type \\server\share\secret.txt'
+            candidates_unquoted = extract_path_candidates(payload_unquoted)
+            self.assertIn(r'\\server\share\secret.txt', candidates_unquoted)
 
             # 2. Test denial of UNC path when workspace is on a local drive
-            decision_outside = WorkspacePathScope.from_root(local_workspace).validate_payload(payload)
+            decision_outside = WorkspacePathScope.from_root(local_workspace).validate_payload(payload_escaped)
             self.assertFalse(decision_outside.allowed)
             
             # 3. Test allowance of UNC path when workspace root is itself a UNC path
