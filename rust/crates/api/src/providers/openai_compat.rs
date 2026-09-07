@@ -21,6 +21,11 @@ use super::{preflight_message_request, resolve_model_alias, Provider, ProviderFu
 pub const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 pub const DEFAULT_DASHSCOPE_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
+/// Default base URL for Claw's custom OpenAI-compatible provider.
+/// Intentionally left empty: a custom endpoint must set
+/// `CLAWCUSTOMOPENAI_BASE_URL`; otherwise requests will fail at URL build
+/// time rather than leaking credentials to the real OpenAI endpoint.
+pub const DEFAULT_CUSTOM_OPENAI_BASE_URL: &str = "";
 const REQUEST_ID_HEADER: &str = "request-id";
 const ALT_REQUEST_ID_HEADER: &str = "x-request-id";
 const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
@@ -43,6 +48,7 @@ pub struct OpenAiCompatConfig {
 const XAI_ENV_VARS: &[&str] = &["XAI_API_KEY"];
 const OPENAI_ENV_VARS: &[&str] = &["OPENAI_API_KEY"];
 const DASHSCOPE_ENV_VARS: &[&str] = &["DASHSCOPE_API_KEY"];
+const CUSTOM_OPENAI_ENV_VARS: &[&str] = &["CLAWCUSTOMOPENAI_API_KEY"];
 
 // Provider-specific request body size limits in bytes
 const XAI_MAX_REQUEST_BODY_BYTES: usize = 52_428_800; // 50MB
@@ -95,12 +101,27 @@ impl OpenAiCompatConfig {
         }
     }
 
+    /// Claw-specific custom OpenAI-compatible endpoint.
+    /// Reads `CLAWCUSTOMOPENAI_API_KEY` / `CLAWCUSTOMOPENAI_BASE_URL` so it
+    /// can coexist with real OpenAI/NeuralWatt `OPENAI_*` environment vars.
+    #[must_use]
+    pub const fn custom_openai() -> Self {
+        Self {
+            provider_name: "Custom OpenAI",
+            api_key_env: "CLAWCUSTOMOPENAI_API_KEY",
+            base_url_env: "CLAWCUSTOMOPENAI_BASE_URL",
+            default_base_url: DEFAULT_CUSTOM_OPENAI_BASE_URL,
+            max_request_body_bytes: OPENAI_MAX_REQUEST_BODY_BYTES,
+        }
+    }
+
     #[must_use]
     pub fn credential_env_vars(self) -> &'static [&'static str] {
         match self.provider_name {
             "xAI" => XAI_ENV_VARS,
             "OpenAI" => OPENAI_ENV_VARS,
             "DashScope" => DASHSCOPE_ENV_VARS,
+            "Custom OpenAI" => CUSTOM_OPENAI_ENV_VARS,
             _ => &[],
         }
     }
@@ -1066,7 +1087,7 @@ fn wire_model_for_base_url<'a>(
     if matches!(lowered_prefix.as_str(), "xai" | "grok" | "qwen" | "kimi") {
         return Cow::Borrowed(&model[pos + 1..]);
     }
-    if lowered_prefix == "local" {
+    if matches!(lowered_prefix.as_str(), "local" | "custom") {
         return Cow::Borrowed(&model[pos + 1..]);
     }
 
@@ -2276,6 +2297,29 @@ mod tests {
             json!({"city": "Paris"})
         );
         assert_eq!(parse_tool_arguments("not-json"), json!({"raw": "not-json"}));
+    }
+
+    #[test]
+    fn custom_routing_prefix_strips_on_wire() {
+        let payload = build_chat_completion_request(
+            &MessageRequest {
+                model: "custom/openclaw_3750".to_string(),
+                max_tokens: 64,
+                messages: vec![InputMessage::user_text("hello")],
+                ..Default::default()
+            },
+            OpenAiCompatConfig::custom_openai(),
+        );
+
+        assert_eq!(payload["model"], json!("openclaw_3750"));
+    }
+
+    #[test]
+    fn custom_openai_config_uses_separate_env_vars() {
+        let config = OpenAiCompatConfig::custom_openai();
+        assert_eq!(config.provider_name, "Custom OpenAI");
+        assert_eq!(config.api_key_env, "CLAWCUSTOMOPENAI_API_KEY");
+        assert_eq!(config.base_url_env, "CLAWCUSTOMOPENAI_BASE_URL");
     }
 
     #[test]

@@ -14,8 +14,10 @@
     clippy::unnecessary_wraps,
     clippy::unused_self
 )]
+
 mod init;
 mod input;
+
 mod render;
 mod setup_wizard;
 
@@ -1003,6 +1005,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let (args, cwd) = split_global_cwd_args(&args)?;
     apply_global_cwd(cwd)?;
+    // Inject saved provider settings (from /setup wizard) as env var fallbacks.
+    // The API client constructors read env vars only, so we set them once at
+    // process startup before any runtime threads are spawned. Already-set env
+    // vars are preserved — resolution order remains: env var > .env file >
+    // stored config. This only runs in the real binary (run() is not called by
+    // unit tests) to avoid leaking user config into the test suite.
+    runtime::inject_config_as_env_fallbacks();
     match parse_args(&args)? {
         CliAction::DumpManifests {
             output_format,
@@ -2986,6 +2995,8 @@ fn is_local_openai_model_syntax(model: &str) -> bool {
     if let Some(rest) = model.strip_prefix("local/") {
         return !rest.is_empty() && rest.split('/').all(|segment| !segment.is_empty());
     }
+    // Ollama-style tags (contain ':' or '.') are accepted when a custom
+    // OpenAI-compatible base URL is configured via OPENAI_BASE_URL.
     std::env::var_os("OPENAI_BASE_URL").is_some() && (model.contains(':') || model.contains('.'))
 }
 
@@ -3111,7 +3122,25 @@ fn config_permission_mode_for_current_dir() -> Option<PermissionMode> {
 fn config_model_for_current_dir() -> Option<String> {
     let cwd = env::current_dir().ok()?;
     let loader = ConfigLoader::default_for(&cwd);
-    loader.load().ok()?.model().map(ToOwned::to_owned)
+    let config = loader.load().ok()?;
+    let model = config.model()?;
+
+    // If the user configured a custom OpenAI-compatible endpoint with a bare
+    // model name (e.g. "openclaw"), route it through the custom/ prefix so it
+    // passes validation, maps to the custom OpenAI-compat client, and gets
+    // stripped down to the bare model id on the wire (avoiding a proxy 404).
+    if is_custom_openai_provider(&config) && !model.contains('/') {
+        return Some(format!("custom/{model}"));
+    }
+
+    Some(model.to_owned())
+}
+
+/// Check whether the loaded config uses the Claw custom OpenAI-compatible
+/// provider, which has its own env var namespace so it can coexist with real
+/// OpenAI/NeuralWatt credentials.
+fn is_custom_openai_provider(config: &runtime::RuntimeConfig) -> bool {
+    config.provider().kind() == Some("custom-openai")
 }
 
 fn resolve_repl_model(cli_model: String) -> Result<String, String> {
@@ -6926,6 +6955,7 @@ fn run_resume_command(
         | SlashCommand::Tag { .. }
         | SlashCommand::OutputStyle { .. }
         | SlashCommand::AddDir { .. }
+        | SlashCommand::Lsp { .. }
         | SlashCommand::Team { .. }
         | SlashCommand::Setup => Err("unsupported resumed slash command".into()),
     }
@@ -7062,7 +7092,6 @@ fn run_repl(
         input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
     println!("{}", cli.startup_banner());
     println!("{}", format_connected_line(&cli.model));
-
     loop {
         editor.set_completions(cli.repl_completion_candidates().unwrap_or_default());
         match editor.read_line()? {
@@ -7102,10 +7131,108 @@ fn run_repl(
                 cli.record_prompt_history(&trimmed);
                 cli.run_turn(&trimmed)?;
             }
+            input::ReadOutcome::TeamToggle => {
+                // Ctrl+T toggles agent teams mode
+                let current = std::env::var("CLAWD_AGENT_TEAMS").unwrap_or_default();
+                if current == "1" {
+                    std::env::set_var("CLAWD_AGENT_TEAMS", "0");
+                    eprintln!("[team] Agent teams disabled");
+                } else {
+                    std::env::set_var("CLAWD_AGENT_TEAMS", "1");
+                    eprintln!("[team] Agent teams enabled (TeamCreate now available)");
+                }
+            }
             input::ReadOutcome::Cancel => {}
             input::ReadOutcome::Exit => {
                 cli.persist_session()?;
                 break;
+            }
+            input::ReadOutcome::ProviderSwap => {
+                let _ = setup_wizard::run_setup_wizard();
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let config = runtime::ConfigLoader::default_for(&cwd).load().ok();
+                if let Some(new_model) = config
+                    .as_ref()
+                    .and_then(|c| c.provider().model().map(str::to_string))
+                {
+                    let _ = cli.set_model(Some(new_model));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Run the plain REPL starting from an existing LiveCli.
+/// This is the same loop as `run_repl` but takes ownership
+/// of a pre-existing `LiveCli` instead of creating one from CLI args.
+fn run_repl_from_cli(mut cli: LiveCli) -> Result<(), Box<dyn std::error::Error>> {
+    let mut editor =
+        input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
+    println!();
+    println!("{}", format_connected_line(&cli.model));
+    loop {
+        editor.set_completions(cli.repl_completion_candidates().unwrap_or_default());
+        match editor.read_line()? {
+            input::ReadOutcome::Submit(input) => {
+                let trimmed = input.trim().to_string();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if matches!(trimmed.as_str(), "/exit" | "/quit") {
+                    cli.persist_session()?;
+                    break;
+                }
+                match SlashCommand::parse(&trimmed) {
+                    Ok(Some(command)) => {
+                        if cli.handle_repl_command(command)? {
+                            cli.persist_session()?;
+                        }
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        eprintln!("{error}");
+                        continue;
+                    }
+                }
+                let cwd = std::env::current_dir().unwrap_or_default();
+                if let Some(prompt) = try_resolve_bare_skill_prompt(&cwd, &trimmed) {
+                    editor.push_history(input);
+                    cli.record_prompt_history(&trimmed);
+                    cli.run_turn(&prompt)?;
+                    continue;
+                }
+                editor.push_history(input);
+                cli.record_prompt_history(&trimmed);
+                cli.run_turn(&trimmed)?;
+            }
+            input::ReadOutcome::Cancel => {}
+            input::ReadOutcome::Exit => {
+                cli.persist_session()?;
+                break;
+            }
+            input::ReadOutcome::ProviderSwap => {
+                let _ = setup_wizard::run_setup_wizard();
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let config = runtime::ConfigLoader::default_for(&cwd).load().ok();
+                if let Some(new_model) = config
+                    .as_ref()
+                    .and_then(|c| c.provider().model().map(str::to_string))
+                {
+                    let _ = cli.set_model(Some(new_model));
+                }
+            }
+            input::ReadOutcome::TeamToggle => {
+                let current = std::env::var("CLAWD_AGENT_TEAMS").unwrap_or_default();
+                if current == "1" {
+                    std::env::set_var("CLAWD_AGENT_TEAMS", "0");
+                    eprintln!("[team] Agent teams disabled");
+                } else {
+                    std::env::set_var("CLAWD_AGENT_TEAMS", "1");
+                    eprintln!("[team] Agent teams enabled");
+                }
             }
         }
     }
@@ -7749,35 +7876,38 @@ impl LiveCli {
     }
 
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
+        self.run_turn_to(input, &mut io::stdout(), true)
+    }
+
+    /// Core turn execution with a custom output writer.
+    /// In the plain REPL, `out` is `io::stdout()`.
+    fn run_turn_to<W: io::Write>(
+        &mut self,
+        input: &str,
+        out: &mut W,
+        emit_output: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(emit_output)?;
         let mut spinner = Spinner::new();
-        let mut stdout = io::stdout();
-        spinner.tick(
-            "🦀 Thinking...",
-            TerminalRenderer::new().color_theme(),
-            &mut stdout,
-        )?;
+        spinner.tick("🦀 Thinking...", TerminalRenderer::new().color_theme(), out)?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
         match result {
             Ok(summary) => {
                 self.replace_runtime(runtime)?;
-                spinner.finish(
-                    "✨ Done",
-                    TerminalRenderer::new().color_theme(),
-                    &mut stdout,
-                )?;
+                spinner.finish("✨ Done", TerminalRenderer::new().color_theme(), out)?;
                 let final_text = final_assistant_text(&summary);
                 if !final_text.is_empty() {
-                    println!("{final_text}");
+                    writeln!(out, "{final_text}")?;
                 }
-                println!();
+                writeln!(out)?;
                 if let Some(event) = summary.auto_compaction {
-                    println!(
+                    writeln!(
+                        out,
                         "{}",
                         format_auto_compaction_notice(event.removed_message_count)
-                    );
+                    )?;
                 }
                 self.persist_session()?;
                 Ok(())
@@ -7787,34 +7917,14 @@ impl LiveCli {
                 spinner.fail(
                     "❌ Request failed",
                     TerminalRenderer::new().color_theme(),
-                    &mut stdout,
+                    out,
                 )?;
 
                 // ============================================================================
                 // Auto-compact retry on context window errors
                 // ============================================================================
-                // When the model API returns a context_window_blocked error (because the request
-                // exceeds the model's context window), we automatically:
-                // 1. Compact the session (remove old messages to free up space)
-                // 2. Retry the original request with the compacted session
-                // 3. Report results to the user
-                //
-                // This eliminates the need for users to manually run /compact when they
-                // hit context limits - the recovery happens automatically.
-                //
-                // Detection: We look for "context_window" or "Context window" in the error
-                // message, which covers error types like:
-                // - "context_window_blocked"
-                // - "Context window blocked"
-                // - "This model's maximum context length is X tokens..."
-                // ============================================================================
 
                 let error_str = error.to_string();
-                // Detect context window overflow. Some providers (e.g. OpenAI-compat backends)
-                // return 400 with "no parseable body" instead of a proper context_length_exceeded
-                // error when the request is too large to even parse — treat that as context overflow too.
-                // Also detect model-specific context error markers (e.g. llama.cpp returns
-                // "Context size has been exceeded." / "exceed_context_size_error" / "exceeds the available context size").
                 let is_context_window = error_str.contains("context_window")
                     || error_str.contains("Context window")
                     || error_str.contains("no parseable body")
@@ -7824,44 +7934,33 @@ impl LiveCli {
                         .to_ascii_lowercase()
                         .contains("context size has been exceeded");
 
-                // Also treat "assistant stream produced no content" and reqwest decode failures
-                // as recoverable errors that may benefit from auto-compaction. Some backends (e.g.
-                // llama.cpp) return a non-SSE HTTP 500 body when context overflows, causing
-                // reqwest to fail with "error decoding response body" — treat that as context overflow too.
                 let is_no_content = error_str.contains("assistant stream produced no content")
                     || error_str.contains("Failed to parse input at pos")
                     || error_str.contains("error decoding response body");
 
                 if is_context_window || is_no_content {
-                    // If the error tells us the server's actual context window, adapt our
-                    // auto-compaction threshold so future auto-compact-trigger checks are accurate.
                     if let Some(window) = extract_context_window_tokens_from_error(&error_str) {
-                        // Set threshold at 70% of the reported window to leave headroom.
                         let threshold: u32 = (window as f64 * 0.7).round() as u32;
-                        println!(
+                        writeln!(
+                            out,
                             "  Server context window: {} tokens — setting auto-compaction threshold to {}",
                             window, threshold
-                        );
+                        )?;
                         runtime.set_auto_compaction_input_tokens_threshold(threshold);
                     }
 
-                    // A single compaction pass may not free enough context space.
-                    // Progressive retry: each round preserves fewer recent messages (4→2→1→0),
-                    // trading conversation continuity for a smaller payload until it fits.
-                    // Max 4 rounds before giving up and surfacing the error to the user.
                     let max_compact_rounds = 4;
                     let preserve_schedule = [4, 2, 1, 0];
 
                     for round in 0..max_compact_rounds {
                         let preserve = preserve_schedule[round];
-                        println!(
+                        writeln!(
+                            out,
                             "  Auto-compacting session (round {}/{}, preserving {} recent messages)...",
                             round + 1,
                             max_compact_rounds,
                             preserve
-                        );
-
-                        // Run Trident pipeline then summary-based compaction
+                        )?;
                         let result = runtime::trident::trident_compact_session(
                             runtime.session(),
                             CompactionConfig {
@@ -7874,19 +7973,20 @@ impl LiveCli {
 
                         if removed == 0 && round > 0 {
                             // No more messages to compact — further rounds won't help
-                            println!("  No further compaction possible.");
+                            writeln!(out, "  No further compaction possible.")?;
                             break;
                         }
 
                         if removed > 0 {
-                            println!(
+                            writeln!(
+                                out,
                                 "{}",
                                 format_compact_report(
                                     removed,
                                     result.compacted_session.messages.len(),
                                     false
                                 )
-                            );
+                            )?;
                         }
 
                         // Without this, prepare_turn_runtime() reads from self.runtime.session()
@@ -7896,7 +7996,7 @@ impl LiveCli {
 
                         // Build a new runtime with the compacted session and retry
                         let (mut new_runtime, hook_abort_monitor) =
-                            self.prepare_turn_runtime(true)?;
+                            self.prepare_turn_runtime(emit_output)?;
                         drop(hook_abort_monitor);
 
                         let mut rp = CliPermissionPrompter::new(self.permission_mode);
@@ -7910,14 +8010,15 @@ impl LiveCli {
                                         "✨ Done (after aggressive auto-compact)"
                                     },
                                     TerminalRenderer::new().color_theme(),
-                                    &mut stdout,
+                                    out,
                                 )?;
-                                println!();
+                                writeln!(out)?;
                                 if let Some(event) = summary.auto_compaction {
-                                    println!(
+                                    writeln!(
+                                        out,
                                         "{}",
                                         format_auto_compaction_notice(event.removed_message_count)
-                                    );
+                                    )?;
                                 }
                                 self.persist_session()?;
                                 return Ok(());
@@ -8140,6 +8241,56 @@ impl LiveCli {
                 run_init(CliOutputFormat::Text)?;
                 false
             }
+            SlashCommand::Team { action } => {
+                match action.as_deref().unwrap_or("") {
+                    "on" | "enable" => {
+                        std::env::set_var("CLAWD_AGENT_TEAMS", "1");
+                        eprintln!("[team] Agent teams enabled (TeamCreate now available)");
+                    }
+                    "off" | "disable" => {
+                        std::env::set_var("CLAWD_AGENT_TEAMS", "0");
+                        eprintln!("[team] Agent teams disabled");
+                    }
+                    "status" => {
+                        let current = std::env::var("CLAWD_AGENT_TEAMS").unwrap_or_default();
+                        if current == "1" {
+                            eprintln!("[team] Agent teams: ENABLED");
+                        } else {
+                            eprintln!(
+                                "[team] Agent teams: DISABLED (use /team on or Ctrl+T to enable)"
+                            );
+                        }
+                    }
+                    "" => {
+                        // Toggle
+                        let current = std::env::var("CLAWD_AGENT_TEAMS").unwrap_or_default();
+                        if current == "1" {
+                            std::env::set_var("CLAWD_AGENT_TEAMS", "0");
+                            eprintln!("[team] Agent teams disabled");
+                        } else {
+                            std::env::set_var("CLAWD_AGENT_TEAMS", "1");
+                            eprintln!("[team] Agent teams enabled (TeamCreate now available)");
+                        }
+                    }
+                    other => {
+                        eprintln!("[team] unknown action: {other}. Use: /team [on|off|status]")
+                    }
+                }
+                false
+            }
+            SlashCommand::Setup => {
+                setup_wizard::run_setup_wizard()?;
+                // Reload the model from config after wizard saves
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let config = runtime::ConfigLoader::default_for(&cwd).load().ok();
+                if let Some(new_model) = config
+                    .as_ref()
+                    .and_then(|c| c.provider().model().map(str::to_string))
+                {
+                    self.set_model(Some(new_model))?;
+                }
+                false
+            }
             SlashCommand::Diff => {
                 Self::print_diff()?;
                 false
@@ -8186,12 +8337,6 @@ impl LiveCli {
                     )?
                     .render()
                 );
-                false
-            }
-            SlashCommand::Setup => {
-                if let Err(e) = setup_wizard::run_setup_wizard() {
-                    eprintln!("Setup wizard failed: {e}");
-                }
                 false
             }
             SlashCommand::History { count } => {
@@ -8241,7 +8386,7 @@ impl LiveCli {
             | SlashCommand::Tag { .. }
             | SlashCommand::OutputStyle { .. }
             | SlashCommand::AddDir { .. }
-            | SlashCommand::Team { .. } => {
+            | SlashCommand::Lsp { .. } => {
                 let cmd_name = command.slash_name();
                 eprintln!("{cmd_name} is not yet implemented in this build.");
                 false
@@ -12432,7 +12577,8 @@ fn build_runtime_with_plugin_state(
             emit_output,
             tool_registry.clone(),
             mcp_state.clone(),
-        ),
+        )
+        .with_max_parallel_tool_calls(feature_config.max_parallel_tool_calls()),
         policy,
         system_prompt,
         &feature_config,
@@ -13860,6 +14006,22 @@ struct CliToolExecutor {
     allowed_tools: Option<AllowedToolSet>,
     tool_registry: GlobalToolRegistry,
     mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
+    /// Cap on concurrently executing parallel-safe tool calls in one batch.
+    max_parallel_tool_calls: usize,
+}
+
+/// Default fan-out cap for parallel read-only tool execution. Local model
+/// servers and filesystem watchers degrade past a handful of concurrent
+/// requests, so 8 is the sane default. Precedence: `maxParallelToolCalls`
+/// in settings > `CLAWD_PARALLEL_TOOL_CALLS` env > this default.
+const DEFAULT_MAX_PARALLEL_TOOL_CALLS: usize = 8;
+
+fn max_parallel_tool_calls_from_env() -> usize {
+    std::env::var("CLAWD_PARALLEL_TOOL_CALLS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_MAX_PARALLEL_TOOL_CALLS)
 }
 
 impl CliToolExecutor {
@@ -13875,7 +14037,18 @@ impl CliToolExecutor {
             allowed_tools,
             tool_registry,
             mcp_state,
+            max_parallel_tool_calls: max_parallel_tool_calls_from_env(),
         }
+    }
+
+    /// Apply the `maxParallelToolCalls` setting when present; `None` keeps
+    /// the env/default already resolved by `new`.
+    #[must_use]
+    fn with_max_parallel_tool_calls(mut self, max: Option<usize>) -> Self {
+        if let Some(max) = max.filter(|m| *m > 0) {
+            self.max_parallel_tool_calls = max;
+        }
+        self
     }
 
     fn execute_search_tool(&self, value: serde_json::Value) -> Result<String, ToolError> {
@@ -13981,6 +14154,179 @@ impl ToolExecutor for CliToolExecutor {
                 Err(error)
             }
         }
+    }
+
+    fn execute_batch(&mut self, calls: Vec<runtime::ToolCall>) -> Vec<runtime::ToolResult> {
+        if calls.len() <= 1 {
+            return calls
+                .into_iter()
+                .map(|call| {
+                    let result = self.execute(&call.tool_name, &call.input);
+                    runtime::ToolResult {
+                        tool_use_id: call.tool_use_id,
+                        tool_name: call.tool_name,
+                        result,
+                    }
+                })
+                .collect();
+        }
+
+        /// Tools that are safe to run in parallel because they only read
+        /// state and dispatch through the stateless tool registry.
+        ///
+        /// `ToolSearch` is intentionally absent: the sequential path routes it
+        /// through `execute_search_tool` (which merges live MCP state), while
+        /// the parallel path dispatches straight to the stateless registry.
+        /// Keeping it sequential preserves identical output under parallelism.
+        const PARALLEL_SAFE_TOOLS: &[&str] = &[
+            "read_file",
+            "glob_search",
+            "grep_search",
+            "WebFetch",
+            "WebSearch",
+            "Skill",
+            "LSP",
+            "Agent",
+            "AgentMessage",
+            "TeamStatus",
+            "TaskClaim",
+            "AgentSuggestion",
+            "ContextRequest",
+            "TaskGet",
+            "TaskList",
+            "TaskOutput",
+            "GitStatus",
+            "GitDiff",
+            "GitLog",
+            "GitShow",
+            "GitBlame",
+        ];
+
+        let emit_output = self.emit_output;
+        let mut results: Vec<Option<runtime::ToolResult>> = vec![None; calls.len()];
+        let mut parallel_calls: Vec<(usize, String, String, String)> = Vec::new();
+        let mut sequential_indices: Vec<usize> = Vec::new();
+
+        // Classify calls as parallel-safe or sequential
+        for (i, call) in calls.iter().enumerate() {
+            if self.allowed_tools.as_ref().is_some_and(|allowed| {
+                !allowed.contains(&canonical_allowed_tool_name(&call.tool_name))
+            }) {
+                results[i] = Some(runtime::ToolResult {
+                    tool_use_id: call.tool_use_id.clone(),
+                    tool_name: call.tool_name.clone(),
+                    result: Err(ToolError::new(format!(
+                        "tool `{}` is not enabled by the current --allowedTools setting",
+                        call.tool_name
+                    ))),
+                });
+            } else if PARALLEL_SAFE_TOOLS.contains(&call.tool_name.as_str())
+                && !self.tool_registry.has_runtime_tool(&call.tool_name)
+            {
+                parallel_calls.push((
+                    i,
+                    call.tool_use_id.clone(),
+                    call.tool_name.clone(),
+                    call.input.clone(),
+                ));
+            } else {
+                sequential_indices.push(i);
+            }
+        }
+
+        // Execute parallel-safe tools concurrently, bounded so fan-out against
+        // local model servers cannot queue unbounded threads. Results are
+        // keyed by the original call index, never by completion order, so the
+        // transcript stays deterministic across runs for the same input.
+        //
+        // Note: parallel-safe calls run before sequential ones within a batch
+        // (results still land in call-order slots). Models must not emit
+        // calls whose success depends on another call in the same batch.
+        if !parallel_calls.is_empty() {
+            let registry = self.tool_registry.clone();
+            let max_parallel = self.max_parallel_tool_calls.max(1);
+            let mut parallel_results: Vec<(usize, String, String, Result<String, ToolError>)> =
+                Vec::with_capacity(parallel_calls.len());
+            for wave in parallel_calls.chunks(max_parallel) {
+                let wave_results: Vec<(usize, String, String, Result<String, ToolError>)> =
+                    std::thread::scope(|s| {
+                        let mut handles = Vec::new();
+                        for (idx, tool_use_id, tool_name, input) in wave {
+                            let registry = &registry;
+                            let tool_use_id = tool_use_id.clone();
+                            let tool_name = tool_name.clone();
+                            let input = input.clone();
+                            let idx = *idx;
+                            // Fallback tuple carried outside the closure so a
+                            // panicking worker still lands in its own slot instead
+                            // of colliding with index 0 or leaving a hole.
+                            let fallback = (idx, tool_use_id.clone(), tool_name.clone());
+                            handles.push((
+                                fallback,
+                                s.spawn(move || {
+                                    let value = serde_json::from_str(&input).map_err(|error| {
+                                        ToolError::new(format!("invalid tool input JSON: {error}"))
+                                    });
+                                    let result = match value {
+                                        Ok(v) => {
+                                            registry.execute(&tool_name, &v).map_err(ToolError::new)
+                                        }
+                                        Err(e) => Err(e),
+                                    };
+                                    (idx, tool_use_id, tool_name, result)
+                                }),
+                            ));
+                        }
+                        handles
+                            .into_iter()
+                            .map(|((idx, tool_use_id, tool_name), h)| {
+                                h.join().unwrap_or_else(|_| {
+                                    (
+                                        idx,
+                                        tool_use_id,
+                                        tool_name,
+                                        Err(ToolError::new("parallel tool thread panicked")),
+                                    )
+                                })
+                            })
+                            .collect()
+                    });
+                parallel_results.extend(wave_results);
+            }
+
+            for (idx, tool_use_id, tool_name, result) in parallel_results {
+                if emit_output {
+                    let output_str = match &result {
+                        Ok(o) => o.clone(),
+                        Err(e) => e.to_string(),
+                    };
+                    let is_error = result.is_err();
+                    let markdown = format_tool_result(&tool_name, &output_str, is_error);
+                    self.renderer
+                        .stream_markdown(&markdown, &mut io::stdout())
+                        .map_err(|error| ToolError::new(error.to_string()))
+                        .ok();
+                }
+                results[idx] = Some(runtime::ToolResult {
+                    tool_use_id,
+                    tool_name,
+                    result,
+                });
+            }
+        }
+
+        // Execute sequential tools one at a time
+        for idx in sequential_indices {
+            let call = &calls[idx];
+            let result = self.execute(&call.tool_name, &call.input);
+            results[idx] = Some(runtime::ToolResult {
+                tool_use_id: call.tool_use_id.clone(),
+                tool_name: call.tool_name.clone(),
+                result,
+            });
+        }
+
+        results.into_iter().map(|r| r.unwrap()).collect()
     }
 }
 
@@ -14643,6 +14989,178 @@ mod tests {
                 allow_broad_cwd: false,
             }
         );
+    }
+
+    #[test]
+    fn config_model_normalizes_bare_name_to_custom_prefix_for_custom_openai_provider() {
+        let _guard = env_lock();
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let config_home = root.join("config-home");
+        std::fs::create_dir_all(&cwd).expect("project dir should exist");
+        std::fs::create_dir_all(&config_home).expect("config home should exist");
+        std::fs::write(
+            config_home.join("settings.json"),
+            r#"{
+                "provider": {
+                    "kind": "custom-openai",
+                    "apiKey": "sk-test",
+                    "baseUrl": "http://localhost:9999/v1"
+                },
+                "model": "openclaw"
+            }"#,
+        )
+        .expect("user settings should write");
+
+        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+
+        let resolved = with_current_dir(&cwd, super::config_model_for_current_dir);
+
+        match original_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        std::fs::remove_dir_all(root).expect("temp config root should clean up");
+
+        assert_eq!(resolved, Some("custom/openclaw".to_string()));
+    }
+
+    #[test]
+    fn config_model_leaves_openai_kind_bare_model_unnormalized() {
+        let _guard = env_lock();
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let config_home = root.join("config-home");
+        std::fs::create_dir_all(&cwd).expect("project dir should exist");
+        std::fs::create_dir_all(&config_home).expect("config home should exist");
+        std::fs::write(
+            config_home.join("settings.json"),
+            r#"{
+                "provider": {
+                    "kind": "openai",
+                    "apiKey": "sk-test",
+                    "baseUrl": "http://localhost:9999/v1"
+                },
+                "model": "openclaw"
+            }"#,
+        )
+        .expect("user settings should write");
+
+        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+
+        let resolved = with_current_dir(&cwd, super::config_model_for_current_dir);
+
+        match original_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        std::fs::remove_dir_all(root).expect("temp config root should clean up");
+
+        assert_eq!(resolved, Some("openclaw".to_string()));
+    }
+
+    #[test]
+    fn inject_config_as_env_fallbacks_sets_openai_provider_env_vars() {
+        let _guard = env_lock();
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let config_home = root.join("config-home");
+        std::fs::create_dir_all(&cwd).expect("project dir should exist");
+        std::fs::create_dir_all(&config_home).expect("config home should exist");
+        std::fs::write(
+            config_home.join("settings.json"),
+            r#"{
+                "provider": {
+                    "kind": "openai",
+                    "apiKey": "sk-from-config",
+                    "baseUrl": "http://localhost:9999/v1"
+                }
+            }"#,
+        )
+        .expect("user settings should write");
+
+        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_api_key = std::env::var("OPENAI_API_KEY").ok();
+        let original_base_url = std::env::var("OPENAI_BASE_URL").ok();
+
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        std::env::remove_var("OPENAI_API_KEY");
+        std::env::remove_var("OPENAI_BASE_URL");
+
+        with_current_dir(&cwd, runtime::inject_config_as_env_fallbacks);
+
+        let api_key = std::env::var("OPENAI_API_KEY").ok();
+        let base_url = std::env::var("OPENAI_BASE_URL").ok();
+
+        match original_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        match original_api_key {
+            Some(value) => std::env::set_var("OPENAI_API_KEY", value),
+            None => std::env::remove_var("OPENAI_API_KEY"),
+        }
+        match original_base_url {
+            Some(value) => std::env::set_var("OPENAI_BASE_URL", value),
+            None => std::env::remove_var("OPENAI_BASE_URL"),
+        }
+        std::fs::remove_dir_all(root).expect("temp config root should clean up");
+
+        assert_eq!(api_key, Some("sk-from-config".to_string()));
+        assert_eq!(base_url, Some("http://localhost:9999/v1".to_string()));
+    }
+
+    #[test]
+    fn inject_config_as_env_fallbacks_sets_custom_openai_provider_env_vars() {
+        let _guard = env_lock();
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let config_home = root.join("config-home");
+        std::fs::create_dir_all(&cwd).expect("project dir should exist");
+        std::fs::create_dir_all(&config_home).expect("config home should exist");
+        std::fs::write(
+            config_home.join("settings.json"),
+            r#"{
+                "provider": {
+                    "kind": "custom-openai",
+                    "apiKey": "sk-from-config",
+                    "baseUrl": "http://localhost:9999/v1"
+                }
+            }"#,
+        )
+        .expect("user settings should write");
+
+        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_api_key = std::env::var("CLAWCUSTOMOPENAI_API_KEY").ok();
+        let original_base_url = std::env::var("CLAWCUSTOMOPENAI_BASE_URL").ok();
+
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        std::env::remove_var("CLAWCUSTOMOPENAI_API_KEY");
+        std::env::remove_var("CLAWCUSTOMOPENAI_BASE_URL");
+
+        with_current_dir(&cwd, runtime::inject_config_as_env_fallbacks);
+
+        let api_key = std::env::var("CLAWCUSTOMOPENAI_API_KEY").ok();
+        let base_url = std::env::var("CLAWCUSTOMOPENAI_BASE_URL").ok();
+
+        match original_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        match original_api_key {
+            Some(value) => std::env::set_var("CLAWCUSTOMOPENAI_API_KEY", value),
+            None => std::env::remove_var("CLAWCUSTOMOPENAI_API_KEY"),
+        }
+        match original_base_url {
+            Some(value) => std::env::set_var("CLAWCUSTOMOPENAI_BASE_URL", value),
+            None => std::env::remove_var("CLAWCUSTOMOPENAI_BASE_URL"),
+        }
+        std::fs::remove_dir_all(root).expect("temp config root should clean up");
+
+        assert_eq!(api_key, Some("sk-from-config".to_string()));
+        assert_eq!(base_url, Some("http://localhost:9999/v1".to_string()));
     }
 
     #[test]
@@ -18594,6 +19112,103 @@ UU conflicted.rs",
             .expect("system time should be after epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("claw-cli-{label}-{nanos}"))
+    }
+
+    #[test]
+    fn parallel_batch_results_follow_call_index_even_with_workspace_escapes() {
+        let workspace = temp_workspace("parallel-order");
+        fs::create_dir_all(&workspace).expect("workspace dir should exist");
+        for name in ["a", "b", "c", "d", "e"] {
+            fs::write(
+                workspace.join(format!("{name}.txt")),
+                format!("marker-{name}\n"),
+            )
+            .expect("fixture file should write");
+        }
+        let unique = workspace
+            .file_name()
+            .expect("workspace name")
+            .to_string_lossy()
+            .into_owned();
+        let escape_name = format!("{unique}-escape.txt");
+        let escape_path = workspace
+            .parent()
+            .expect("workspace parent dir")
+            .join(&escape_name);
+        fs::write(&escape_path, "out-of-scope\n").expect("escape file should write");
+
+        let calls = vec![
+            runtime::ToolCall {
+                tool_use_id: "t0".to_string(),
+                tool_name: "read_file".to_string(),
+                input: r#"{"path":"a.txt"}"#.to_string(),
+            },
+            runtime::ToolCall {
+                tool_use_id: "t1".to_string(),
+                tool_name: "read_file".to_string(),
+                input: format!(r#"{{"path":"../{escape_name}"}}"#),
+            },
+            runtime::ToolCall {
+                tool_use_id: "t2".to_string(),
+                tool_name: "read_file".to_string(),
+                input: r#"{"path":"b.txt"}"#.to_string(),
+            },
+            runtime::ToolCall {
+                tool_use_id: "t3".to_string(),
+                tool_name: "read_file".to_string(),
+                input: r#"{"path":"c.txt"}"#.to_string(),
+            },
+            runtime::ToolCall {
+                tool_use_id: "t4".to_string(),
+                tool_name: "read_file".to_string(),
+                input: r#"{"path":"d.txt"}"#.to_string(),
+            },
+            runtime::ToolCall {
+                tool_use_id: "t5".to_string(),
+                tool_name: "read_file".to_string(),
+                input: r#"{"path":"e.txt"}"#.to_string(),
+            },
+        ];
+
+        let results = with_current_dir(&workspace, || {
+            let mut executor =
+                CliToolExecutor::new(None, false, GlobalToolRegistry::builtin(), None)
+                    .with_max_parallel_tool_calls(Some(2));
+            executor.execute_batch(calls)
+        });
+
+        let _ = fs::remove_file(&escape_path);
+        let _ = fs::remove_dir_all(&workspace);
+
+        assert_eq!(results.len(), 6, "every call must produce a result slot");
+        for (i, result) in results.iter().enumerate() {
+            assert_eq!(
+                result.tool_use_id,
+                format!("t{i}"),
+                "result {i} must carry the call that owned the slot, not the thread that finished first"
+            );
+            assert_eq!(result.tool_name, "read_file");
+        }
+        let escaped = results[1]
+            .result
+            .as_ref()
+            .expect_err("out-of-scope path must fail even inside a parallel batch");
+        assert!(
+            escaped.to_string().contains("escapes workspace boundary"),
+            "escape must be rejected by the per-call workspace check, got: {escaped}"
+        );
+        let markers = ["marker-a", "marker-b", "marker-c", "marker-d", "marker-e"];
+        let slots = [0usize, 2, 3, 4, 5];
+        for (slot, marker) in slots.iter().zip(markers) {
+            let output = results[*slot]
+                .result
+                .as_ref()
+                .unwrap_or_else(|error| panic!("read at slot {slot} failed: {error}"));
+            assert!(
+                output.contains(marker),
+                "slot {slot} must contain {marker}, got: {output}"
+            );
+        }
     }
 
     #[test]

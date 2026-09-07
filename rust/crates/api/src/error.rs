@@ -180,6 +180,49 @@ impl ApiError {
         }
     }
 
+    /// HTTP status code for an `Api` error, if any. Used by callers (e.g. the
+    /// sub-agent provider chain) to decide whether to advance to the next
+    /// configured model — a 404 "model not found" on the primary should fall
+    /// through to the next fallback rather than killing the whole chain.
+    #[must_use]
+    pub fn status_code(&self) -> Option<reqwest::StatusCode> {
+        match self {
+            Self::Api { status, .. } => Some(*status),
+            Self::RetriesExhausted { last_error, .. } => last_error.status_code(),
+            Self::MissingCredentials { .. }
+            | Self::ContextWindowExceeded { .. }
+            | Self::ExpiredOAuthToken
+            | Self::Auth(_)
+            | Self::InvalidApiKeyEnv(_)
+            | Self::Http(_)
+            | Self::Io(_)
+            | Self::Json { .. }
+            | Self::InvalidSseFrame(_)
+            | Self::BackoffOverflow { .. }
+            | Self::RequestBodySizeExceeded { .. } => None,
+        }
+    }
+
+    /// Response body (best-effort) for an `Api` error, if any.
+    #[must_use]
+    pub fn response_body(&self) -> Option<&str> {
+        match self {
+            Self::Api { body, .. } => Some(body.as_str()),
+            Self::RetriesExhausted { last_error, .. } => last_error.response_body(),
+            Self::MissingCredentials { .. }
+            | Self::ContextWindowExceeded { .. }
+            | Self::ExpiredOAuthToken
+            | Self::Auth(_)
+            | Self::InvalidApiKeyEnv(_)
+            | Self::Http(_)
+            | Self::Io(_)
+            | Self::Json { .. }
+            | Self::InvalidSseFrame(_)
+            | Self::BackoffOverflow { .. }
+            | Self::RequestBodySizeExceeded { .. } => None,
+        }
+    }
+
     #[must_use]
     pub fn safe_failure_class(&self) -> &'static str {
         match self {

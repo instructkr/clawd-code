@@ -13,3 +13,4 @@ archive/
 status-help.txt
 # Legacy Python port session scratch artifacts
 .port_sessions/
+.claude/

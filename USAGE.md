@@ -364,10 +364,11 @@ Reasoning variants (`qwen-qwq-*`, `qwq-*`, `*-thinking`) automatically strip `te
 | **xAI** | OpenAI-compatible | `XAI_API_KEY` | `XAI_BASE_URL` | `https://api.x.ai/v1` |
 | **OpenAI-compatible** | OpenAI Chat Completions | `OPENAI_API_KEY` | `OPENAI_BASE_URL` | `https://api.openai.com/v1` |
 | **DashScope** (Alibaba) | OpenAI-compatible | `DASHSCOPE_API_KEY` | `DASHSCOPE_BASE_URL` | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
+| **Custom OpenAI-compat** | OpenAI Chat Completions | `CLAWCUSTOMOPENAI_API_KEY` | `CLAWCUSTOMOPENAI_BASE_URL` | none (must be supplied) |
 
 The OpenAI-compatible backend also serves as the gateway for **OpenRouter**, **Ollama**, and any other service that speaks the OpenAI `/v1/chat/completions` wire format — just point `OPENAI_BASE_URL` at the service.
 
-**Model-name prefix routing:** If a model name starts with `openai/`, `local/`, `gpt-`, `qwen/`, `qwen-`, `kimi/`, or `kimi-`, the provider is selected by the prefix regardless of which env vars are set. This prevents accidental misrouting to Anthropic when multiple credentials exist in the environment. For the default OpenAI API and local/private OpenAI-compatible endpoints, `openai/` is a routing prefix and is stripped before the request hits the wire. For non-local custom `OPENAI_BASE_URL` gateways, slash-containing OpenAI-compatible slugs (for example OpenRouter-style `openai/gpt-4.1-mini`) are preserved so the gateway receives the model ID it expects. The `local/` prefix is an explicit escape hatch for local slash-containing model IDs: it is stripped while the rest of the model ID is sent verbatim.
+**Model-name prefix routing:** If a model name starts with `openai/`, `local/`, `custom/`, `gpt-`, `qwen/`, `qwen-`, `kimi/`, or `kimi-`, the provider is selected by the prefix regardless of which env vars are set. This prevents accidental misrouting to Anthropic when multiple credentials exist in the environment. For the default OpenAI API and local/private OpenAI-compatible endpoints, `openai/` is a routing prefix and is stripped before the request hits the wire. For non-local custom `OPENAI_BASE_URL` gateways, slash-containing OpenAI-compatible slugs (for example OpenRouter-style `openai/gpt-4.1-mini`) are preserved so the gateway receives the model ID it expects. The `local/` prefix is an explicit escape hatch for local slash-containing model IDs: it is stripped while the rest of the model ID is sent verbatim. The `custom/` prefix selects the Claw-specific custom OpenAI-compat provider (`CLAWCUSTOMOPENAI_*` env vars) and is also stripped on the wire; use it when you want a private OpenAI-compatible endpoint that does not collide with real `OPENAI_*` credentials.
 
 ### Tested models and aliases
 
@@ -407,15 +408,22 @@ Local project settings override user-level settings. Aliases resolve through the
 
 Model selection precedence is CLI flag, environment, config, then default. The environment model slot accepts `CLAW_MODEL`, `ANTHROPIC_MODEL`, and `ANTHROPIC_DEFAULT_MODEL` in that order; aliases from those variables are resolved and validated before provider startup. `claw --output-format json status` exposes `model_raw`, `model_alias_resolved_to`, and `model_env_var` so automation can see the winning value.
 
+### /setup wizard
+
+Run `/setup` inside the REPL (or `claw setup` from the shell) to save provider credentials interactively to `~/.claw/settings.json`. Saved settings are injected as env-var fallbacks at startup, preserving the precedence: env var > `.env` file > stored config.
+
+For a **Custom (OpenAI-compat)** endpoint, `/setup` now stores `kind: "custom-openai"` and sets the dedicated `CLAWCUSTOMOPENAI_API_KEY` / `CLAWCUSTOMOPENAI_BASE_URL` env vars. This lets a private OpenAI-compatible proxy coexist with real OpenAI, NeuralWatt, or other tools that already consume `OPENAI_*`. A bare model name saved by `/setup` is normalized to `custom/<model>` and stripped back to the bare id on the wire.
+
 ### How provider detection works
 
 1. If the resolved model name starts with `claude` → Anthropic.
 2. If it starts with `grok` → xAI.
-3. If it starts with `openai/`, `local/`, or `gpt-` → OpenAI-compatible.
+3. If it starts with `openai/`, `local/`, `custom/`, or `gpt-` → OpenAI-compatible.
 4. If it starts with `qwen/`, `qwen-`, `kimi/`, or `kimi-` → DashScope-compatible OpenAI wire format.
 5. If `OPENAI_BASE_URL` is set, local-looking unknown model names such as `llama3.2` or `qwen2.5-coder:7b` route to the OpenAI-compatible client for local/gateway servers.
-6. Otherwise, `claw` checks which credential is set: Anthropic first, then OpenAI, then xAI. If only `OPENAI_BASE_URL` is set, it still routes to OpenAI-compatible for authless local servers.
-7. If nothing matches, it defaults to Anthropic.
+6. If it starts with `custom/` → the Claw custom OpenAI-compat provider (`CLAWCUSTOMOPENAI_API_KEY` / `CLAWCUSTOMOPENAI_BASE_URL`).
+7. Otherwise, `claw` checks which credential is set: Anthropic first, then OpenAI, then xAI. If only `OPENAI_BASE_URL` is set, it still routes to OpenAI-compatible for authless local servers.
+8. If nothing matches, it defaults to Anthropic.
 
 
 ### Provider diagnostics and custom OpenAI-compatible parameters

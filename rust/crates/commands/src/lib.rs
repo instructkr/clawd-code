@@ -808,7 +808,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         name: "team",
         aliases: &[],
         summary: "Manage agent teams",
-        argument_hint: Some("[list|create|delete]"),
+        argument_hint: Some("[on|off|status]"),
         resume_supported: true,
     },
     SlashCommandSpec {
@@ -1188,10 +1188,14 @@ pub enum SlashCommand {
     History {
         count: Option<String>,
     },
-    Unknown(String),
+    Lsp {
+        action: Option<String>,
+        target: Option<String>,
+    },
     Team {
         action: Option<String>,
     },
+    Unknown(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1508,6 +1512,9 @@ pub fn validate_slash_command_input(
         "add-dir" => SlashCommand::AddDir { path: remainder },
         "history" => SlashCommand::History {
             count: optional_single_arg(command, &args, "[count]")?,
+        },
+        "team" => SlashCommand::Team {
+            action: optional_single_arg(command, &args, "[list|create|delete]")?,
         },
         other => SlashCommand::Unknown(other.to_string()),
     }))
@@ -5393,6 +5400,7 @@ pub fn handle_slash_command(
         | SlashCommand::OutputStyle { .. }
         | SlashCommand::AddDir { .. }
         | SlashCommand::History { .. }
+        | SlashCommand::Lsp { .. }
         | SlashCommand::Team { .. }
         | SlashCommand::Setup
         | SlashCommand::Unknown(_) => None,
@@ -5525,6 +5533,16 @@ mod tests {
     #[test]
     fn parses_supported_slash_commands() {
         assert_eq!(SlashCommand::parse("/help"), Ok(Some(SlashCommand::Help)));
+        assert_eq!(
+            SlashCommand::parse("/team"),
+            Ok(Some(SlashCommand::Team { action: None }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/team on"),
+            Ok(Some(SlashCommand::Team {
+                action: Some("on".to_string())
+            }))
+        );
         assert_eq!(
             SlashCommand::parse(" /status "),
             Ok(Some(SlashCommand::Status))

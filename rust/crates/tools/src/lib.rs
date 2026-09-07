@@ -7,8 +7,8 @@ use aspect_macros::aspect;
 use aspect_std::LoggingAspect;
 
 use api::{
-    max_tokens_for_model, model_family_identity_for, resolve_model_alias, ApiError,
-    ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
+    max_tokens_for_model, model_family_identity_for, model_token_limit, resolve_model_alias,
+    ApiError, ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
     OutputContentBlock, ProviderClient, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
     ToolResultContentBlock,
 };
@@ -30,7 +30,7 @@ use runtime::{
     ConversationRuntime, GrepSearchInput, LaneCommitProvenance, LaneEvent, LaneEventBlocker,
     LaneEventName, LaneEventStatus, LaneFailureClass, McpDegradedReport, MessageRole,
     PermissionMode, PermissionPolicy, PromptCacheEvent, ProviderFallbackConfig, RuntimeError,
-    Session, TaskPacket, ToolError, ToolExecutor,
+    Session, TaskPacket, ToolError, ToolExecutor, TurnProgressReporter,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -58,6 +58,109 @@ fn global_cron_registry() -> &'static CronRegistry {
     use std::sync::OnceLock;
     static REGISTRY: OnceLock<CronRegistry> = OnceLock::new();
     REGISTRY.get_or_init(CronRegistry::new)
+}
+
+/// Per-team gate bounding how many sub-agents of one team execute
+/// concurrently. TeamCreate still spawns every agent thread immediately
+/// (manifests, task claims, and return semantics are unchanged), but each
+/// thread blocks here before entering its run loop. This is the team-level
+/// fan-out bound the parallel read-only tool execution assumes: without it,
+/// a `mega` team queues 24 simultaneous runs against whatever model server
+/// the team points at.
+#[derive(Default)]
+struct AgentGate {
+    state: std::sync::Mutex<std::collections::HashMap<String, TeamGateState>>,
+    available: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct TeamGateState {
+    running: usize,
+    limit: Option<usize>,
+}
+
+/// RAII slot for one agent run; releasing happens on drop, so early
+/// returns and unwound panics both free the slot.
+struct AgentGateGuard<'a> {
+    gate: &'a AgentGate,
+    team_id: String,
+}
+
+impl Drop for AgentGateGuard<'_> {
+    fn drop(&mut self) {
+        self.gate.release(&self.team_id);
+    }
+}
+
+impl AgentGate {
+    fn lock_state(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, TeamGateState>> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn set_limit(&self, team_id: &str, limit: Option<usize>) {
+        self.lock_state()
+            .entry(team_id.to_string())
+            .or_default()
+            .limit = limit;
+        self.available.notify_all();
+    }
+
+    fn acquire(&self, team_id: &str) -> AgentGateGuard<'_> {
+        let mut state = self.lock_state();
+        loop {
+            {
+                let entry = state.entry(team_id.to_string()).or_default();
+                if entry.limit.is_none_or(|limit| entry.running < limit) {
+                    entry.running += 1;
+                    return AgentGateGuard {
+                        gate: self,
+                        team_id: team_id.to_string(),
+                    };
+                }
+            }
+            state = self
+                .available
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    fn release(&self, team_id: &str) {
+        if let Some(entry) = self.lock_state().get_mut(team_id) {
+            entry.running = entry.running.saturating_sub(1);
+        }
+        self.available.notify_all();
+    }
+
+    fn forget(&self, team_id: &str) {
+        self.lock_state().remove(team_id);
+        self.available.notify_all();
+    }
+
+    #[cfg(test)]
+    fn running_count(&self, team_id: &str) -> usize {
+        self.lock_state()
+            .get(team_id)
+            .map_or(0, |entry| entry.running)
+    }
+}
+
+fn global_agent_gate() -> &'static AgentGate {
+    use std::sync::OnceLock;
+    static GATE: OnceLock<AgentGate> = OnceLock::new();
+    GATE.get_or_init(AgentGate::default)
+}
+
+/// Read the `maxConcurrentAgents` setting as the per-team sub-agent cap
+/// default, mirroring how `subagentModel` is resolved for the Agent tool.
+fn load_max_concurrent_agents_from_config() -> Option<usize> {
+    let cwd = std::env::current_dir().ok()?;
+    let config = ConfigLoader::default_for(&cwd).load().ok()?;
+    config.max_concurrent_agents()
 }
 
 fn global_task_registry() -> &'static TaskRegistry {
@@ -1094,24 +1197,40 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "TeamCreate",
-            description: "Create a team of sub-agents for parallel task execution.",
+            description: "Create a team of agents that run in parallel. Each task becomes an independent Agent with its own context. Agents communicate via AgentMessage, claim tasks via TaskClaim, and report progress automatically. Reviewer agents are included for quality checks. Use TeamStatus to monitor, /team to toggle. 'mode' preset: tiny/1x (4 agents), small/2x (8), medium/3x (12), large/4x (16), xlarge/5x (20), mega/6x (24). Requires /team on.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "name": { "type": "string" },
+                    "mode": {
+                        "type": "string",
+                        "description": "Preset team size. Named sizes: 'tiny'/'1x'=1 per role (3+1 agents), 'small'/'2x'=2 per role (6+2), 'medium'/'3x'=3 per role (9+3), 'large'/'4x'=4 per role (12+4), 'xlarge'/'5x'=5 per role (15+5), 'mega'/'6x'=6 per role (18+6). Overrides 'tasks'.",
+                        "enum": ["1x", "2x", "3x", "4x", "5x", "6x", "tiny", "small", "medium", "large", "xlarge", "mega"]
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": "Shared prompt for all agents when using 'mode' preset. Each agent gets this prompt with its role prepended."
+                    },
+                    "maxConcurrentAgents": {
+                        "type": "number",
+                        "description": "Cap on how many agents from this team run at the same time; extras queue until a slot frees. Defaults to the `maxConcurrentAgents` setting; unset = unlimited."
+                    },
                     "tasks": {
                         "type": "array",
+                        "description": "Manual task list. Ignored when 'mode' is set.",
                         "items": {
                             "type": "object",
                             "properties": {
                                 "prompt": { "type": "string" },
-                                "description": { "type": "string" }
+                                "description": { "type": "string" },
+                                "subagent_type": { "type": "string", "enum": ["Explore", "Plan", "Verification", "general-purpose"] },
+                                "model": { "type": "string" }
                             },
                             "required": ["prompt"]
                         }
                     }
                 },
-                "required": ["name", "tasks"],
+                "required": ["name"],
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::DangerFullAccess,
@@ -1128,6 +1247,108 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "AgentMessage",
+            description: "Send or read messages between agents in a team. Use action=send to post a message to another agent's inbox, action=read to check your own inbox, or action=broadcast to send to all agents in a team. Agents communicate through a shared mailbox directory.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["send", "read", "broadcast"],
+                        "description": "send=post to agent inbox, read=check own inbox, broadcast=send to all team members"
+                    },
+                    "agent_id": { "type": "string", "description": "Target agent ID (for send action)" },
+                    "team_id": { "type": "string", "description": "Team ID (for broadcast)" },
+                    "message": { "type": "string", "description": "Message content (for send/broadcast)" },
+                    "mark_read": { "type": "boolean", "description": "Mark retrieved messages as read (default true)" }
+                },
+                "required": ["action"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "TeamStatus",
+            description: "Check the progress of a team of agents. Returns structured status: which agents are running, completed, or failed, with their results. Use action=status for a snapshot, action=summary for final results when all agents are done, or action=events for a timeline of team events.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "team_id": { "type": "string", "description": "Team ID to check" },
+                    "action": {
+                        "type": "string",
+                        "enum": ["status", "summary", "events", "inbox", "kill", "suggestions"],
+                        "description": "status=live snapshot, summary=final results, events=timeline, inbox=team messages, kill=terminate stuck agent, suggestions=list pending AGENTS.md suggestions"
+                    }
+                },
+                "required": ["team_id"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "TaskClaim",
+            description: "Claim, release, or list task claims. Agents claim tasks to prevent duplicate work. Use action=claim to atomically claim a task (returns success/failure), action=release to release a claim, or action=list to see all active claims.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["claim", "release", "list"],
+                        "description": "claim=atomically acquire a task lock, release=release your claim, list=show all active claims"
+                    },
+                    "task_id": { "type": "string", "description": "Task identifier to claim or release" },
+                    "team_id": { "type": "string", "description": "Team ID (used with claim and list)" },
+                    "agent_id": { "type": "string", "description": "Agent ID claiming the task (used with claim)" }
+                },
+                "required": ["action"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "AgentSuggestion",
+            description: "Suggest an addition to AGENTS.md for the team to review. Agents should NOT write AGENTS.md directly. Instead, propose patterns, pitfalls, or style guidelines. The team lead (human) decides what to include.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "category": {
+                        "type": "string",
+                        "enum": ["pattern", "pitfall", "style"],
+                        "description": "Category: pattern=proven approach, pitfall=thing to avoid, style=coding convention"
+                    },
+                    "suggestion": { "type": "string", "description": "The suggestion text to add to AGENTS.md" },
+                    "team_id": { "type": "string", "description": "Team ID" },
+                    "agent_id": { "type": "string", "description": "Agent ID making the suggestion" }
+                },
+                "required": ["category", "suggestion"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "ContextRequest",
+            description: "Request additional context for your task. Use when you need specific files or symbols you haven't seen. You have a budget of 3 retrieval cycles. Be specific: name exact files or describe the symbols you need and why.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "files": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Exact file paths to read"
+                    },
+                    "symbols": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Symbol names to search for (e.g. function names, type names)"
+                    },
+                    "reason": { "type": "string", "description": "Why you need this context (helps prioritize)" }
+                },
+                "required": ["reason"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
             name: "CronCreate",
@@ -1476,6 +1697,13 @@ fn execute_tool_with_enforcer(
             .and_then(run_worker_observe_completion),
         "TeamCreate" => from_value::<TeamCreateInput>(input).and_then(run_team_create),
         "TeamDelete" => from_value::<TeamDeleteInput>(input).and_then(run_team_delete),
+        "AgentMessage" => from_value::<AgentMessageInput>(input).and_then(run_agent_message),
+        "TeamStatus" => from_value::<TeamStatusInput>(input).and_then(run_team_status),
+        "TaskClaim" => from_value::<TaskClaimInput>(input).and_then(run_task_claim),
+        "AgentSuggestion" => {
+            from_value::<AgentSuggestionInput>(input).and_then(run_agent_suggestion)
+        }
+        "ContextRequest" => from_value::<ContextRequestInput>(input).and_then(run_context_request),
         "CronCreate" => from_value::<CronCreateInput>(input).and_then(run_cron_create),
         "CronDelete" => from_value::<CronDeleteInput>(input).and_then(run_cron_delete),
         "CronList" => run_cron_list(input.clone()),
@@ -1765,36 +1993,1083 @@ fn run_worker_observe_completion(input: WorkerObserveCompletionInput) -> Result<
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_team_create(input: TeamCreateInput) -> Result<String, String> {
-    let task_ids: Vec<String> = input
-        .tasks
-        .iter()
-        .filter_map(|t| t.get("task_id").and_then(|v| v.as_str()).map(str::to_owned))
-        .collect();
-    let team = global_team_registry().create(&input.name, task_ids);
-    // Register team assignment on each task
-    for task_id in &team.task_ids {
-        let _ = global_task_registry().assign_team(task_id, &team.team_id);
+    if std::env::var("CLAWD_AGENT_TEAMS").map_or(true, |v| v != "1") {
+        return Err("Agent teams is disabled. Use /team on or Ctrl+T to enable.".to_string());
     }
+
+    let team_id = format!(
+        "team-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    let output_dir = agent_store_dir()?;
+    let team_dir = output_dir.join("teams");
+    std::fs::create_dir_all(&team_dir).map_err(|e| e.to_string())?;
+
+    // Resolve the per-team concurrency cap: explicit input > settings
+    // default > unlimited (pre-fix behavior preserved when unset).
+    let max_concurrent = input
+        .max_concurrent_agents
+        .filter(|n| *n > 0)
+        .or_else(load_max_concurrent_agents_from_config);
+    global_agent_gate().set_limit(&team_id, max_concurrent);
+
+    // Expand mode preset into tasks, or use manual tasks.
+    // Default to "2x" when neither mode nor tasks are provided.
+    let tasks = if let Some(mode) = &input.mode {
+        expand_team_mode(
+            mode,
+            input
+                .prompt
+                .as_deref()
+                .unwrap_or("Explore the codebase and report findings"),
+            &team_id,
+        )?
+    } else if input.tasks.is_empty() {
+        expand_team_mode(
+            "2x",
+            input
+                .prompt
+                .as_deref()
+                .unwrap_or("Explore the codebase and report findings"),
+            &team_id,
+        )?
+    } else {
+        input.tasks.clone()
+    };
+
+    let mut agent_ids: Vec<String> = Vec::new();
+    let mut agent_outputs: Vec<Value> = Vec::new();
+
+    for (i, task) in tasks.iter().enumerate() {
+        let prompt = task.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
+        let description = task
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&input.name);
+        let subagent_type = task.get("subagent_type").and_then(|v| v.as_str());
+        let model_override = task.get("model").and_then(|v| v.as_str());
+
+        if prompt.is_empty() {
+            continue;
+        }
+
+        let task_id = task
+            .get("task_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let agent_input = AgentInput {
+            description: description.to_string(),
+            prompt: prompt.to_string(),
+            subagent_type: subagent_type.map(|s| s.to_string()),
+            name: Some(format!(
+                "{}-agent-{}",
+                slugify_agent_name(&input.name),
+                i + 1
+            )),
+            model: model_override.map(|s| s.to_string()),
+            team_id: Some(team_id.clone()),
+            task_id,
+        };
+
+        match execute_agent_with_spawn(agent_input, spawn_agent_job) {
+            Ok(manifest) => {
+                let aid = manifest.agent_id.clone();
+                // Set CLAWD_AGENT_ID env for the agent thread
+                agent_ids.push(aid.clone());
+                agent_outputs.push(json!({
+                    "agent_id": aid,
+                    "name": manifest.name,
+                    "status": manifest.status,
+                    "subagent_type": manifest.subagent_type,
+                }));
+            }
+            Err(error) => {
+                agent_outputs.push(json!({
+                    "agent_index": i,
+                    "error": error,
+                }));
+            }
+        }
+    }
+
+    // Persist team manifest
+    let team_manifest = json!({
+        "team_id": team_id,
+        "name": input.name,
+        "agent_ids": agent_ids,
+        "agent_count": agent_ids.len(),
+        "status": "running",
+        "max_concurrent_agents": max_concurrent,
+        "created_at": iso8601_now(),
+    });
+    let manifest_path = team_dir.join(format!("{team_id}.json"));
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&team_manifest).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+
+    // Register in global registry
+    let team = global_team_registry().create(&input.name, agent_ids.clone());
+
+    // Spawn background watcher that prints progress to stderr
+    spawn_team_watcher(&team_id, &agent_ids);
+
     to_pretty_json(json!({
-        "team_id": team.team_id,
-        "name": team.name,
-        "task_count": team.task_ids.len(),
-        "task_ids": team.task_ids,
-        "status": team.status,
-        "created_at": team.created_at
+        "team_id": team_id,
+        "name": input.name,
+        "agent_count": agent_ids.len(),
+        "agents": agent_outputs,
+        "status": "running",
+        "created_at": team.created_at,
+        "message": format!("Team created with {} agents. Use AgentMessage to coordinate. TeamStatus shows live progress.", agent_ids.len()),
     }))
 }
 
 #[allow(clippy::needless_pass_by_value)]
+fn run_team_status(input: TeamStatusInput) -> Result<String, String> {
+    let action = input.action.as_deref().unwrap_or("status");
+    let team_dir = agent_store_dir()?.join("teams");
+    let manifest_path = team_dir.join(format!("{}.json", input.team_id));
+    if !manifest_path.exists() {
+        return Err(format!("team {} not found", input.team_id));
+    }
+    let team_data: Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    let agent_ids = team_data
+        .get("agent_ids")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let store_dir = agent_store_dir()?;
+    let mut agents_detail: Vec<Value> = Vec::new();
+    let mut running_count = 0usize;
+    let mut completed_count = 0usize;
+    let mut failed_count = 0usize;
+
+    for id_val in &agent_ids {
+        if let Some(id) = id_val.as_str() {
+            let agent_json = store_dir.join(format!("{id}.json"));
+            let agent_md = store_dir.join(format!("{id}.md"));
+            let mut detail = json!({ "agent_id": id });
+
+            if agent_json.exists() {
+                if let Ok(data) = std::fs::read_to_string(&agent_json) {
+                    if let Ok(parsed) = serde_json::from_str::<Value>(&data) {
+                        detail["status"] =
+                            parsed.get("status").cloned().unwrap_or(json!("unknown"));
+                        detail["name"] = parsed.get("name").cloned().unwrap_or(json!(null));
+                        detail["subagent_type"] =
+                            parsed.get("subagent_type").cloned().unwrap_or(json!(null));
+                        if let Some(completed) = parsed.get("completed_at") {
+                            detail["completed_at"] = completed.clone();
+                        }
+                    }
+                }
+            } else {
+                detail["status"] = json!("running");
+            }
+
+            if agent_md.exists() {
+                if let Ok(md_content) = std::fs::read_to_string(&agent_md) {
+                    let summary = md_content
+                        .lines()
+                        .skip_while(|line| !line.starts_with("## Result"))
+                        .skip(1)
+                        .take(10)
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if !summary.is_empty() {
+                        detail["result_preview"] = json!(summary);
+                    }
+                }
+            }
+
+            match detail
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+            {
+                "completed" => completed_count += 1,
+                "failed" => failed_count += 1,
+                _ => running_count += 1,
+            }
+            agents_detail.push(detail);
+        }
+    }
+
+    match action {
+        "status" => {
+            to_pretty_json(json!({
+                "team_id": input.team_id,
+                "team_name": team_data.get("name"),
+                "status": if running_count > 0 { "running" } else if failed_count > 0 { "completed_with_failures" } else { "completed" },
+                "progress": {
+                    "total": agent_ids.len(),
+                    "running": running_count,
+                    "completed": completed_count,
+                    "failed": failed_count,
+                },
+                "agents": agents_detail,
+            }))
+        }
+        "summary" => {
+            let mut results: Vec<Value> = Vec::new();
+            for id_val in &agent_ids {
+                if let Some(id) = id_val.as_str() {
+                    let agent_md = store_dir.join(format!("{id}.md"));
+                    let agent_json = store_dir.join(format!("{id}.json"));
+                    let mut entry = json!({ "agent_id": id });
+
+                    if let Ok(data) = std::fs::read_to_string(&agent_json) {
+                        if let Ok(parsed) = serde_json::from_str::<Value>(&data) {
+                            entry["status"] = parsed.get("status").cloned().unwrap_or(json!("unknown"));
+                            entry["name"] = parsed.get("name").cloned().unwrap_or(json!(null));
+                            entry["subagent_type"] = parsed.get("subagent_type").cloned().unwrap_or(json!(null));
+                        }
+                    }
+                    if let Ok(md_content) = std::fs::read_to_string(&agent_md) {
+                        entry["result"] = json!(md_content);
+                    }
+                    results.push(entry);
+                }
+            }
+            to_pretty_json(json!({
+                "team_id": input.team_id,
+                "team_name": team_data.get("name"),
+                "status": if running_count > 0 { "still_running" } else if failed_count > 0 { "completed_with_failures" } else { "completed" },
+                "progress": {
+                    "total": agent_ids.len(),
+                    "running": running_count,
+                    "completed": completed_count,
+                    "failed": failed_count,
+                },
+                "results": results,
+            }))
+        }
+        "events" => {
+            let events_path = team_dir.join(format!("{}-events.jsonl", input.team_id));
+            let mut events: Vec<Value> = Vec::new();
+            if events_path.exists() {
+                if let Ok(content) = std::fs::read_to_string(&events_path) {
+                    for line in content.lines() {
+                        if let Ok(event) = serde_json::from_str::<Value>(line) {
+                            events.push(event);
+                        }
+                    }
+                }
+            }
+            to_pretty_json(json!({
+                "team_id": input.team_id,
+                "event_count": events.len(),
+                "events": events,
+            }))
+        }
+        "inbox" => {
+            let inbox_dir = agent_mailbox_dir().join("team").join(&input.team_id);
+            let mut messages: Vec<Value> = Vec::new();
+            if inbox_dir.exists() {
+                if let Ok(entries) = std::fs::read_dir(&inbox_dir) {
+                    for entry in entries.filter_map(|e| e.ok()) {
+                        let path = entry.path();
+                        if path.extension().is_some_and(|ext| ext == "json") {
+                            if let Ok(data) = std::fs::read_to_string(&path) {
+                                if let Ok(msg) = serde_json::from_str::<Value>(&data) {
+                                    messages.push(msg);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            to_pretty_json(json!({
+                "team_id": input.team_id,
+                "inbox_count": messages.len(),
+                "messages": messages,
+            }))
+        }
+        "kill" => {
+            let agent_id = input.agent_id.as_deref().unwrap_or("");
+            if agent_id.is_empty() {
+                return Err("agent_id is required for kill action".to_string());
+            }
+            // Write kill signal file that the agent checks
+            let kill_dir = agent_mailbox_dir().join("team").join(&input.team_id);
+            let _ = std::fs::create_dir_all(&kill_dir);
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            let entry = json!({
+                "event": "kill_signal",
+                "agent_id": agent_id,
+                "reason": input.reason.as_deref().unwrap_or("terminated by team lead"),
+                "timestamp": ts,
+            });
+            let kill_file = kill_dir.join(format!("kill-{agent_id}-{ts}.json"));
+            std::fs::write(&kill_file, serde_json::to_string_pretty(&entry).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+            to_pretty_json(json!({
+                "action": "kill",
+                "agent_id": agent_id,
+                "status": "kill_signal_sent",
+            }))
+        }
+        "suggestions" => {
+            let suggestions_dir = agent_store_dir()?.join("suggestions");
+            let mut suggestions = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(&suggestions_dir) {
+                for entry in entries.filter_map(|e| e.ok()) {
+                    let path = entry.path();
+                    if path.extension().map_or(false, |e| e == "json") {
+                        if let Ok(content) = std::fs::read_to_string(&path) {
+                            if let Ok(v) = serde_json::from_str::<Value>(&content) {
+                                if input.team_id.is_empty() || v.get("team_id").and_then(|t| t.as_str()).map_or(true, |t| t == input.team_id) {
+                                    suggestions.push(v);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            to_pretty_json(json!({
+                "action": "suggestions",
+                "suggestions": suggestions,
+                "count": suggestions.len(),
+            }))
+        }
+        other => Err(format!("unknown TeamStatus action: {other}. Use status, summary, events, inbox, kill, or suggestions")),
+    }
+}
+
+/// Spawn a background thread that watches a team's agents and prints progress.
+/// Prints agent completion/failure events to stderr. Exits when all agents are done.
+fn spawn_team_watcher(team_id: &str, agent_ids: &[String]) {
+    let team_id = team_id.to_string();
+    let total = agent_ids.len();
+    let thread_name = format!("claw-team-watch-{team_id}");
+
+    std::thread::Builder::new()
+        .name(thread_name)
+        .spawn(move || {
+            let inbox_dir = agent_mailbox_dir().join("team").join(&team_id);
+            let _ = std::fs::create_dir_all(&inbox_dir);
+
+            let team_dir = agent_store_dir().map(|d| d.join("teams")).unwrap_or_default();
+            let events_path = team_dir.join(format!("{team_id}-events.jsonl"));
+
+            let mut completed: BTreeSet<String> = BTreeSet::new();
+            let mut failed: BTreeSet<String> = BTreeSet::new();
+            let mut seen: BTreeSet<String> = BTreeSet::new();
+
+            eprintln!("[team] {team_id}: watching {total} agents via inbox...");
+
+            loop {
+                let mut new_events = false;
+                if let Ok(entries) = std::fs::read_dir(&inbox_dir) {
+                    for entry in entries.filter_map(|e| e.ok()) {
+                        let path = entry.path();
+                        let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                        if seen.contains(&name) {
+                            continue;
+                        }
+                        if !path.extension().is_some_and(|ext| ext == "json") {
+                            continue;
+                        }
+                        if let Ok(data) = std::fs::read_to_string(&path) {
+                            if let Ok(parsed) = serde_json::from_str::<Value>(&data) {
+                                seen.insert(name);
+                                new_events = true;
+                                let agent_id = parsed.get("agent_id").and_then(|v| v.as_str()).unwrap_or("unknown");
+                                let event = parsed.get("event").and_then(|v| v.as_str()).unwrap_or("unknown");
+                                let agent_name = parsed.get("name").and_then(|v| v.as_str()).unwrap_or(agent_id);
+                                let subagent_type = parsed.get("subagent_type").and_then(|v| v.as_str()).unwrap_or("unknown");
+                                let result_preview = parsed.get("result_preview").and_then(|v| v.as_str()).unwrap_or("");
+
+                                match event {
+                                    "agent_completed" => {
+                                        completed.insert(agent_id.to_string());
+                                        let done_count = completed.len() + failed.len();
+                                        eprintln!("[team] {team_id}: done {agent_name} ({subagent_type}) completed - {done_count}/{total}{}", if result_preview.is_empty() { String::new() } else { format!(" - {}", &result_preview[..result_preview.len().min(120)]) });
+                                        append_team_event(&events_path, &team_id, agent_id, "completed", agent_name, Some(result_preview));
+                                    }
+                                    "agent_failed" => {
+                                        failed.insert(agent_id.to_string());
+                                        let error = parsed.get("error").and_then(|v| v.as_str())
+                                            .or_else(|| parsed.get("result_preview").and_then(|v| v.as_str()))
+                                            .unwrap_or("unknown error");
+                                        eprintln!("[team] {team_id}: FAIL {agent_name} failed - {error}");
+                                        append_team_event(&events_path, &team_id, agent_id, "failed", agent_name, Some(error));
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let all_done = completed.len() + failed.len() >= total;
+                if all_done {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+
+            eprintln!("[team] {team_id}: all agents finished - {}/{} completed, {}/{} failed", completed.len(), total, failed.len(), total);
+            append_team_event(&events_path, &team_id, "team", "finished", &team_id, Some(&format!("{}/{} completed", completed.len(), total)));
+
+            let manifest_path = team_dir.join(format!("{team_id}.json"));
+            if let Ok(data) = std::fs::read_to_string(&manifest_path) {
+                if let Ok(mut parsed) = serde_json::from_str::<Value>(&data) {
+                    if let Some(obj) = parsed.as_object_mut() {
+                        obj.insert("status".to_string(), json!(if failed.is_empty() { "completed" } else { "completed_with_failures" }));
+                        let _ = std::fs::write(&manifest_path, serde_json::to_string_pretty(&parsed).unwrap_or_default());
+                    }
+                }
+            }
+
+            // Clean up inbox
+            let _ = std::fs::remove_dir_all(&inbox_dir);
+        })
+        .ok();
+}
+
+fn get_agent_result_preview(store_dir: &std::path::Path, agent_id: &str) -> String {
+    let md_path = store_dir.join(format!("{agent_id}.md"));
+    if let Ok(content) = std::fs::read_to_string(&md_path) {
+        let lines: Vec<&str> = content.lines().collect();
+        let start = lines
+            .iter()
+            .position(|l| l.starts_with("## Result"))
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        lines[start..]
+            .iter()
+            .take(5)
+            .cloned()
+            .collect::<Vec<&str>>()
+            .join(" ")
+            .chars()
+            .take(200)
+            .collect()
+    } else {
+        String::new()
+    }
+}
+
+fn append_team_event(
+    events_path: &std::path::Path,
+    team_id: &str,
+    agent_id: &str,
+    event_type: &str,
+    name: &str,
+    detail: Option<&str>,
+) {
+    let entry = json!({
+        "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis(),
+        "team_id": team_id,
+        "agent_id": agent_id,
+        "event": event_type,
+        "name": name,
+        "detail": detail,
+    });
+    if let Ok(line) = serde_json::to_string(&entry) {
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(events_path)
+        {
+            let _ = writeln!(file, "{line}");
+        }
+    }
+}
+
 fn run_team_delete(input: TeamDeleteInput) -> Result<String, String> {
-    match global_team_registry().delete(&input.team_id) {
-        Ok(team) => to_pretty_json(json!({
-            "team_id": team.team_id,
-            "name": team.name,
-            "status": team.status,
-            "message": "Team deleted"
-        })),
-        Err(e) => Err(e),
+    // Delete from disk-based team storage
+    let team_dir = agent_store_dir()?.join("teams");
+    let manifest_path = team_dir.join(format!("{}.json", input.team_id));
+    if !manifest_path.exists() {
+        return Err(format!("team not found: {}", input.team_id));
+    }
+    let data = std::fs::read_to_string(&manifest_path).map_err(|e| e.to_string())?;
+    let parsed: serde_json::Value = serde_json::from_str(&data).map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_file(&manifest_path);
+    // Drop the per-team concurrency cap so queued agents unblock and the
+    // gate map does not accumulate stale entries.
+    global_agent_gate().forget(&input.team_id);
+    // Also clean up the team inbox directory
+    let inbox_dir = agent_mailbox_dir().join("team").join(&input.team_id);
+    if inbox_dir.exists() {
+        let _ = std::fs::remove_dir_all(&inbox_dir);
+    }
+    // Also clean up task claims for this team
+    let claims_dir = claims_dir();
+    if claims_dir.exists() {
+        if let Ok(entries) = std::fs::read_dir(&claims_dir) {
+            for entry in entries.filter_map(|e| e.ok()) {
+                let path = entry.path();
+                if path.extension().map_or(false, |e| e == "lock") {
+                    if let Ok(content) = std::fs::read_to_string(&path) {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
+                            if v.get("team_id").and_then(|t| t.as_str()) == Some(&input.team_id) {
+                                let _ = std::fs::remove_file(&path);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    to_pretty_json(json!({
+        "team_id": input.team_id,
+        "name": parsed.get("name").and_then(|v| v.as_str()).unwrap_or("unknown"),
+        "status": "deleted",
+        "message": "Team deleted, inbox cleaned, claims released"
+    }))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_agent_message(input: AgentMessageInput) -> Result<String, String> {
+    let mailbox_dir = agent_mailbox_dir();
+    std::fs::create_dir_all(&mailbox_dir).map_err(|e| e.to_string())?;
+
+    match input.action.as_str() {
+        "send" => {
+            let target = input.agent_id.as_deref().unwrap_or("");
+            if target.is_empty() {
+                return Err("agent_id is required for send action".to_string());
+            }
+            let msg = input.message.as_deref().unwrap_or("");
+            if msg.is_empty() {
+                return Err("message is required for send action".to_string());
+            }
+            let inbox_dir = mailbox_dir.join(target);
+            std::fs::create_dir_all(&inbox_dir).map_err(|e| e.to_string())?;
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            let msg_file = inbox_dir.join(format!("msg-{ts}.json"));
+            let sender = std::env::var("CLAWD_AGENT_ID").unwrap_or_else(|_| "main".to_string());
+            let entry = json!({
+                "from": sender,
+                "message": msg,
+                "timestamp": ts,
+            });
+            std::fs::write(
+                &msg_file,
+                serde_json::to_string_pretty(&entry).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+            to_pretty_json(json!({
+                "action": "sent",
+                "to": target,
+                "timestamp": ts,
+            }))
+        }
+        "read" => {
+            let my_id = std::env::var("CLAWD_AGENT_ID").unwrap_or_else(|_| "main".to_string());
+            let inbox_dir = mailbox_dir.join(&my_id);
+            if !inbox_dir.exists() {
+                return to_pretty_json(json!({
+                    "action": "read",
+                    "messages": [],
+                    "unread_count": 0,
+                }));
+            }
+            let mark_read = input.mark_read.unwrap_or(true);
+            let mut messages: Vec<Value> = Vec::new();
+            let entries: Vec<_> = std::fs::read_dir(&inbox_dir)
+                .map_err(|e| e.to_string())?
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
+                .collect();
+            for entry in &entries {
+                if let Ok(content) = std::fs::read_to_string(entry.path()) {
+                    if let Ok(msg) = serde_json::from_str::<Value>(&content) {
+                        messages.push(msg);
+                    }
+                }
+            }
+            let unread_count = messages.len();
+            if mark_read {
+                for entry in &entries {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+            to_pretty_json(json!({
+                "action": "read",
+                "messages": messages,
+                "unread_count": unread_count,
+            }))
+        }
+        "broadcast" => {
+            let team_id = input.team_id.as_deref().unwrap_or("");
+            if team_id.is_empty() {
+                return Err("team_id is required for broadcast action".to_string());
+            }
+            let msg = input.message.as_deref().unwrap_or("");
+            if msg.is_empty() {
+                return Err("message is required for broadcast action".to_string());
+            }
+            let team_dir = agent_store_dir()?.join("teams");
+            std::fs::create_dir_all(&team_dir).map_err(|e| e.to_string())?;
+            let manifest_path = team_dir.join(format!("{team_id}.json"));
+            if !manifest_path.exists() {
+                return Err(format!("team {team_id} not found"));
+            }
+            let team_data: Value = serde_json::from_str(
+                &std::fs::read_to_string(&manifest_path).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+            let agent_ids = team_data
+                .get("agent_ids")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let sender = std::env::var("CLAWD_AGENT_ID").unwrap_or_else(|_| "main".to_string());
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            let mut sent_to: Vec<String> = Vec::new();
+            for id_val in agent_ids {
+                if let Some(id) = id_val.as_str() {
+                    if id == sender {
+                        continue;
+                    }
+                    let inbox_dir = mailbox_dir.join(id);
+                    std::fs::create_dir_all(&inbox_dir).map_err(|e| e.to_string())?;
+                    let msg_file = inbox_dir.join(format!("msg-{ts}-{sender}.json"));
+                    let entry = json!({
+                        "from": sender,
+                        "message": msg,
+                        "timestamp": ts,
+                        "team_id": team_id,
+                    });
+                    std::fs::write(
+                        &msg_file,
+                        serde_json::to_string_pretty(&entry).map_err(|e| e.to_string())?,
+                    )
+                    .map_err(|e| e.to_string())?;
+                    sent_to.push(id.to_string());
+                }
+            }
+            to_pretty_json(json!({
+                "action": "broadcast",
+                "team_id": team_id,
+                "sent_to": sent_to,
+                "timestamp": ts,
+            }))
+        }
+        other => Err(format!("unknown AgentMessage action: {other}")),
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_task_claim(input: TaskClaimInput) -> Result<String, String> {
+    match input.action.as_str() {
+        "claim" => {
+            let task_id = input.task_id.as_deref().unwrap_or("");
+            let agent_id = input.agent_id.as_deref().unwrap_or("");
+            let team_id = input.team_id.as_deref().unwrap_or("");
+            if task_id.is_empty() {
+                return Err("task_id is required for claim action".to_string());
+            }
+            if agent_id.is_empty() {
+                return Err("agent_id is required for claim action".to_string());
+            }
+            if team_id.is_empty() {
+                return Err("team_id is required for claim action".to_string());
+            }
+            match claim_task(task_id, agent_id, team_id) {
+                Ok(true) => to_pretty_json(json!({
+                    "action": "claim",
+                    "task_id": task_id,
+                    "agent_id": agent_id,
+                    "claimed": true,
+                })),
+                Ok(false) => to_pretty_json(json!({
+                    "action": "claim",
+                    "task_id": task_id,
+                    "claimed": false,
+                    "reason": "task already claimed by another agent",
+                })),
+                Err(e) => Err(e),
+            }
+        }
+        "release" => {
+            let task_id = input.task_id.as_deref().unwrap_or("");
+            if task_id.is_empty() {
+                return Err("task_id is required for release action".to_string());
+            }
+            release_claim(task_id)?;
+            to_pretty_json(json!({
+                "action": "release",
+                "task_id": task_id,
+                "released": true,
+            }))
+        }
+        "list" => {
+            let claims = list_claims(input.team_id.as_deref());
+            to_pretty_json(json!({
+                "action": "list",
+                "claims": claims,
+                "count": claims.len(),
+            }))
+        }
+        other => Err(format!(
+            "unknown TaskClaim action: {other}. Use claim, release, or list"
+        )),
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_agent_suggestion(input: AgentSuggestionInput) -> Result<String, String> {
+    let suggestions_dir = agent_store_dir()?.join("suggestions");
+    std::fs::create_dir_all(&suggestions_dir).map_err(|e| e.to_string())?;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let agent_id = input.agent_id.unwrap_or_else(|| "unknown".to_string());
+    let entry = json!({
+        "category": input.category,
+        "suggestion": input.suggestion,
+        "team_id": input.team_id,
+        "agent_id": agent_id,
+        "timestamp": ts,
+    });
+    let filename = format!("suggestion-{agent_id}-{ts}.json");
+    let path = suggestions_dir.join(&filename);
+    std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&entry).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    to_pretty_json(json!({
+        "action": "suggestion",
+        "file": filename,
+        "status": "pending_review",
+    }))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_context_request(input: ContextRequestInput) -> Result<String, String> {
+    let mut results = Vec::new();
+    let mut files_read = 0u32;
+    let mut symbols_found = 0u32;
+
+    // Read requested files
+    for file_path in &input.files {
+        let path = std::path::PathBuf::from(file_path);
+        if path.exists() {
+            match std::fs::read_to_string(&path) {
+                Ok(content) => {
+                    let truncated = if content.len() > 10000 {
+                        format!(
+                            "{}... (truncated, {} bytes total)",
+                            &content[..10000],
+                            content.len()
+                        )
+                    } else {
+                        content
+                    };
+                    results.push(json!({
+                        "type": "file",
+                        "path": file_path,
+                        "content": truncated,
+                    }));
+                    files_read += 1;
+                }
+                Err(e) => {
+                    results.push(json!({
+                        "type": "file_error",
+                        "path": file_path,
+                        "error": e.to_string(),
+                    }));
+                }
+            }
+        } else {
+            results.push(json!({
+                "type": "file_not_found",
+                "path": file_path,
+            }));
+        }
+    }
+
+    // Search for requested symbols using grep
+    for symbol in &input.symbols {
+        let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+        let output = std::process::Command::new("grep")
+            .args([
+                "-rn",
+                "--include=*.rs",
+                "--include=*.ts",
+                "--include=*.js",
+                "--include=*.py",
+                symbol,
+                ".",
+            ])
+            .current_dir(&cwd)
+            .output()
+            .map_err(|e| e.to_string())?;
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let lines: Vec<&str> = stdout.lines().take(20).collect();
+            if !lines.is_empty() {
+                results.push(json!({
+                    "type": "symbol_search",
+                    "symbol": symbol,
+                    "matches": lines,
+                }));
+                symbols_found += 1;
+            }
+        }
+    }
+
+    to_pretty_json(json!({
+        "action": "context_request",
+        "reason": input.reason,
+        "files_read": files_read,
+        "symbols_found": symbols_found,
+        "results": results,
+        "reminder": "You have a budget of 3 retrieval cycles. Be specific with your requests.",
+    }))
+}
+
+fn expand_team_mode(mode: &str, base_prompt: &str, team_id: &str) -> Result<Vec<Value>, String> {
+    let n = match mode {
+        "1x" | "tiny" => 1,
+        "2x" | "small" => 2,
+        "3x" | "medium" => 3,
+        "4x" | "large" => 4,
+        "5x" | "xlarge" => 5,
+        "6x" | "mega" => 6,
+        other => {
+            return Err(format!(
+                "unknown team mode '{other}'. Use 1x-6x or tiny/small/medium/large/xlarge/mega"
+            ))
+        }
+    };
+    let short_team_id = &team_id[team_id.len().saturating_sub(8)..];
+    let roles: &[&str] = &["Explore", "Plan", "Verification"];
+    let mut tasks = Vec::new();
+    for role in roles {
+        for i in 0..n {
+            let prompt = format!("[{role} agent {}/{}] {base_prompt}", i + 1, n);
+            let description = format!("{role} agent {}/{}", i + 1, n);
+            let task_id = format!("{short_team_id}-{role}-{i}");
+            tasks.push(json!({
+                "prompt": prompt,
+                "description": description,
+                "subagent_type": role,
+                "task_id": task_id,
+            }));
+        }
+    }
+    // Add read-only Reviewer agents (1 per 3 builders, minimum 1)
+    let reviewer_count = std::cmp::max(1, (roles.len() * n) / 3);
+    for i in 0..reviewer_count {
+        let prompt = format!("[Reviewer {}/{}] Review the work of other agents. Read their output files, check code quality, identify issues, and report findings via AgentMessage. Only use read-only tools.", i + 1, reviewer_count);
+        let description = format!("Reviewer {}/{}", i + 1, reviewer_count);
+        let task_id = format!("{short_team_id}-Reviewer-{i}");
+        tasks.push(json!({
+            "prompt": prompt,
+            "description": description,
+            "subagent_type": "Reviewer",
+            "task_id": task_id,
+        }));
+    }
+    Ok(tasks)
+}
+
+fn agent_mailbox_dir() -> std::path::PathBuf {
+    if let Ok(path) = std::env::var("CLAWD_AGENT_STORE") {
+        return std::path::PathBuf::from(path).join("mailbox");
+    }
+    let cwd = std::env::current_dir().unwrap_or_default();
+    if let Some(workspace_root) = cwd.ancestors().nth(2) {
+        return workspace_root.join(".clawd-agents").join("mailbox");
+    }
+    cwd.join(".clawd-agents").join("mailbox")
+}
+
+fn claims_dir() -> std::path::PathBuf {
+    if let Ok(path) = std::env::var("CLAWD_AGENT_STORE") {
+        return std::path::PathBuf::from(path).join("claims");
+    }
+    let cwd = std::env::current_dir().unwrap_or_default();
+    if let Some(workspace_root) = cwd.ancestors().nth(2) {
+        return workspace_root.join(".clawd-agents").join("claims");
+    }
+    cwd.join(".clawd-agents").join("claims")
+}
+
+fn claim_task(task_id: &str, agent_id: &str, team_id: &str) -> Result<bool, String> {
+    let dir = claims_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let lock_path = dir.join(format!("{task_id}.lock"));
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let entry = serde_json::json!({
+        "task_id": task_id,
+        "agent_id": agent_id,
+        "team_id": team_id,
+        "claimed_at": ts,
+    });
+    // Atomic claim: create_new fails atomically if the file already exists,
+    // eliminating the TOCTOU race between exists() and write().
+    let content = serde_json::to_string_pretty(&entry).map_err(|e| e.to_string())?;
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock_path)
+    {
+        Ok(mut file) => {
+            use std::io::Write;
+            file.write_all(content.as_bytes())
+                .map_err(|e| e.to_string())?;
+            Ok(true)
+        }
+        Err(ref e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+fn release_claim(task_id: &str) -> Result<(), String> {
+    let lock_path = claims_dir().join(format!("{task_id}.lock"));
+    if lock_path.exists() {
+        std::fs::remove_file(&lock_path).map_err(|e| e.to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn is_task_claimed(task_id: &str) -> bool {
+    claims_dir().join(format!("{task_id}.lock")).exists()
+}
+
+fn list_claims(team_id: Option<&str>) -> Vec<serde_json::Value> {
+    let dir = claims_dir();
+    let mut claims = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.extension().map_or(false, |e| e == "lock") {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
+                        if team_id.map_or(true, |tid| v.get("team_id").map_or(false, |t| t == tid))
+                        {
+                            claims.push(v);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    claims
+}
+
+#[allow(dead_code)]
+struct TeamInboxReporter {
+    team_id: String,
+    agent_id: String,
+    agent_name: String,
+    inbox_dir: std::path::PathBuf,
+}
+
+impl TeamInboxReporter {
+    fn new(team_id: String, agent_id: String, agent_name: String) -> Self {
+        let inbox_dir = agent_mailbox_dir().join("team").join(&team_id);
+        let _ = std::fs::create_dir_all(&inbox_dir);
+        Self {
+            team_id,
+            agent_id,
+            agent_name,
+            inbox_dir,
+        }
+    }
+}
+
+impl TurnProgressReporter for TeamInboxReporter {
+    fn on_tool_result(
+        &self,
+        iteration: usize,
+        max_iterations: usize,
+        tool_name: &str,
+        input: &str,
+        result: Result<&str, &str>,
+    ) {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let (result_preview, is_error) = match result {
+            Ok(output) => (output.chars().take(500).collect::<String>(), false),
+            Err(err) => (err.chars().take(500).collect::<String>(), true),
+        };
+        let input_preview: String = input.chars().take(300).collect();
+        let entry = serde_json::json!({
+            "event": "tool_progress",
+            "agent_id": self.agent_id,
+            "name": self.agent_name,
+            "tool_name": tool_name,
+            "input_preview": input_preview,
+            "result_preview": result_preview,
+            "is_error": is_error,
+            "iteration": iteration,
+            "max_iterations": max_iterations,
+            "timestamp": ts,
+        });
+        let msg_file = self
+            .inbox_dir
+            .join(format!("tp-{}-{}-{ts}.json", self.agent_id, iteration));
+        if let Ok(line) = serde_json::to_string(&entry) {
+            let _ = std::fs::write(&msg_file, line);
+        }
+
+        // Periodic git commit (every 5 tool calls) to preserve progress
+        if iteration > 0 && iteration % 5 == 0 {
+            let _ = std::process::Command::new("git")
+                .args(["add", "-A"])
+                .output();
+            let diff_check = std::process::Command::new("git")
+                .args(["diff", "--cached", "--quiet"])
+                .output();
+            if diff_check.map_or(true, |o| !o.status.success()) {
+                let _ = std::process::Command::new("git")
+                    .args([
+                        "commit",
+                        "-m",
+                        &format!("agent {} progress: iteration {iteration}", self.agent_id),
+                    ])
+                    .output();
+            }
+        }
+
+        // Check for kill signal from team lead
+        for entry in
+            std::fs::read_dir(&self.inbox_dir).unwrap_or_else(|_| std::fs::read_dir(".").unwrap())
+        {
+            if let Ok(e) = entry {
+                let name = e.file_name();
+                let name_str = name.to_string_lossy();
+                if name_str.starts_with(&format!("kill-{}-", self.agent_id)) {
+                    // Kill signal received — panic to abort
+                    std::fs::remove_file(e.path()).ok();
+                    panic!("agent {} received kill signal", self.agent_id);
+                }
+            }
+        }
     }
 }
 
@@ -2835,6 +4110,10 @@ struct AgentInput {
     subagent_type: Option<String>,
     name: Option<String>,
     model: Option<String>,
+    #[serde(default)]
+    team_id: Option<String>,
+    #[serde(default)]
+    task_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2995,12 +4274,75 @@ const fn default_auto_recover_prompt_misdelivery() -> bool {
 #[derive(Debug, Deserialize)]
 struct TeamCreateInput {
     name: String,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
     tasks: Vec<Value>,
+    /// Per-team override for the concurrent-agent cap. Falls back to the
+    /// `maxConcurrentAgents` setting; `None` (or `0`) means unlimited.
+    #[serde(default, alias = "maxConcurrentAgents")]
+    max_concurrent_agents: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
 struct TeamDeleteInput {
     team_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentMessageInput {
+    action: String,
+    #[serde(default)]
+    agent_id: Option<String>,
+    #[serde(default)]
+    team_id: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    mark_read: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TeamStatusInput {
+    team_id: String,
+    #[serde(default)]
+    action: Option<String>,
+    #[serde(default)]
+    agent_id: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TaskClaimInput {
+    action: String,
+    #[serde(default)]
+    task_id: Option<String>,
+    #[serde(default)]
+    team_id: Option<String>,
+    #[serde(default)]
+    agent_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentSuggestionInput {
+    category: String,
+    suggestion: String,
+    #[serde(default)]
+    team_id: Option<String>,
+    #[serde(default)]
+    agent_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ContextRequestInput {
+    #[serde(default)]
+    files: Vec<String>,
+    #[serde(default)]
+    symbols: Vec<String>,
+    reason: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3215,6 +4557,10 @@ struct AgentOutput {
     derived_state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    #[serde(rename = "teamId", skip_serializing_if = "Option::is_none")]
+    team_id: Option<String>,
+    #[serde(rename = "taskId", skip_serializing_if = "Option::is_none")]
+    task_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -3223,6 +4569,9 @@ struct AgentJob {
     prompt: String,
     system_prompt: Vec<String>,
     allowed_tools: BTreeSet<String>,
+    team_id: Option<String>,
+    task_id: Option<String>,
+    max_tokens: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -4119,6 +5468,7 @@ where
     let created_at = iso8601_now();
     let system_prompt = build_agent_system_prompt(&normalized_subagent_type, &model)?;
     let allowed_tools = allowed_tools_for_subagent(&normalized_subagent_type);
+    let team_id = input.team_id.clone();
 
     let output_contents = format!(
         "# Agent Task
@@ -4153,6 +5503,8 @@ where
         current_blocker: None,
         derived_state: String::from("working"),
         error: None,
+        team_id: input.team_id.clone(),
+        task_id: input.task_id.clone(),
     };
     write_agent_manifest(&manifest)?;
 
@@ -4162,6 +5514,9 @@ where
         prompt: input.prompt,
         system_prompt,
         allowed_tools,
+        team_id: input.team_id.clone(),
+        task_id: input.task_id,
+        max_tokens: None,
     };
     if let Err(error) = spawn_fn(job) {
         let error = format!("failed to spawn sub-agent: {error}");
@@ -4174,18 +5529,34 @@ where
 
 fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
     let thread_name = format!("clawd-agent-{}", job.manifest.agent_id);
+    let agent_id_for_env = job.manifest.agent_id.clone();
     std::thread::Builder::new()
         .name(thread_name)
         .spawn(move || {
+            std::env::set_var("CLAWD_AGENT_ID", &agent_id_for_env);
+            // Team fan-out bound: block until this team has a free run slot.
+            // Non-team Agent() spawns (team_id: None) stay ungated.
+            let _gate_slot = job
+                .team_id
+                .as_deref()
+                .map(|team_id| global_agent_gate().acquire(team_id));
             let result =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_agent_job(&job)));
             match result {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
+                    // Release task claim on failure
+                    if let Some(ref task_id) = job.task_id {
+                        let _ = release_claim(task_id);
+                    }
                     let _ =
                         persist_agent_terminal_state(&job.manifest, "failed", None, Some(error));
                 }
                 Err(_) => {
+                    // Release task claim on panic
+                    if let Some(ref task_id) = job.task_id {
+                        let _ = release_claim(task_id);
+                    }
                     let _ = persist_agent_terminal_state(
                         &job.manifest,
                         "failed",
@@ -4199,11 +5570,141 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+fn setup_agent_worktree(agent_id: &str) -> Result<std::path::PathBuf, String> {
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    // Check if we're in a git repo
+    let git_check = std::process::Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .current_dir(&cwd)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !git_check.status.success() {
+        return Ok(cwd); // Not a git repo, work in current dir
+    }
+    let worktree_dir = cwd.join(".clawd-agents").join("worktrees").join(agent_id);
+    // Create worktree on a new branch
+    let branch_name = format!("agent/{agent_id}");
+    let output = std::process::Command::new("git")
+        .args([
+            "worktree",
+            "add",
+            worktree_dir.to_str().unwrap_or(""),
+            "-b",
+            &branch_name,
+        ])
+        .current_dir(&cwd)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        // Branch might already exist, try with existing branch
+        let output2 = std::process::Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                worktree_dir.to_str().unwrap_or(""),
+                &branch_name,
+            ])
+            .current_dir(&cwd)
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !output2.status.success() {
+            // Fall back to working in current directory
+            return Ok(cwd);
+        }
+    }
+    Ok(worktree_dir)
+}
+
+fn teardown_agent_worktree(agent_id: &str, worktree_path: &std::path::Path) -> Result<(), String> {
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    // Stage and commit any changes in the worktree
+    let _ = std::process::Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(worktree_path)
+        .output();
+    let commit_check = std::process::Command::new("git")
+        .args(["diff", "--cached", "--quiet"])
+        .current_dir(worktree_path)
+        .output();
+    if commit_check.map_or(true, |o| !o.status.success()) {
+        let _ = std::process::Command::new("git")
+            .args(["commit", "-m", &format!("agent {agent_id}: completed task")])
+            .current_dir(worktree_path)
+            .output();
+    }
+    // Remove the worktree
+    let _ = std::process::Command::new("git")
+        .args([
+            "worktree",
+            "remove",
+            worktree_path.to_str().unwrap_or(""),
+            "--force",
+        ])
+        .current_dir(&cwd)
+        .output();
+    // Delete the branch
+    let _ = std::process::Command::new("git")
+        .args(["branch", "-D", &format!("agent/{agent_id}")])
+        .current_dir(&cwd)
+        .output();
+    Ok(())
+}
+
 fn run_agent_job(job: &AgentJob) -> Result<(), String> {
+    // Inject provider credentials from /setup-saved config into env vars so
+    // sub-agents can reach the same endpoint the user connected the main session
+    // with (e.g. custom-openai's CLAWCUSTOMOPENAI_API_KEY / BASE_URL). Without
+    // this, sub-agents can't find custom/ or exotic providers that were set up
+    // via /setup rather than via explicit env vars.
+    runtime::inject_config_as_env_fallbacks();
+
+    // Claim task if task_id is set (prevents duplicate work)
+    if let Some(ref task_id) = job.task_id {
+        if let Some(ref team_id) = job.team_id {
+            let claimed = claim_task(task_id, &job.manifest.agent_id, team_id).unwrap_or(false);
+            if !claimed {
+                return Err(format!("task {task_id} already claimed by another agent"));
+            }
+        }
+    }
+
+    // Save and fix CLAWD_AGENT_STORE to prevent doubled paths when CWD changes
+    // between thread spawn and execution
+    if let Ok(store) = agent_store_dir() {
+        std::env::set_var("CLAWD_AGENT_STORE", store);
+    }
+
     let mut runtime = build_agent_runtime(job)?.with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS);
-    let summary = runtime
+
+    // Set auto-compaction threshold based on model's context window
+    if let Some(ref model) = job.manifest.model {
+        if let Some(limit) = model_token_limit(model) {
+            // Compact at 70% of context window to stay safely under the limit
+            let threshold = (limit.context_window_tokens as f32 * 0.7) as u32;
+            runtime = runtime.with_auto_compaction_input_tokens_threshold(threshold);
+        }
+    }
+
+    // Attach TeamInboxReporter for per-tool-call progress when agent belongs to a team
+    if let Some(ref team_id) = job.team_id {
+        let reporter = TeamInboxReporter::new(
+            team_id.clone(),
+            job.manifest.agent_id.clone(),
+            job.manifest.name.clone(),
+        );
+        runtime = runtime.with_turn_progress_reporter(Box::new(reporter));
+    }
+
+    let result = runtime
         .run_turn(job.prompt.clone(), None)
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| error.to_string());
+
+    // Release task claim on completion (success or failure)
+    if let Some(ref task_id) = job.task_id {
+        let _ = release_claim(task_id);
+    }
+
+    let summary = result?;
     let final_text = final_assistant_text(&summary);
     persist_agent_terminal_state(&job.manifest, "completed", Some(final_text.as_str()), None)
 }
@@ -4232,6 +5733,7 @@ fn build_agent_runtime(
 
 fn build_agent_system_prompt(subagent_type: &str, model: &str) -> Result<Vec<String>, String> {
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    let agents_md = cwd.join("AGENTS.md");
     let mut prompt = load_system_prompt(
         cwd,
         DEFAULT_AGENT_SYSTEM_DATE.to_string(),
@@ -4243,15 +5745,70 @@ fn build_agent_system_prompt(subagent_type: &str, model: &str) -> Result<Vec<Str
     prompt.push(format!(
         "You are a background sub-agent of type `{subagent_type}`. Work only on the delegated task, use only the tools available to you, do not ask the user questions, and finish with a concise result."
     ));
+    // Append AGENTS.md shared learnings if it exists
+    let agents_md = agents_md;
+    if let Ok(content) = std::fs::read_to_string(&agents_md) {
+        if !content.trim().is_empty() {
+            prompt.push(format!(
+                "
+## Shared Team Learnings (AGENTS.md)
+The following patterns, pitfalls, and style guidelines were documented by previous team sessions. Follow them:
+
+{content}"
+            ));
+        }
+    }
     Ok(prompt)
 }
 
 fn resolve_agent_model(model: Option<&str>) -> String {
-    model
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-        .unwrap_or(DEFAULT_AGENT_MODEL)
-        .to_string()
+    if let Some(m) = model.map(str::trim).filter(|m| !m.is_empty()) {
+        return qualify_for_provider(m);
+    }
+    // subagentModel (if set) pins the sub-agent model.
+    if let Some(fast) = load_subagent_model_from_config() {
+        return qualify_for_provider(&fast);
+    }
+    // Otherwise default to the session's configured `model` so sub-agents use
+    // the same provider the user is actually connected with, rather than the
+    // hard-coded DEFAULT_AGENT_MODEL (which may not exist on a custom endpoint).
+    if let Some(session_model) = load_main_model_from_config() {
+        return qualify_for_provider(&session_model);
+    }
+    DEFAULT_AGENT_MODEL.to_string()
+}
+
+/// Read the top-level `model` from merged config as a sub-agent default.
+fn load_main_model_from_config() -> Option<String> {
+    let cwd = std::env::current_dir().ok()?;
+    let config = ConfigLoader::default_for(&cwd).load().ok()?;
+    config.provider().model().map(str::to_string)
+}
+
+/// Read the `subagentModel` setting from merged config so the Agent tool
+/// honors it even when the caller didn't pass an explicit model.
+fn load_subagent_model_from_config() -> Option<String> {
+    let cwd = std::env::current_dir().ok()?;
+    let config = ConfigLoader::default_for(&cwd).load().ok()?;
+    config.subagent_model().map(str::to_string)
+}
+
+/// When the user's active provider is `custom-openai`, bare model names
+/// (e.g. "claude-haiku-4-5-20251001") need a `custom/` prefix so
+/// `ProviderClient::from_model` routes them through the custom endpoint
+/// instead of dispatching to the Anthropic provider (which has no creds).
+fn qualify_for_provider(model: &str) -> String {
+    if model.starts_with("custom/") || model.contains('/') {
+        return model.to_string();
+    }
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let Ok(config) = ConfigLoader::default_for(&cwd).load() else {
+        return model.to_string();
+    };
+    if config.provider().kind() == Some("custom-openai") {
+        return format!("custom/{model}");
+    }
+    model.to_string()
 }
 
 fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
@@ -4264,6 +5821,11 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
             "WebSearch",
             "ToolSearch",
             "Skill",
+            "AgentMessage",
+            "TaskClaim",
+            "AgentSuggestion",
+            "ContextRequest",
+            "TeamStatus",
             "StructuredOutput",
         ],
         "Plan" => vec![
@@ -4275,6 +5837,11 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
             "ToolSearch",
             "Skill",
             "TodoWrite",
+            "AgentMessage",
+            "TaskClaim",
+            "AgentSuggestion",
+            "ContextRequest",
+            "TeamStatus",
             "StructuredOutput",
             "SendUserMessage",
         ],
@@ -4287,9 +5854,28 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
             "WebSearch",
             "ToolSearch",
             "TodoWrite",
+            "AgentMessage",
+            "TaskClaim",
+            "AgentSuggestion",
+            "ContextRequest",
+            "TeamStatus",
             "StructuredOutput",
             "SendUserMessage",
             "PowerShell",
+        ],
+        "Reviewer" => vec![
+            "read_file",
+            "glob_search",
+            "grep_search",
+            "WebFetch",
+            "WebSearch",
+            "ToolSearch",
+            "AgentMessage",
+            "TaskClaim",
+            "AgentSuggestion",
+            "ContextRequest",
+            "TeamStatus",
+            "StructuredOutput",
         ],
         "claw-guide" => vec![
             "read_file",
@@ -4325,6 +5911,11 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
             "ToolSearch",
             "NotebookEdit",
             "Sleep",
+            "AgentMessage",
+            "TaskClaim",
+            "AgentSuggestion",
+            "ContextRequest",
+            "TeamStatus",
             "SendUserMessage",
             "Config",
             "StructuredOutput",
@@ -4395,7 +5986,44 @@ fn persist_agent_terminal_state(
             ));
         }
     }
-    write_agent_manifest(&next_manifest)
+    write_agent_manifest(&next_manifest)?;
+
+    // If this agent belongs to a team, post completion to the team inbox
+    if let Some(ref tid) = next_manifest.team_id {
+        let _ = post_agent_completion_to_team_inbox(&next_manifest, tid, status, result);
+    }
+
+    Ok(())
+}
+
+fn post_agent_completion_to_team_inbox(
+    manifest: &AgentOutput,
+    team_id: &str,
+    status: &str,
+    result: Option<&str>,
+) -> Result<(), String> {
+    let mailbox_dir = agent_mailbox_dir().join("team").join(team_id);
+    std::fs::create_dir_all(&mailbox_dir).map_err(|e| e.to_string())?;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let entry = json!({
+        "event": format!("agent_{status}"),
+        "agent_id": manifest.agent_id,
+        "name": manifest.name,
+        "subagent_type": manifest.subagent_type,
+        "status": status,
+        "result_preview": result.map(|r| r.chars().take(2000).collect::<String>()),
+        "error": if status == "failed" { result.map(|r| r.chars().take(500).collect::<String>()) } else { None::<String> },
+        "timestamp": ts,
+    });
+    let msg_file = mailbox_dir.join(format!("{}-{ts}.json", manifest.agent_id));
+    std::fs::write(
+        &msg_file,
+        serde_json::to_string_pretty(&entry).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())
 }
 
 const MIN_LANE_SUMMARY_WORDS: usize = 7;
@@ -5140,18 +6768,33 @@ impl ProviderRuntimeClient {
         allowed_tools: BTreeSet<String>,
         fallback_config: &ProviderFallbackConfig,
     ) -> Result<Self, String> {
-        let primary_model = fallback_config.primary().map_or(model, str::to_string);
-        let primary = build_provider_entry(&primary_model)?;
+        // The caller's resolved `model` is the primary. `providerFallbacks`
+        // (primary + fallbacks) are recovery entries tried in order after the
+        // primary fails with a retryable error. Previously the config's
+        // `providerFallbacks.primary` silently overrode the resolved model,
+        // which made sub-agents ignore `subagentModel` / the Agent tool's
+        // explicit model — e.g. spawning agents that always used a dead
+        // configured primary instead of the model the caller picked.
+        let primary = build_provider_entry(&model)?;
         let mut chain = vec![primary];
-        for fallback_model in fallback_config.fallbacks() {
-            match build_provider_entry(fallback_model) {
+        let mut seen: BTreeSet<String> = std::iter::once(model.clone()).collect();
+        let mut push_fallback = |chain: &mut Vec<ProviderEntry>, m: &str| {
+            if seen.contains(m) {
+                return;
+            }
+            seen.insert(m.to_string());
+            match build_provider_entry(m) {
                 Ok(entry) => chain.push(entry),
                 Err(error) => {
-                    eprintln!(
-                        "warning: skipping unavailable fallback provider {fallback_model}: {error}"
-                    );
+                    eprintln!("warning: skipping unavailable fallback provider {m}: {error}")
                 }
             }
+        };
+        if let Some(config_primary) = fallback_config.primary() {
+            push_fallback(&mut chain, config_primary);
+        }
+        for fallback_model in fallback_config.fallbacks() {
+            push_fallback(&mut chain, fallback_model);
         }
         Ok(Self {
             runtime: tokio::runtime::Runtime::new().map_err(|error| error.to_string())?,
@@ -5177,6 +6820,111 @@ fn load_provider_fallback_config() -> ProviderFallbackConfig {
         .map_or_else(ProviderFallbackConfig::default, |config| {
             config.provider_fallbacks().clone()
         })
+}
+
+/// Whether an API error should advance the provider chain to the next model.
+/// In addition to the standard retryable statuses (429/500/502/503/504), a
+/// 404 whose body indicates the model itself is unknown ("model not found")
+/// is chain-eligible: a dead primary model shouldn't abort the whole team —
+/// fall through to the next configured fallback.
+fn fallback_chain_eligible(error: &ApiError) -> bool {
+    if error.is_retryable() {
+        return true;
+    }
+    is_model_not_found(error)
+}
+
+/// True when the error body indicates the requested model doesn't exist on
+/// the provider (HTTP 404 + a "not found" / "model" message).
+fn is_model_not_found(error: &ApiError) -> bool {
+    let Some(status) = error.status_code() else {
+        return false;
+    };
+    if status != reqwest::StatusCode::NOT_FOUND && status != reqwest::StatusCode::BAD_REQUEST {
+        return false;
+    }
+    let body = error
+        .response_body()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let message = error.to_string().to_ascii_lowercase();
+    body.contains("not found")
+        || body.contains("does not exist")
+        || message.contains("not found")
+        || (body.contains("model") && body.contains("unavailable"))
+}
+
+/// Short human-readable reason for a chain fallthrough, for the log line.
+fn fallback_reason(error: &ApiError) -> &'static str {
+    if error.is_retryable() {
+        "retryable error"
+    } else if is_model_not_found(error) {
+        "model not found"
+    } else {
+        "error"
+    }
+}
+
+#[cfg(test)]
+mod fallback_chain_tests {
+    use super::{fallback_chain_eligible, is_model_not_found};
+    use api::ApiError;
+
+    fn model_not_found_404() -> ApiError {
+        ApiError::Api {
+            status: reqwest::StatusCode::NOT_FOUND,
+            error_type: Some("invalid_request_error".to_string()),
+            message: Some("Model 'openai/glm-5.1-fast' not found.".to_string()),
+            request_id: None,
+            body: "{\"detail\":\"Model 'openai/glm-5.1-fast' not found. Use GET /v1/models to see available models.\"}".to_string(),
+            retryable: false,
+            suggested_action: None,
+            retry_after: None,
+        }
+    }
+
+    fn auth_error() -> ApiError {
+        ApiError::Api {
+            status: reqwest::StatusCode::UNAUTHORIZED,
+            error_type: None,
+            message: None,
+            request_id: None,
+            body: "unauthorized".to_string(),
+            retryable: false,
+            suggested_action: None,
+            retry_after: None,
+        }
+    }
+
+    fn rate_limited() -> ApiError {
+        ApiError::Api {
+            status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+            error_type: None,
+            message: None,
+            request_id: None,
+            body: "slow down".to_string(),
+            retryable: true,
+            suggested_action: None,
+            retry_after: None,
+        }
+    }
+
+    #[test]
+    fn model_not_found_404_is_chain_eligible() {
+        assert!(is_model_not_found(&model_not_found_404()));
+        assert!(fallback_chain_eligible(&model_not_found_404()));
+    }
+
+    #[test]
+    fn auth_error_is_not_chain_eligible() {
+        assert!(!is_model_not_found(&auth_error()));
+        assert!(!fallback_chain_eligible(&auth_error()));
+    }
+
+    #[test]
+    fn retryable_error_remains_chain_eligible() {
+        assert!(fallback_chain_eligible(&rate_limited()));
+    }
 }
 
 impl ApiClient for ProviderRuntimeClient {
@@ -5212,10 +6960,11 @@ impl ApiClient for ProviderRuntimeClient {
             let attempt = runtime.block_on(stream_with_provider(&entry.client, &message_request));
             match attempt {
                 Ok(events) => return Ok(events),
-                Err(error) if error.is_retryable() && index + 1 < chain.len() => {
+                Err(error) if fallback_chain_eligible(&error) && index + 1 < chain.len() => {
                     eprintln!(
-                        "provider {} failed with retryable error, falling back: {error}",
-                        entry.model
+                        "provider {} failed ({}, falling back to next in chain): {error}",
+                        entry.model,
+                        fallback_reason(&error)
                     );
                     last_error = Some(error);
                 }
@@ -5715,6 +7464,7 @@ fn normalize_subagent_type(subagent_type: Option<&str>) -> String {
         "verification" | "verificationagent" | "verify" | "verifier" => {
             String::from("Verification")
         }
+        "reviewer" | "review" | "reviewagent" => String::from("Reviewer"),
         "clawguide" | "clawguideagent" | "guide" => String::from("claw-guide"),
         "statusline" | "statuslinesetup" => String::from("statusline-setup"),
         _ => trimmed.to_string(),
@@ -8699,6 +10449,8 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("ship-audit".to_string()),
                 model: None,
+                team_id: None,
+                task_id: None,
             },
             move |job| {
                 *captured_for_spawn
@@ -8780,6 +10532,8 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("complete-task".to_string()),
                 model: Some("claude-sonnet-4-6".to_string()),
+                team_id: None,
+                task_id: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -8837,6 +10591,8 @@ mod tests {
                 subagent_type: Some("Verification".to_string()),
                 name: Some("fail-task".to_string()),
                 model: None,
+                team_id: None,
+                task_id: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -8884,6 +10640,8 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("summary-floor".to_string()),
                 model: None,
+                team_id: None,
+                task_id: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -8929,6 +10687,8 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("recovery-lane".to_string()),
                 model: None,
+            team_id: None,
+            task_id: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -8977,6 +10737,8 @@ mod tests {
                 subagent_type: Some("Verification".to_string()),
                 name: Some("review-lane".to_string()),
                 model: None,
+                team_id: None,
+                task_id: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9017,6 +10779,8 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("backlog-scan".to_string()),
                 model: None,
+            team_id: None,
+            task_id: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9063,6 +10827,8 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("artifact-lane".to_string()),
                 model: None,
+            team_id: None,
+            task_id: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9133,6 +10899,8 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("cron-closeout".to_string()),
                 model: None,
+                team_id: None,
+                task_id: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9174,6 +10942,8 @@ mod tests {
                 subagent_type: None,
                 name: Some("spawn-error".to_string()),
                 model: None,
+                team_id: None,
+                task_id: None,
             },
             |_| Err(String::from("thread creation failed")),
         )
@@ -9475,6 +11245,42 @@ mod tests {
         )
         .expect_err("blank prompt should fail");
         assert!(missing_prompt.contains("prompt must not be empty"));
+    }
+
+    #[test]
+    fn agent_gate_bounds_team_concurrency_and_releases_on_drop() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let team = format!("gate-test-{nanos}");
+        let gate = super::global_agent_gate();
+        gate.set_limit(&team, Some(1));
+
+        let guard = gate.acquire(&team);
+        assert_eq!(gate.running_count(&team), 1, "first acquire takes the slot");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let blocked_team = team.clone();
+        thread::spawn(move || {
+            let _blocked = super::global_agent_gate().acquire(&blocked_team);
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_millis(150)).is_err(),
+            "second agent must block while the team cap is saturated"
+        );
+
+        drop(guard);
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("slot must be released when the guard drops");
+        assert_eq!(
+            gate.running_count(&team),
+            0,
+            "running count returns to zero"
+        );
+
+        gate.forget(&team);
     }
 
     #[test]
@@ -10674,9 +12480,12 @@ printf 'pwsh:%s' "$1"
         .expect("chain with primary override should construct");
 
         // then
-        assert_eq!(client.chain.len(), 2);
-        assert_eq!(client.chain[0].model, "grok-3");
-        assert_eq!(client.chain[1].model, "claude-sonnet-4-6");
+        // The caller's model is now the primary; fallbacks are appended
+        // as recovery entries, deduped.
+        assert_eq!(client.chain.len(), 3);
+        assert_eq!(client.chain[0].model, "claude-haiku-4-5-20251213");
+        assert_eq!(client.chain[1].model, "grok-3");
+        assert_eq!(client.chain[2].model, "claude-sonnet-4-6");
 
         match original_anthropic {
             Some(value) => std::env::set_var("ANTHROPIC_API_KEY", value),

@@ -14,6 +14,7 @@ api = { path = "../api" }
 commands = { path = "../commands" }
 crossterm = "0.28"
 pulldown-cmark = "0.13"
+once_cell = "1"
 rustyline = "15"
 runtime = { path = "../runtime" }
 plugins = { path = "../plugins" }
@@ -25,8 +26,15 @@ tools = { path = "../tools" }
 log = "0.4"
 
 
-[lints]
-workspace = true
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "allow", priority = -1 }
+module_name_repetitions = "allow"
+missing_panics_doc = "allow"
+missing_errors_doc = "allow"
 
 [dev-dependencies]
 mock-anthropic-service = { path = "../mock-anthropic-service" }
