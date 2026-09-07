@@ -60,14 +60,27 @@ class WorkspacePathScope:
     def validate_path(self, candidate: str | Path, cwd: str | Path | None = None) -> PathScopeDecision:
         raw = os.path.expandvars(os.path.expanduser(str(candidate)))
         if _is_windows_absolute(raw):
-            return self._validate_windows_path(raw)
+            if os.name != 'nt':
+                return self._validate_windows_path(raw)
+            elif not any(_is_windows_absolute(str(root)) for root in self.roots):
+                # Even on Windows, deny if no roots are Windows absolute paths (edge case)
+                return PathScopeDecision(False, 'windows absolute path is outside workspace scope', str(candidate), raw)
+
         base = Path(cwd).expanduser().resolve(strict=False) if cwd else self.roots[0]
         path = Path(raw)
         if not path.is_absolute():
             path = base / path
         expanded = self._expand_glob(path)
         for expanded_path in expanded:
-            resolved = expanded_path.resolve(strict=False)
+            try:
+                resolved = expanded_path.resolve(strict=False)
+            except (OSError, ValueError, RuntimeError):
+                return PathScopeDecision(
+                    False,
+                    'path cannot be resolved or is invalid',
+                    str(candidate),
+                    str(expanded_path),
+                )
             if not any(_is_relative_to(resolved, root) for root in self.roots):
                 return PathScopeDecision(
                     False,
@@ -75,7 +88,16 @@ class WorkspacePathScope:
                     str(candidate),
                     str(resolved),
                 )
-        return PathScopeDecision(True, 'path is inside workspace scope', str(candidate), str(expanded[0].resolve(strict=False)))
+        try:
+            final_resolved = str(expanded[0].resolve(strict=False))
+        except (OSError, ValueError, RuntimeError):
+            return PathScopeDecision(
+                False,
+                'path cannot be resolved or is invalid',
+                str(candidate),
+                str(expanded[0]),
+            )
+        return PathScopeDecision(True, 'path is inside workspace scope', str(candidate), final_resolved)
 
     def _expand_glob(self, path: Path) -> tuple[Path, ...]:
         path_text = str(path)
@@ -116,7 +138,7 @@ def extract_path_candidates(payload: str) -> tuple[str, ...]:
         tokens = payload.split()
     raw_tokens = payload.split()
     candidates: list[str] = []
-    for token in (*tokens, *raw_tokens):
+    for token in (*raw_tokens, *tokens):
         if not token or token.startswith('-') or _ENV_ASSIGNMENT_RE.match(token):
             continue
         token = _strip_redirection_operator(token)
