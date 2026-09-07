@@ -12577,7 +12577,8 @@ fn build_runtime_with_plugin_state(
             emit_output,
             tool_registry.clone(),
             mcp_state.clone(),
-        ),
+        )
+        .with_max_parallel_tool_calls(feature_config.max_parallel_tool_calls()),
         policy,
         system_prompt,
         &feature_config,
@@ -14005,6 +14006,22 @@ struct CliToolExecutor {
     allowed_tools: Option<AllowedToolSet>,
     tool_registry: GlobalToolRegistry,
     mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
+    /// Cap on concurrently executing parallel-safe tool calls in one batch.
+    max_parallel_tool_calls: usize,
+}
+
+/// Default fan-out cap for parallel read-only tool execution. Local model
+/// servers and filesystem watchers degrade past a handful of concurrent
+/// requests, so 8 is the sane default. Precedence: `maxParallelToolCalls`
+/// in settings > `CLAWD_PARALLEL_TOOL_CALLS` env > this default.
+const DEFAULT_MAX_PARALLEL_TOOL_CALLS: usize = 8;
+
+fn max_parallel_tool_calls_from_env() -> usize {
+    std::env::var("CLAWD_PARALLEL_TOOL_CALLS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_MAX_PARALLEL_TOOL_CALLS)
 }
 
 impl CliToolExecutor {
@@ -14020,7 +14037,18 @@ impl CliToolExecutor {
             allowed_tools,
             tool_registry,
             mcp_state,
+            max_parallel_tool_calls: max_parallel_tool_calls_from_env(),
         }
+    }
+
+    /// Apply the `maxParallelToolCalls` setting when present; `None` keeps
+    /// the env/default already resolved by `new`.
+    #[must_use]
+    fn with_max_parallel_tool_calls(mut self, max: Option<usize>) -> Self {
+        if let Some(max) = max.filter(|m| *m > 0) {
+            self.max_parallel_tool_calls = max;
+        }
+        self
     }
 
     fn execute_search_tool(&self, value: serde_json::Value) -> Result<String, ToolError> {
@@ -14145,13 +14173,17 @@ impl ToolExecutor for CliToolExecutor {
 
         /// Tools that are safe to run in parallel because they only read
         /// state and dispatch through the stateless tool registry.
+        ///
+        /// `ToolSearch` is intentionally absent: the sequential path routes it
+        /// through `execute_search_tool` (which merges live MCP state), while
+        /// the parallel path dispatches straight to the stateless registry.
+        /// Keeping it sequential preserves identical output under parallelism.
         const PARALLEL_SAFE_TOOLS: &[&str] = &[
             "read_file",
             "glob_search",
             "grep_search",
             "WebFetch",
             "WebSearch",
-            "ToolSearch",
             "Skill",
             "LSP",
             "Agent",
@@ -14202,43 +14234,65 @@ impl ToolExecutor for CliToolExecutor {
             }
         }
 
-        // Execute parallel-safe tools concurrently
+        // Execute parallel-safe tools concurrently, bounded so fan-out against
+        // local model servers cannot queue unbounded threads. Results are
+        // keyed by the original call index, never by completion order, so the
+        // transcript stays deterministic across runs for the same input.
+        //
+        // Note: parallel-safe calls run before sequential ones within a batch
+        // (results still land in call-order slots). Models must not emit
+        // calls whose success depends on another call in the same batch.
         if !parallel_calls.is_empty() {
             let registry = self.tool_registry.clone();
-            let parallel_results: Vec<(usize, String, String, Result<String, ToolError>)> =
-                std::thread::scope(|s| {
-                    let mut handles = Vec::new();
-                    for (idx, tool_use_id, tool_name, input) in &parallel_calls {
-                        let registry = &registry;
-                        let tool_use_id = tool_use_id.clone();
-                        let tool_name = tool_name.clone();
-                        let input = input.clone();
-                        let idx = *idx;
-                        handles.push(s.spawn(move || {
-                            let value = serde_json::from_str(&input).map_err(|error| {
-                                ToolError::new(format!("invalid tool input JSON: {error}"))
-                            });
-                            let result = match value {
-                                Ok(v) => registry.execute(&tool_name, &v).map_err(ToolError::new),
-                                Err(e) => Err(e),
-                            };
-                            (idx, tool_use_id, tool_name, result)
-                        }));
-                    }
-                    handles
-                        .into_iter()
-                        .map(|h| {
-                            h.join().unwrap_or_else(|_| {
-                                (
-                                    0,
-                                    String::new(),
-                                    String::new(),
-                                    Err(ToolError::new("parallel thread panicked")),
-                                )
+            let max_parallel = self.max_parallel_tool_calls.max(1);
+            let mut parallel_results: Vec<(usize, String, String, Result<String, ToolError>)> =
+                Vec::with_capacity(parallel_calls.len());
+            for wave in parallel_calls.chunks(max_parallel) {
+                let wave_results: Vec<(usize, String, String, Result<String, ToolError>)> =
+                    std::thread::scope(|s| {
+                        let mut handles = Vec::new();
+                        for (idx, tool_use_id, tool_name, input) in wave {
+                            let registry = &registry;
+                            let tool_use_id = tool_use_id.clone();
+                            let tool_name = tool_name.clone();
+                            let input = input.clone();
+                            let idx = *idx;
+                            // Fallback tuple carried outside the closure so a
+                            // panicking worker still lands in its own slot instead
+                            // of colliding with index 0 or leaving a hole.
+                            let fallback = (idx, tool_use_id.clone(), tool_name.clone());
+                            handles.push((
+                                fallback,
+                                s.spawn(move || {
+                                    let value = serde_json::from_str(&input).map_err(|error| {
+                                        ToolError::new(format!("invalid tool input JSON: {error}"))
+                                    });
+                                    let result = match value {
+                                        Ok(v) => {
+                                            registry.execute(&tool_name, &v).map_err(ToolError::new)
+                                        }
+                                        Err(e) => Err(e),
+                                    };
+                                    (idx, tool_use_id, tool_name, result)
+                                }),
+                            ));
+                        }
+                        handles
+                            .into_iter()
+                            .map(|((idx, tool_use_id, tool_name), h)| {
+                                h.join().unwrap_or_else(|_| {
+                                    (
+                                        idx,
+                                        tool_use_id,
+                                        tool_name,
+                                        Err(ToolError::new("parallel tool thread panicked")),
+                                    )
+                                })
                             })
-                        })
-                        .collect()
-                });
+                            .collect()
+                    });
+                parallel_results.extend(wave_results);
+            }
 
             for (idx, tool_use_id, tool_name, result) in parallel_results {
                 if emit_output {
@@ -19058,6 +19112,103 @@ UU conflicted.rs",
             .expect("system time should be after epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("claw-cli-{label}-{nanos}"))
+    }
+
+    #[test]
+    fn parallel_batch_results_follow_call_index_even_with_workspace_escapes() {
+        let workspace = temp_workspace("parallel-order");
+        fs::create_dir_all(&workspace).expect("workspace dir should exist");
+        for name in ["a", "b", "c", "d", "e"] {
+            fs::write(
+                workspace.join(format!("{name}.txt")),
+                format!("marker-{name}\n"),
+            )
+            .expect("fixture file should write");
+        }
+        let unique = workspace
+            .file_name()
+            .expect("workspace name")
+            .to_string_lossy()
+            .into_owned();
+        let escape_name = format!("{unique}-escape.txt");
+        let escape_path = workspace
+            .parent()
+            .expect("workspace parent dir")
+            .join(&escape_name);
+        fs::write(&escape_path, "out-of-scope\n").expect("escape file should write");
+
+        let calls = vec![
+            runtime::ToolCall {
+                tool_use_id: "t0".to_string(),
+                tool_name: "read_file".to_string(),
+                input: r#"{"path":"a.txt"}"#.to_string(),
+            },
+            runtime::ToolCall {
+                tool_use_id: "t1".to_string(),
+                tool_name: "read_file".to_string(),
+                input: format!(r#"{{"path":"../{escape_name}"}}"#),
+            },
+            runtime::ToolCall {
+                tool_use_id: "t2".to_string(),
+                tool_name: "read_file".to_string(),
+                input: r#"{"path":"b.txt"}"#.to_string(),
+            },
+            runtime::ToolCall {
+                tool_use_id: "t3".to_string(),
+                tool_name: "read_file".to_string(),
+                input: r#"{"path":"c.txt"}"#.to_string(),
+            },
+            runtime::ToolCall {
+                tool_use_id: "t4".to_string(),
+                tool_name: "read_file".to_string(),
+                input: r#"{"path":"d.txt"}"#.to_string(),
+            },
+            runtime::ToolCall {
+                tool_use_id: "t5".to_string(),
+                tool_name: "read_file".to_string(),
+                input: r#"{"path":"e.txt"}"#.to_string(),
+            },
+        ];
+
+        let results = with_current_dir(&workspace, || {
+            let mut executor =
+                CliToolExecutor::new(None, false, GlobalToolRegistry::builtin(), None)
+                    .with_max_parallel_tool_calls(Some(2));
+            executor.execute_batch(calls)
+        });
+
+        let _ = fs::remove_file(&escape_path);
+        let _ = fs::remove_dir_all(&workspace);
+
+        assert_eq!(results.len(), 6, "every call must produce a result slot");
+        for (i, result) in results.iter().enumerate() {
+            assert_eq!(
+                result.tool_use_id,
+                format!("t{i}"),
+                "result {i} must carry the call that owned the slot, not the thread that finished first"
+            );
+            assert_eq!(result.tool_name, "read_file");
+        }
+        let escaped = results[1]
+            .result
+            .as_ref()
+            .expect_err("out-of-scope path must fail even inside a parallel batch");
+        assert!(
+            escaped.to_string().contains("escapes workspace boundary"),
+            "escape must be rejected by the per-call workspace check, got: {escaped}"
+        );
+        let markers = ["marker-a", "marker-b", "marker-c", "marker-d", "marker-e"];
+        let slots = [0usize, 2, 3, 4, 5];
+        for (slot, marker) in slots.iter().zip(markers) {
+            let output = results[*slot]
+                .result
+                .as_ref()
+                .unwrap_or_else(|error| panic!("read at slot {slot} failed: {error}"));
+            assert!(
+                output.contains(marker),
+                "slot {slot} must contain {marker}, got: {output}"
+            );
+        }
     }
 
     #[test]
