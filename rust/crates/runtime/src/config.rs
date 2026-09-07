@@ -167,6 +167,16 @@ pub struct RuntimeFeatureConfig {
     /// Read from `subagentModel` (or `subagent_model`) in settings; falls
     /// back to the default model when unset.
     subagent_model: Option<String>,
+    /// Cap on concurrently executing parallel-safe tool calls in one batch.
+    /// Read from `maxParallelToolCalls` (or `max_parallel_tool_calls`) in
+    /// settings; the CLI falls back to `CLAWD_PARALLEL_TOOL_CALLS` and then
+    /// to its built-in default when unset.
+    max_parallel_tool_calls: Option<usize>,
+    /// Default cap on concurrently *running* sub-agents per team. Read from
+    /// `maxConcurrentAgents` (or `max_concurrent_agents`) in settings; a
+    /// per-team `maxConcurrentAgents` on TeamCreate overrides it. `None`
+    /// means no gate (current pre-fix behavior).
+    max_concurrent_agents: Option<usize>,
 }
 
 /// Controls which external AI coding framework rules are imported into the system prompt.
@@ -806,6 +816,14 @@ fn build_runtime_config(
         rules_import: parse_optional_rules_import(&merged_value)?,
         provider: parse_optional_provider_config(&merged_value)?,
         subagent_model: parse_optional_subagent_model(&merged_value),
+        max_parallel_tool_calls: parse_optional_positive_usize(
+            &merged_value,
+            &["maxParallelToolCalls", "max_parallel_tool_calls"],
+        )?,
+        max_concurrent_agents: parse_optional_positive_usize(
+            &merged_value,
+            &["maxConcurrentAgents", "max_concurrent_agents"],
+        )?,
     };
 
     Ok(RuntimeConfig {
@@ -892,6 +910,22 @@ impl RuntimeConfig {
         self.feature_config.subagent_model.as_deref()
     }
 
+    /// Cap on concurrently executing parallel-safe tool calls in one batch.
+    /// Read from `maxParallelToolCalls` in settings; `None` means the CLI
+    /// falls back to `CLAWD_PARALLEL_TOOL_CALLS` and then its built-in default.
+    #[must_use]
+    pub fn max_parallel_tool_calls(&self) -> Option<usize> {
+        self.feature_config.max_parallel_tool_calls
+    }
+
+    /// Default cap on concurrently running sub-agents per team. Read from
+    /// `maxConcurrentAgents` in settings; `None` means the built-in default
+    /// applies. A per-team `maxConcurrentAgents` on TeamCreate overrides it.
+    #[must_use]
+    pub fn max_concurrent_agents(&self) -> Option<usize> {
+        self.feature_config.max_concurrent_agents
+    }
+
     #[must_use]
     pub fn aliases(&self) -> &BTreeMap<String, String> {
         &self.feature_config.aliases
@@ -950,6 +984,20 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn provider(&self) -> &RuntimeProviderConfig {
         &self.provider
+    }
+
+    /// Cap on concurrently executing parallel-safe tool calls in one batch.
+    /// `None` means fall back to env/default.
+    #[must_use]
+    pub fn max_parallel_tool_calls(&self) -> Option<usize> {
+        self.max_parallel_tool_calls
+    }
+
+    /// Default per-team cap on concurrently running sub-agents; `None`
+    /// means unlimited (pre-fix behavior).
+    #[must_use]
+    pub fn max_concurrent_agents(&self) -> Option<usize> {
+        self.max_concurrent_agents
     }
 
     #[must_use]
@@ -1742,6 +1790,36 @@ fn parse_optional_subagent_model(root: &JsonValue) -> Option<String> {
         .and_then(JsonValue::as_str)
         .filter(|s| !s.trim().is_empty())
         .map(|s| s.trim().to_string())
+}
+
+/// Reads the first present key from `keys` as a positive integer.
+/// Absent, null, or non-positive values parse to `None` so callers fall
+/// back to their own defaults rather than silently disabling a cap via a
+/// `0` typo. Accepts JSON numbers or numeric strings.
+fn parse_optional_positive_usize(
+    root: &JsonValue,
+    keys: &[&str],
+) -> Result<Option<usize>, ConfigError> {
+    let Some(object) = root.as_object() else {
+        return Ok(None);
+    };
+    for key in keys {
+        let Some(value) = object.get(*key) else {
+            continue;
+        };
+        if matches!(value, JsonValue::Null) {
+            continue;
+        }
+        let parsed = value
+            .as_i64()
+            .or_else(|| value.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
+            .ok_or_else(|| ConfigError::Parse(format!("{key} must be a positive integer")))?;
+        if parsed <= 0 {
+            return Ok(None);
+        }
+        return Ok(usize::try_from(parsed).ok());
+    }
+    Ok(None)
 }
 
 fn parse_optional_aliases(root: &JsonValue) -> Result<BTreeMap<String, String>, ConfigError> {
@@ -4032,6 +4110,78 @@ mod tests {
             config.subagent_model(),
             None,
             "blank subagentModel should fall back to None"
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn parallel_and_agent_caps_read_camel_and_snake_case_keys() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            home.join("settings.json"),
+            "{\n  \"maxParallelToolCalls\": 4,\n  \"max_concurrent_agents\": \"6\"\n}\n",
+        )
+        .expect("write settings");
+
+        let config = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+        assert_eq!(
+            config.max_parallel_tool_calls(),
+            Some(4),
+            "maxParallelToolCalls camelCase key should parse"
+        );
+        assert_eq!(
+            config.max_concurrent_agents(),
+            Some(6),
+            "max_concurrent_agents snake_case key should parse numeric strings"
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn parallel_and_agent_caps_reject_nonpositive_and_malformed() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            home.join("settings.json"),
+            "{\n  \"maxParallelToolCalls\": 0\n}\n",
+        )
+        .expect("write settings");
+
+        let config = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("zero cap should parse as unset");
+        assert_eq!(config.max_parallel_tool_calls(), None);
+        assert_eq!(config.max_concurrent_agents(), None);
+        fs::remove_dir_all(&root).expect("cleanup temp dir");
+
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            home.join("settings.json"),
+            "{\n  \"maxParallelToolCalls\": \"lots\"\n}\n",
+        )
+        .expect("write settings");
+
+        let error = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect_err("non-numeric cap should be a config error");
+        assert!(
+            error.to_string().contains("maxParallelToolCalls"),
+            "error should name the offending key: {error}"
         );
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
