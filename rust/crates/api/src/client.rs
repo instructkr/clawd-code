@@ -47,6 +47,9 @@ impl ProviderClient {
                         Some(meta) if meta.auth_env == "DASHSCOPE_API_KEY" => {
                             OpenAiCompatConfig::dashscope()
                         }
+                        Some(meta) if meta.auth_env == "CLAWCUSTOMOPENAI_API_KEY" => {
+                            OpenAiCompatConfig::custom_openai()
+                        }
                         _ => OpenAiCompatConfig::openai(),
                     };
                     Ok(Self::OpenAi(OpenAiCompatClient::from_env(config)?))

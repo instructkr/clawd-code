@@ -270,6 +270,14 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
             default_base_url: openai_compat::DEFAULT_OPENAI_BASE_URL,
         });
     }
+    if canonical.starts_with("custom/") {
+        return Some(ProviderMetadata {
+            provider: ProviderKind::OpenAi,
+            auth_env: "CLAWCUSTOMOPENAI_API_KEY",
+            base_url_env: "CLAWCUSTOMOPENAI_BASE_URL",
+            default_base_url: openai_compat::DEFAULT_CUSTOM_OPENAI_BASE_URL,
+        });
+    }
     // Alibaba DashScope compatible-mode endpoint. Routes qwen/* and bare
     // qwen-* model names (qwen-max, qwen-plus, qwen-turbo, qwen-qwq, etc.)
     // to the OpenAI-compat client pointed at DashScope's /compatible-mode/v1.
@@ -375,6 +383,11 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
     if std::env::var_os("OPENAI_BASE_URL").is_some()
         && looks_like_local_openai_model(&resolved_model)
     {
+        return ProviderKind::OpenAi;
+    }
+    // Explicit `custom/` prefix selects the Claw custom OpenAI-compat provider
+    // even when no other credentials are present.
+    if resolved_model.starts_with("custom/") {
         return ProviderKind::OpenAi;
     }
     if anthropic::has_auth_from_env_or_saved().unwrap_or(false) {
@@ -1136,6 +1149,21 @@ mod tests {
     fn kimi_alias_resolves_to_kimi_k2_5() {
         assert_eq!(super::resolve_model_alias("kimi"), "kimi-k2.5");
         assert_eq!(super::resolve_model_alias("KIMI"), "kimi-k2.5"); // case insensitive
+    }
+
+    #[test]
+    fn custom_prefix_routes_to_custom_openai_env_vars() {
+        let meta = super::metadata_for_model("custom/openclaw_3750")
+            .expect("custom/ prefix must resolve to custom OpenAI metadata");
+        assert_eq!(meta.provider, ProviderKind::OpenAi);
+        assert_eq!(meta.auth_env, "CLAWCUSTOMOPENAI_API_KEY");
+        assert_eq!(meta.base_url_env, "CLAWCUSTOMOPENAI_BASE_URL");
+
+        assert_eq!(
+            detect_provider_kind("custom/openclaw_3750"),
+            ProviderKind::OpenAi,
+            "custom/ prefix must select OpenAi provider kind"
+        );
     }
 
     #[test]
