@@ -1027,7 +1027,7 @@ fn url_host(url: &str) -> &str {
     host_port.split(':').next().unwrap_or("")
 }
 
-fn is_local_openai_compatible_base_url(url: &str) -> bool {
+pub(crate) fn is_local_openai_compatible_base_url(url: &str) -> bool {
     let host = url_host(url.trim());
     if host.eq_ignore_ascii_case("localhost") || host == "::1" {
         return true;

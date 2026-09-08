@@ -205,6 +205,11 @@ pub struct RuntimeProviderConfig {
 
 impl RuntimeProviderConfig {
     #[must_use]
+    pub fn is_configured(&self) -> bool {
+        self.kind.is_some()
+    }
+
+    #[must_use]
     pub fn kind(&self) -> Option<&str> {
         self.kind.as_deref()
     }
@@ -2609,6 +2614,42 @@ mod tests {
         let pid = std::process::id();
         let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!("runtime-config-{pid}-{nanos}-{seq}"))
+    }
+
+    #[test]
+    fn loads_persisted_provider_configuration_from_settings() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+
+        fs::write(
+            home.join("settings.json"),
+            r#"{
+                "provider": {
+                    "kind": "dashscope",
+                    "apiKey": "persisted-test-key",
+                    "baseUrl": "https://dashscope.example/v1",
+                    "model": "qwen-plus"
+                }
+            }"#,
+        )
+        .expect("write settings");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("provider configuration should load");
+
+        let provider = loaded.provider();
+
+        assert_eq!(provider.kind(), Some("dashscope"));
+        assert_eq!(provider.api_key(), Some("persisted-test-key"));
+        assert_eq!(provider.base_url(), Some("https://dashscope.example/v1"));
+        assert_eq!(provider.model(), Some("qwen-plus"));
+        assert!(provider.is_configured());
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
     #[test]
